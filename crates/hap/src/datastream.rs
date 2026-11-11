@@ -246,11 +246,8 @@ impl DataStreams {
                 ("dataSend", "close" | "ack", Kind::Event)
                     if sending.as_ref().is_some_and(|(id, _)| Some(*id) == stream_id) =>
                 {
-                    tracing::info!(
-                        "data stream from {peer}: the hub sent {} (reason {:?})",
-                        message.topic,
-                        message.body.get("reason").and_then(Value::as_i64)
-                    );
+                    let reason = message.body.get("reason").and_then(|v| v.as_i64());
+                    tracing::info!("data stream from {peer}: the hub sent {} (reason {reason:?})", message.topic);
                     if let Some((_, task)) = sending.take() {
                         task.abort();
                     }
