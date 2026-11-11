@@ -267,9 +267,17 @@ impl Stream {
             if let Some(stderr) = stderr {
                 let name = stream.name.clone();
                 tokio::spawn(async move {
+                    // ffmpeg repeats a complaint for every frame it cannot
+                    // use, so each distinct one is logged once and counted.
+                    let mut seen = Repeats::default();
                     let mut lines = BufReader::new(stderr).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
-                        tracing::warn!("{name}: ffmpeg: {line}");
+                        if seen.first(&line) {
+                            tracing::warn!("{name}: ffmpeg: {line}");
+                        }
+                    }
+                    for (line, extra) in seen.repeated() {
+                        tracing::warn!("{name}: ffmpeg: {line} ({extra} more like this)");
                     }
                 });
             }
@@ -376,6 +384,50 @@ fn ffmpeg_args(input: &[String], request: &SetupRequest, video: &SelectedVideo, 
     args
 }
 
+/// Counts repeated ffmpeg messages so a burst of identical complaints takes
+/// one log line and a total rather than one line per video frame.
+#[derive(Default)]
+struct Repeats {
+    /// Message with addresses removed, first full line, and times seen.
+    seen: Vec<(String, String, u32)>,
+}
+
+impl Repeats {
+    /// Distinct messages remembered per stream; anything past this is logged
+    /// as it comes so the memory used cannot grow without limit.
+    const LIMIT: usize = 32;
+
+    /// Records a line and says whether it should be logged now.
+    fn first(&mut self, line: &str) -> bool {
+        let key = without_addresses(line);
+        if let Some(entry) = self.seen.iter_mut().find(|(k, _, _)| *k == key) {
+            entry.2 = entry.2.saturating_add(1);
+            return false;
+        }
+        if self.seen.len() < Self::LIMIT {
+            self.seen.push((key, line.to_owned(), 1));
+        }
+        true
+    }
+
+    /// Messages seen more than once, with how many times beyond the first.
+    fn repeated(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.seen.iter().filter(|(_, _, n)| *n > 1).map(|(_, line, n)| (line.as_str(), n - 1))
+    }
+}
+
+/// Drops `0x…` pointer values, which differ between otherwise equal lines.
+fn without_addresses(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find("0x") {
+        out.push_str(&rest[..at]);
+        rest = rest[at + 2..].trim_start_matches(|c: char| c.is_ascii_hexdigit());
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +450,24 @@ mod tests {
 
     fn video(width: u16, height: u16) -> SelectedVideo {
         SelectedVideo { profile: 1, level: 2, width, height, fps: 30, payload_type: 99, max_bitrate_kbps: 299, mtu: Some(1378) }
+    }
+
+    #[test]
+    fn repeated_ffmpeg_messages_are_logged_once_and_counted() {
+        let mut seen = Repeats::default();
+        assert!(seen.first("[h264 @ 0x13660a3f0] hardware accelerator failed to decode picture"));
+        assert!(!seen.first("[h264 @ 0x7f00aa] hardware accelerator failed to decode picture"));
+        assert!(!seen.first("[h264 @ 0x13660a3f0] hardware accelerator failed to decode picture"));
+        assert!(seen.first("Connection refused"));
+        let repeated: Vec<_> = seen.repeated().collect();
+        assert_eq!(repeated, [("[h264 @ 0x13660a3f0] hardware accelerator failed to decode picture", 2)]);
+
+        // Past the limit, new messages are still logged, just not counted.
+        for n in 0..Repeats::LIMIT {
+            seen.first(&format!("message {n}"));
+        }
+        assert!(seen.first("one more"));
+        assert!(seen.first("one more"));
     }
 
     #[test]
