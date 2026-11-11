@@ -439,7 +439,18 @@ impl Connection {
             }
             (_, _, None) => unauthorized(),
             ("POST", "/pairings", Some(controller)) => {
+                let before = store.pairings().len();
                 let body = pairing::pairings(&store, &controller, &request.body);
+                let after = store.pairings().len();
+                // Pairing changes are rare and matter, so say what happened.
+                match after {
+                    0 if before > 0 => tracing::info!(
+                        "unpaired: a controller at {} removed the bridge from its home",
+                        self.peer.ip().to_canonical()
+                    ),
+                    n if n != before => tracing::info!("controllers changed: {before} before, {n} now"),
+                    _ => {}
+                }
                 self.shared.pairings_changed();
                 response(200, TLV, &body)
             }

@@ -226,10 +226,9 @@ impl Store {
             }
         }
         self.update(|s| {
-            // The very first layout is not a change controllers need to hear about.
-            if !s.layout.is_empty() {
-                s.config_number = if s.config_number >= 65535 { 1 } else { s.config_number + 1 };
-            }
+            // Bump even when no layout was recorded before: a state file from
+            // an older build may already have been published to controllers.
+            s.config_number = if s.config_number >= 65535 { 1 } else { s.config_number + 1 };
             s.layout = layout.to_owned();
         })?;
         Ok(true)
@@ -314,14 +313,14 @@ mod tests {
         let path = temp_path("layout");
         let store = Store::open(&path).unwrap();
         assert!(store.sync_layout("one").unwrap());
-        assert_eq!(store.config_number(), 1, "the first layout is not a change");
+        assert_eq!(store.config_number(), 2);
         assert!(!store.sync_layout("one").unwrap());
         assert!(store.sync_layout("two").unwrap());
-        assert_eq!(store.config_number(), 2);
+        assert_eq!(store.config_number(), 3);
         drop(store);
         let store = Store::open(&path).unwrap();
         assert!(!store.sync_layout("two").unwrap());
-        assert_eq!(store.config_number(), 2);
+        assert_eq!(store.config_number(), 3);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
