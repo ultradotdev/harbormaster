@@ -349,6 +349,10 @@ impl Recorder {
         handle(ids.selected, |s, v| {
             // An unusable choice is refused rather than stored.
             let usable = recording::parse_selected(v).is_some();
+            if !usable {
+                // Codec settings, not secrets: worth seeing in full.
+                tracing::warn!("a hub chose a recording format that could not be read: {v}");
+            }
             if usable {
                 s.selected = v.as_str().unwrap_or_default().to_owned();
             }

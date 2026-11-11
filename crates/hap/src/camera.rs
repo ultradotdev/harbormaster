@@ -25,6 +25,7 @@ pub mod kind {
     pub const SUPPORTED_RTP_CONFIGURATION: &str = "116";
     pub const SELECTED_RTP_STREAM_CONFIGURATION: &str = "117";
     pub const SETUP_ENDPOINTS: &str = "118";
+    pub const ACTIVE: &str = "B0";
 }
 
 /// The only SRTP suite offered: AES-128 counter mode with HMAC-SHA1-80.
@@ -128,7 +129,9 @@ pub fn supported_rtp() -> Value {
 }
 
 /// The characteristics of one stream management service, in the order
-/// `selected configuration, setup endpoints, status, audio, rtp, video`.
+/// `selected configuration, setup endpoints, status, audio, rtp, video,
+/// active`. The Home app switches *active* off and on as part of choosing
+/// whether a camera may stream.
 pub fn stream_characteristics(resolutions: &[(u16, u16, u8)]) -> Vec<Characteristic> {
     let tlv = |kind, value| Characteristic::constant(kind, Format::Tlv8, value);
     let empty = || json!("");
@@ -139,6 +142,8 @@ pub fn stream_characteristics(resolutions: &[(u16, u16, u8)]) -> Vec<Characteris
         tlv(kind::SUPPORTED_AUDIO_STREAM_CONFIGURATION, supported_audio()),
         tlv(kind::SUPPORTED_RTP_CONFIGURATION, supported_rtp()),
         tlv(kind::SUPPORTED_VIDEO_STREAM_CONFIGURATION, supported_video(resolutions)),
+        Characteristic { writable: true, ..Characteristic::sensor(kind::ACTIVE, Format::Uint8, json!(1)) }
+            .range(0.0, 1.0, 1.0),
     ]
 }
 
@@ -516,7 +521,7 @@ mod tests {
         let first = nested(&decoded, 0x03).unwrap();
         assert_eq!((u16_le(&first, 0x01), u16_le(&first, 0x02), first.get_u8(0x03)), (Some(1920), Some(1080), Some(30)));
         assert!(bytes.windows(2).filter(|w| *w == [0x00, 0x00]).count() >= 2);
-        assert_eq!(stream_characteristics(&[(1280, 720, 30)]).len(), 6);
+        assert_eq!(stream_characteristics(&[(1280, 720, 30)]).len(), 7);
     }
 
     #[test]

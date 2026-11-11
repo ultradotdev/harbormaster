@@ -612,7 +612,15 @@ impl Connection {
                     // The controller asked for the answer in this reply.
                     Ok(stored) if write["r"] == true => answer = Some(stored),
                     Ok(_) => {}
-                    Err(e) => code = e,
+                    Err(e) => {
+                        // Values can be sensitive, so only say what was refused.
+                        let kind = self.shared.db.with(aid, iid, |c| c.kind).unwrap_or("unknown");
+                        tracing::warn!(
+                            "refused a write from {} to accessory {aid}, characteristic {iid} (type {kind}): status {e}",
+                            self.peer.ip().to_canonical()
+                        );
+                        code = e;
+                    }
                 }
             }
             if let (status::OK, Some(subscribe)) = (code, write.get("ev")) {

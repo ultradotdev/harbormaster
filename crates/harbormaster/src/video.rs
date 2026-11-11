@@ -92,6 +92,7 @@ pub struct StreamIds {
     selected: u64,
     setup: u64,
     status: u64,
+    active: u64,
 }
 
 /// Adds a stream management service at a fixed instance id.
@@ -102,7 +103,7 @@ pub fn add_stream_service(accessory: &mut Accessory, iid: u64, offered: &[(u16, 
         false,
         camera::stream_characteristics(offered),
     );
-    StreamIds { selected: ids[0], setup: ids[1], status: ids[2] }
+    StreamIds { selected: ids[0], setup: ids[1], status: ids[2], active: ids[6] }
 }
 
 /// A stream the controller has set up but not yet started.
@@ -192,6 +193,9 @@ impl Stream {
         };
         if request.video_srtp.suite != camera::SRTP_AES_CM_128_HMAC_SHA1_80 {
             return unavailable("the controller asked for an encryption suite that was not offered");
+        }
+        if self.db.read(self.aid, self.ids.active) == Ok(serde_json::json!(0)) {
+            return unavailable("streaming is switched off for this camera in HomeKit");
         }
         if !self.source.available() {
             return unavailable("the camera is not reachable");
