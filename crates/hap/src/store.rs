@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{from_hex, random, to_hex};
+use crate::crypto::{base64_encode as base64, from_hex, random, to_hex};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -77,22 +77,6 @@ fn base36(mut value: u64, width: usize) -> String {
         digits.push(b'0');
     }
     digits.iter().rev().map(|d| char::from(*d)).collect()
-}
-
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let n = chunk.iter().fold(0u32, |n, b| n << 8 | *b as u32) << (8 * (3 - chunk.len()));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
 }
 
 /// The payload of a HomeKit setup QR code: the setup code, an "IP accessory"
@@ -348,14 +332,6 @@ mod tests {
     fn setup_uri_matches_known_example() {
         // Published example: code 841-31-633, category 8 (switch), IP accessory.
         assert_eq!(setup_uri("841-31-633", "7OSX", 8), "X-HM://0081YCYEP7OSX");
-    }
-
-    #[test]
-    fn base64_pads_correctly() {
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foob"), "Zm9vYg==");
     }
 
     #[test]

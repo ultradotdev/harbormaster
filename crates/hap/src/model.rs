@@ -1,6 +1,8 @@
 //! The accessory database: accessories, their services and characteristics,
 //! and the change notifications that drive HomeKit events.
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 
 use serde_json::{json, Map, Value};
@@ -310,23 +312,68 @@ pub struct Change {
     pub origin: Option<u64>,
 }
 
+/// Who is writing, for handlers that need to answer the same controller.
+#[derive(Clone, Copy, Debug)]
+pub struct WriteContext {
+    /// Identifies the controller connection for the life of that connection.
+    pub connection: u64,
+    /// This machine's address as the controller reached it.
+    pub local_ip: IpAddr,
+    pub peer_ip: IpAddr,
+}
+
+/// Runs synchronously when a controller writes a characteristic. Returning
+/// `Ok(Some(value))` stores that value instead of the one written, which is
+/// how request-and-response characteristics hand back their answer.
+pub type WriteHandler = Arc<dyn Fn(&Value, &WriteContext) -> Result<Option<Value>, i32> + Send + Sync>;
+
 pub struct Database {
     accessories: RwLock<Vec<Accessory>>,
+    handlers: RwLock<HashMap<(u64, u64), WriteHandler>>,
     changes: broadcast::Sender<Change>,
     writes: broadcast::Sender<Change>,
+    closed: broadcast::Sender<u64>,
 }
 
 impl Database {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             accessories: RwLock::new(Vec::new()),
+            handlers: RwLock::new(HashMap::new()),
             changes: broadcast::channel(1024).0,
             writes: broadcast::channel(256).0,
+            closed: broadcast::channel(64).0,
         })
     }
 
     pub fn add(&self, accessory: Accessory) {
         self.accessories.write().unwrap().push(accessory);
+    }
+
+    /// Swaps in a rebuilt accessory with the same id, or adds it if new.
+    /// Write handlers for the old one are dropped.
+    pub fn replace(&self, accessory: Accessory) {
+        self.handlers.write().unwrap().retain(|(aid, _), _| *aid != accessory.aid);
+        let mut accessories = self.accessories.write().unwrap();
+        match accessories.iter_mut().find(|a| a.aid == accessory.aid) {
+            Some(existing) => *existing = accessory,
+            None => accessories.push(accessory),
+        }
+    }
+
+    /// Registers the handler for writes to one characteristic.
+    pub fn on_write(&self, aid: u64, iid: u64, handler: WriteHandler) {
+        self.handlers.write().unwrap().insert((aid, iid), handler);
+    }
+
+    /// Announces that a controller connection has ended, so anything started
+    /// on its behalf can be stopped.
+    pub fn connection_closed(&self, connection: u64) {
+        let _ = self.closed.send(connection);
+    }
+
+    pub fn subscribe_connection_closed(&self) -> broadcast::Receiver<u64> {
+        self.closed.subscribe()
     }
 
     /// Every value change, for delivering events to subscribed controllers.
@@ -394,7 +441,21 @@ impl Database {
     }
 
     /// Applies a write from a controller connection.
-    pub fn write(&self, aid: u64, iid: u64, value: &Value, origin: u64) -> Result<(), i32> {
+    pub fn write(&self, aid: u64, iid: u64, value: &Value, context: &WriteContext) -> Result<(), i32> {
+        let value = self
+            .with(aid, iid, |c| {
+                if !c.writable {
+                    return Err(status::READ_ONLY);
+                }
+                c.coerce(value).ok_or(status::INVALID_VALUE)
+            })
+            .unwrap_or(Err(status::NOT_FOUND))?;
+        // The handler runs outside the lock so it can read and set other values.
+        let handler = self.handlers.read().unwrap().get(&(aid, iid)).cloned();
+        let stored = match handler {
+            Some(handler) => handler(&value, context)?.unwrap_or(value),
+            None => value,
+        };
         let change = {
             let mut accessories = self.accessories.write().unwrap();
             let c = accessories
@@ -402,15 +463,11 @@ impl Database {
                 .find(|a| a.aid == aid)
                 .and_then(|a| a.characteristic_mut(iid))
                 .ok_or(status::NOT_FOUND)?;
-            if !c.writable {
-                return Err(status::READ_ONLY);
-            }
-            let value = c.coerce(value).ok_or(status::INVALID_VALUE)?;
             // Write-only characteristics such as Identify hold no state.
             if c.readable {
-                c.value = value.clone();
+                c.value = stored.clone();
             }
-            Change { aid, iid, value, origin: Some(origin) }
+            Change { aid, iid, value: stored, origin: Some(context.connection) }
         };
         // Send errors only mean nobody is listening.
         let _ = self.writes.send(change.clone());
@@ -468,6 +525,49 @@ mod tests {
         let db = Database::new();
         db.add(accessory);
         (db, ids[0])
+    }
+
+    fn context() -> WriteContext {
+        WriteContext { connection: 1, local_ip: "10.0.0.2".parse().unwrap(), peer_ip: "10.0.0.9".parse().unwrap() }
+    }
+
+    #[test]
+    fn write_handlers_can_answer_reject_and_are_dropped_on_replace() {
+        let info = Info { name: "n", manufacturer: "m", model: "m", serial_number: "s", firmware_revision: "1" };
+        let build = || {
+            let mut accessory = Accessory::new(2, &info);
+            let ids = accessory.add_service_at(
+                100,
+                "110",
+                true,
+                vec![Characteristic { writable: true, ..Characteristic::constant("118", Format::Tlv8, json!("")) }],
+            );
+            (accessory, ids[0])
+        };
+        let db = Database::new();
+        let (accessory, iid) = build();
+        db.add(accessory);
+        db.on_write(
+            2,
+            iid,
+            Arc::new(|value, ctx| match value.as_str() {
+                Some("ask") => Ok(Some(json!(format!("answer for {}", ctx.peer_ip)))),
+                Some("bad") => Err(status::INVALID_VALUE),
+                _ => Ok(None),
+            }),
+        );
+        assert_eq!(db.write(2, iid, &json!("ask"), &context()), Ok(()));
+        assert_eq!(db.read(2, iid), Ok(json!("answer for 10.0.0.9")));
+        assert_eq!(db.write(2, iid, &json!("bad"), &context()), Err(status::INVALID_VALUE));
+        assert_eq!(db.read(2, iid), Ok(json!("answer for 10.0.0.9")), "a rejected write stores nothing");
+        assert_eq!(db.write(2, iid, &json!("plain"), &context()), Ok(()));
+        assert_eq!(db.read(2, iid), Ok(json!("plain")));
+
+        let (accessory, iid) = build();
+        db.replace(accessory);
+        assert_eq!(db.write(2, iid, &json!("ask"), &context()), Ok(()));
+        assert_eq!(db.read(2, iid), Ok(json!("ask")), "the old handler is gone");
+        assert_eq!(db.to_json()["accessories"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -542,8 +642,9 @@ mod tests {
         assert_eq!(db.read(2, iid), Ok(json!(20.0)));
         assert_eq!(db.read(2, 2), Err(status::WRITE_ONLY));
         assert_eq!(db.read(9, 1), Err(status::NOT_FOUND));
-        assert_eq!(db.write(2, iid, &json!(5.0), 1), Err(status::READ_ONLY));
-        assert_eq!(db.write(2, 2, &json!(1), 1), Ok(()));
-        assert_eq!(db.write(2, 2, &json!("x"), 1), Err(status::INVALID_VALUE));
+        let ctx = context();
+        assert_eq!(db.write(2, iid, &json!(5.0), &ctx), Err(status::READ_ONLY));
+        assert_eq!(db.write(2, 2, &json!(1), &ctx), Ok(()));
+        assert_eq!(db.write(2, 2, &json!("x"), &ctx), Err(status::INVALID_VALUE));
     }
 }

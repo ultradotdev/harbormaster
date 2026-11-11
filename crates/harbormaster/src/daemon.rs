@@ -75,7 +75,7 @@ pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
     };
 
     let config =
-        Config { name: name.clone(), model: "Harbormaster".into(), listen: options.listen, advertise: true };
+        Config { name: name.clone(), model: "Harbormaster".into(), listen: options.listen, advertise: true, snapshots: None };
     let bridge = Arc::new(Bridge::start(config, store.clone(), db.clone()).await?);
     tracing::info!("{name} listening on {}", bridge.local_addr);
     if store.is_paired() {

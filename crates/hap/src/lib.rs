@@ -4,6 +4,7 @@
 //! session encryption, the accessory database and the HTTP endpoints that
 //! Apple controllers talk to.
 
+pub mod camera;
 mod crypto;
 mod mdns;
 pub mod model;
@@ -15,5 +16,5 @@ pub mod store;
 mod tlv;
 
 pub use model::{Accessory, Characteristic, Database, Format, Info};
-pub use server::{Bridge, Config, ConnectionInfo, Error};
+pub use server::{Bridge, Config, ConnectionInfo, Error, SnapshotSource};
 pub use store::Store;

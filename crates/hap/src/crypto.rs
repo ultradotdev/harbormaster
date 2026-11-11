@@ -53,9 +53,58 @@ pub fn from_hex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
 }
 
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().fold(0u32, |n, b| n << 8 | *b as u32) << (8 * (3 - chunk.len()));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(BASE64[(n >> (18 - 6 * i) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let digits = text.trim_end_matches('=').as_bytes();
+    // Padding only ever stands in for one or two missing characters.
+    if text.len() % 4 != 0 || text.len() - digits.len() > 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(digits.len() * 3 / 4);
+    let (mut bits, mut count) = (0u32, 0u8);
+    for digit in digits {
+        let value = BASE64.iter().position(|c| c == digit)? as u32;
+        bits = bits << 6 | value;
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            out.push((bits >> count) as u8);
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_round_trips_and_rejects_garbage() {
+        for (plain, encoded) in [("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg==")] {
+            assert_eq!(base64_encode(plain.as_bytes()), encoded);
+            assert_eq!(base64_decode(encoded).unwrap(), plain.as_bytes());
+        }
+        assert_eq!(base64_decode("").unwrap(), b"");
+        assert!(base64_decode("Zg=").is_none());
+        assert!(base64_decode("Z!==").is_none());
+        assert!(base64_decode("====").is_none());
+    }
 
     #[test]
     fn seal_open_round_trip_and_tamper() {

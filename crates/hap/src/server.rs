@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch, Semaphore};
 
 use crate::mdns::Advertiser;
-use crate::model::{status, Change, Database};
+use crate::model::{status, Change, Database, WriteContext};
 use crate::pairing::{self, SetupState, VerifyState};
 use crate::session::Session;
 use crate::store::Store;
@@ -22,6 +22,9 @@ const MAX_REQUEST: usize = 64 * 1024;
 /// Simultaneous controller connections. Each Apple device in the home holds
 /// one open, so this needs headroom well beyond the protocol minimum of 8.
 const MAX_CONNECTIONS: usize = 64;
+
+/// HAP status: the accessory could not reach the device behind it.
+const SERVICE_COMMUNICATION_FAILURE: i32 = -70402;
 
 const TLV: &str = "application/pairing+tlv8";
 const JSON: &str = "application/hap+json";
@@ -44,6 +47,20 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Whether to advertise over Bonjour. Tests turn this off.
     pub advertise: bool,
+    /// Where camera snapshots come from, if any accessory is a camera.
+    pub snapshots: Option<Arc<dyn SnapshotSource>>,
+}
+
+/// Supplies still images for camera accessories.
+pub trait SnapshotSource: Send + Sync {
+    /// A JPEG of roughly the requested size for the accessory, or `None`
+    /// if it has no image to give right now.
+    fn snapshot(
+        &self,
+        aid: u64,
+        width: u32,
+        height: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>;
 }
 
 /// A controller connection, for status displays.
@@ -56,6 +73,7 @@ pub struct ConnectionInfo {
 }
 
 struct Shared {
+    snapshots: Option<Arc<dyn SnapshotSource>>,
     connections: Mutex<BTreeMap<u64, ConnectionInfo>>,
     store: Arc<Store>,
     db: Arc<Database>,
@@ -135,6 +153,7 @@ impl Bridge {
             None
         };
         let shared = Arc::new(Shared {
+            snapshots: config.snapshots,
             connections: Mutex::new(BTreeMap::new()),
             store,
             db,
@@ -176,6 +195,7 @@ impl Bridge {
                     shared.connections.lock().unwrap().insert(id, info);
                     let result = Connection::new(shared.clone(), stream, id, peer).run().await;
                     shared.connections.lock().unwrap().remove(&id);
+                    shared.db.connection_closed(id);
                     if let Err(e) = result {
                         tracing::debug!("connection {id} from {peer} closed: {e}");
                     }
@@ -304,6 +324,8 @@ struct Connection {
     stream: TcpStream,
     id: u64,
     peer: SocketAddr,
+    /// This machine's address on the interface the controller connected to.
+    local_ip: std::net::IpAddr,
     session: Option<Session>,
     /// Identifier of the verified controller, once pair-verify has succeeded.
     controller: Option<String>,
@@ -314,11 +336,13 @@ struct Connection {
 
 impl Connection {
     fn new(shared: Arc<Shared>, stream: TcpStream, id: u64, peer: SocketAddr) -> Self {
+        let local_ip = stream.local_addr().map_or(peer.ip(), |a| a.ip()).to_canonical();
         Self {
             shared,
             stream,
             id,
             peer,
+            local_ip,
             session: None,
             controller: None,
             setup: SetupState::default(),
@@ -355,7 +379,7 @@ impl Connection {
                     }
                     while let Some(request) = parse_request(&mut plain)? {
                         let was_encrypted = self.session.is_some();
-                        let (reply, upgrade) = self.handle(request);
+                        let (reply, upgrade) = self.handle(request).await;
                         self.send(&reply).await?;
                         if let Some(session) = upgrade {
                             self.session = Some(session);
@@ -395,7 +419,7 @@ impl Connection {
 
     /// Produces the reply to one request and, when pair-verify completes, the
     /// session to switch to after that reply has been sent in the clear.
-    fn handle(&mut self, request: Request) -> (Vec<u8>, Option<Session>) {
+    async fn handle(&mut self, request: Request) -> (Vec<u8>, Option<Session>) {
         let store = self.shared.store.clone();
         let unauthorized = || json_response(470, &json!({ "status": status::INSUFFICIENT_PRIVILEGES }));
         let reply = match (request.method.as_str(), request.path.as_str(), self.controller.clone()) {
@@ -458,6 +482,7 @@ impl Connection {
             ("GET", "/characteristics", Some(_)) => self.read_characteristics(&request.query),
             ("PUT", "/characteristics", Some(_)) => self.write_characteristics(&request.body),
             // Timed writes are acknowledged; no characteristic requires them yet.
+            ("POST", "/resource", Some(_)) => self.resource(&request.body).await,
             ("PUT", "/prepare", Some(_)) => json_response(200, &json!({ "status": status::OK })),
             _ => response(404, JSON, b"{}"),
         };
@@ -480,6 +505,28 @@ impl Connection {
                 tracing::warn!("{what} step {step} from {} refused: {reason}", self.peer.ip().to_canonical());
             }
             None => tracing::info!("{what} step {step} from {} ok", self.peer.ip().to_canonical()),
+        }
+    }
+
+    /// Serves a camera snapshot.
+    async fn resource(&self, body: &[u8]) -> Vec<u8> {
+        let failed = |code: i32| json_response(207, &json!({ "status": code }));
+        let Ok(request) = serde_json::from_slice::<Value>(body) else {
+            return json_response(400, &json!({ "status": status::INVALID_VALUE }));
+        };
+        if request["resource-type"] != "image" {
+            return json_response(400, &json!({ "status": status::INVALID_VALUE }));
+        }
+        let dimension = |key: &str| request[key].as_u64().filter(|n| (1..=8192).contains(n)).map(|n| n as u32);
+        let (Some(width), Some(height)) = (dimension("image-width"), dimension("image-height")) else {
+            return json_response(400, &json!({ "status": status::INVALID_VALUE }));
+        };
+        // A bridge with one camera may omit the accessory id.
+        let aid = request["aid"].as_u64().unwrap_or(1);
+        let Some(source) = &self.shared.snapshots else { return failed(status::NOT_FOUND) };
+        match source.snapshot(aid, width, height).await {
+            Some(jpeg) => response(200, "image/jpeg", &jpeg),
+            None => failed(SERVICE_COMMUNICATION_FAILURE),
         }
     }
 
@@ -549,7 +596,12 @@ impl Connection {
             };
             let mut code = status::OK;
             if let Some(value) = write.get("value") {
-                if let Err(e) = self.shared.db.write(aid, iid, value, self.id) {
+                let context = WriteContext {
+                    connection: self.id,
+                    local_ip: self.local_ip,
+                    peer_ip: self.peer.ip().to_canonical(),
+                };
+                if let Err(e) = self.shared.db.write(aid, iid, value, &context) {
                     code = e;
                 }
             }
