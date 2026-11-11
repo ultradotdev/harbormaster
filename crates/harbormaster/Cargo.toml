@@ -1,0 +1,13 @@
+[package]
+name = "harbormaster"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+harbormaster-hap = { version = "0.1.0", path = "../hap" }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"

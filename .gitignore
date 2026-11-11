@@ -40,3 +40,4 @@
 .opencode/hooks/cortex-session-start.sh
 .opencode/hooks/cortex-stop.sh
 .opencode/agents/cortex-capture.md
+/target
