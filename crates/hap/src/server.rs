@@ -327,6 +327,8 @@ struct Connection {
     /// This machine's address on the interface the controller connected to.
     local_ip: std::net::IpAddr,
     session: Option<Session>,
+    /// The verified session's secret, kept for deriving side-channel keys.
+    shared_secret: Option<[u8; 32]>,
     /// Identifier of the verified controller, once pair-verify has succeeded.
     controller: Option<String>,
     setup: SetupState,
@@ -344,6 +346,7 @@ impl Connection {
             peer,
             local_ip,
             session: None,
+            shared_secret: None,
             controller: None,
             setup: SetupState::default(),
             verify: None,
@@ -449,6 +452,7 @@ impl Connection {
                         info.controller = Some(v.controller_id.clone());
                     }
                     self.controller = Some(v.controller_id);
+                    self.shared_secret = Some(v.shared_secret);
                     Session::new(&v.shared_secret)
                 });
                 return (response(200, TLV, &body), session);
@@ -589,20 +593,26 @@ impl Connection {
         let Ok(parsed) = serde_json::from_slice::<Value>(body) else { return bad() };
         let Some(writes) = parsed["characteristics"].as_array() else { return bad() };
         let mut failed = false;
+        let mut with_values = false;
         let mut results = Vec::new();
         for write in writes {
             let (Some(aid), Some(iid)) = (write["aid"].as_u64(), write["iid"].as_u64()) else {
                 return bad();
             };
             let mut code = status::OK;
+            let mut answer = None;
             if let Some(value) = write.get("value") {
                 let context = WriteContext {
                     connection: self.id,
                     local_ip: self.local_ip,
                     peer_ip: self.peer.ip().to_canonical(),
+                    shared_secret: self.shared_secret,
                 };
-                if let Err(e) = self.shared.db.write(aid, iid, value, &context) {
-                    code = e;
+                match self.shared.db.write(aid, iid, value, &context) {
+                    // The controller asked for the answer in this reply.
+                    Ok(stored) if write["r"] == true => answer = Some(stored),
+                    Ok(_) => {}
+                    Err(e) => code = e,
                 }
             }
             if let (status::OK, Some(subscribe)) = (code, write.get("ev")) {
@@ -619,9 +629,15 @@ impl Connection {
                 }
             }
             failed |= code != status::OK;
-            results.push(json!({ "aid": aid, "iid": iid, "status": code }));
+            let mut result = json!({ "aid": aid, "iid": iid, "status": code });
+            if let (status::OK, Some(value)) = (code, answer) {
+                result["value"] = value;
+                with_values = true;
+            }
+            results.push(result);
         }
-        if failed {
+        // A reply that carries values or failures lists every write.
+        if failed || with_values {
             json_response(207, &json!({ "characteristics": results }))
         } else {
             response(204, "", &[])

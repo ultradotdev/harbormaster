@@ -41,7 +41,7 @@ pub const AAC_ELD: u8 = 2;
 pub const OPUS: u8 = 3;
 
 /// Separates repeated items of the same type in a TLV8 list.
-fn separator(tlv: &mut Tlv) {
+pub(crate) fn separator(tlv: &mut Tlv) {
     tlv.push(0x00, &[]);
 }
 
@@ -49,19 +49,19 @@ fn encode(tlv: &Tlv) -> String {
     base64_encode(&tlv.encode())
 }
 
-fn tlv_value(tlv: &Tlv) -> Value {
+pub(crate) fn tlv_value(tlv: &Tlv) -> Value {
     json!(encode(tlv))
 }
 
-fn decode(value: &Value) -> Option<Tlv> {
+pub(crate) fn decode(value: &Value) -> Option<Tlv> {
     Tlv::decode(&base64_decode(value.as_str()?)?).ok()
 }
 
-fn nested(tlv: &Tlv, ty: u8) -> Option<Tlv> {
+pub(crate) fn nested(tlv: &Tlv, ty: u8) -> Option<Tlv> {
     Tlv::decode(tlv.get(ty)?).ok()
 }
 
-fn u16_le(tlv: &Tlv, ty: u8) -> Option<u16> {
+pub(crate) fn u16_le(tlv: &Tlv, ty: u8) -> Option<u16> {
     Some(u16::from_le_bytes(tlv.get(ty)?.try_into().ok()?))
 }
 

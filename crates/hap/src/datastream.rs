@@ -239,11 +239,11 @@ impl DataStreams {
                     }
                 }
                 // The hub has what it wants, or has given up.
-                ("dataSend", "close" | "ack", Kind::Event) => {
-                    if sending.as_ref().is_some_and(|(id, _)| Some(*id) == stream_id) {
-                        if let Some((_, task)) = sending.take() {
-                            task.abort();
-                        }
+                ("dataSend", "close" | "ack", Kind::Event)
+                    if sending.as_ref().is_some_and(|(id, _)| Some(*id) == stream_id) =>
+                {
+                    if let Some((_, task)) = sending.take() {
+                        task.abort();
                     }
                 }
                 _ => {}

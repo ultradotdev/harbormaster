@@ -91,6 +91,9 @@ pub struct Characteristic {
     pub readable: bool,
     pub writable: bool,
     pub notifies: bool,
+    /// Whether a controller may ask for the handler's answer in the reply
+    /// to its write, instead of reading it afterwards.
+    pub write_response: bool,
     pub value: Value,
     pub unit: Option<&'static str>,
     /// Minimum, maximum and step for numeric formats.
@@ -112,6 +115,7 @@ impl Characteristic {
             readable: true,
             writable: false,
             notifies: false,
+            write_response: false,
             value,
             unit: None,
             range: None,
@@ -133,7 +137,7 @@ impl Characteristic {
     }
 
     fn perms(&self) -> Vec<&'static str> {
-        [(self.readable, "pr"), (self.writable, "pw"), (self.notifies, "ev")]
+        [(self.readable, "pr"), (self.writable, "pw"), (self.notifies, "ev"), (self.write_response, "wr")]
             .into_iter()
             .filter_map(|(on, name)| on.then_some(name))
             .collect()
@@ -200,6 +204,8 @@ pub struct Service {
     pub iid: u64,
     pub kind: &'static str,
     pub primary: bool,
+    /// Instance ids of services this one works together with.
+    pub linked: Vec<u64>,
     pub characteristics: Vec<Characteristic>,
 }
 
@@ -264,7 +270,7 @@ impl Accessory {
             })
             .collect();
         let ids = characteristics.iter().map(|c| c.iid).collect();
-        self.services.push(Service { iid, kind, primary, characteristics });
+        self.services.push(Service { iid, kind, primary, linked: Vec::new(), characteristics });
         ids
     }
 
@@ -291,6 +297,14 @@ impl Accessory {
         let ids = self.add_service(kind, primary, characteristics);
         self.next_iid = restore.max(end + 1);
         ids
+    }
+
+    /// Records that the service at `from` works together with the one at
+    /// `to`. Both are service instance ids.
+    pub fn link(&mut self, from: u64, to: u64) {
+        if let Some(service) = self.services.iter_mut().find(|s| s.iid == from) {
+            service.linked.push(to);
+        }
     }
 
     fn characteristic(&self, iid: u64) -> Option<&Characteristic> {
@@ -320,6 +334,9 @@ pub struct WriteContext {
     /// This machine's address as the controller reached it.
     pub local_ip: IpAddr,
     pub peer_ip: IpAddr,
+    /// The secret this controller's encrypted session is built on, from
+    /// which keys for side channels are derived.
+    pub shared_secret: Option<[u8; 32]>,
 }
 
 /// Runs synchronously when a controller writes a characteristic. Returning
@@ -402,6 +419,9 @@ impl Database {
                         if s.primary {
                             service["primary"] = json!(true);
                         }
+                        if !s.linked.is_empty() {
+                            service["linked"] = json!(s.linked);
+                        }
                         service
                     })
                     .collect();
@@ -419,7 +439,7 @@ impl Database {
         for a in self.accessories.read().unwrap().iter() {
             shape.push_str(&format!("a{}", a.aid));
             for s in &a.services {
-                shape.push_str(&format!("s{}:{}", s.iid, s.kind));
+                shape.push_str(&format!("s{}:{}:{:?}", s.iid, s.kind, s.linked));
                 for c in &s.characteristics {
                     shape.push_str(&format!("c{}:{}", c.iid, c.kind));
                     // Fixed structured values, such as the codecs a camera
@@ -446,7 +466,9 @@ impl Database {
     }
 
     /// Applies a write from a controller connection.
-    pub fn write(&self, aid: u64, iid: u64, value: &Value, context: &WriteContext) -> Result<(), i32> {
+    /// Applies a controller's write and returns the value that was stored:
+    /// what was written, or the handler's answer.
+    pub fn write(&self, aid: u64, iid: u64, value: &Value, context: &WriteContext) -> Result<Value, i32> {
         let value = self
             .with(aid, iid, |c| {
                 if !c.writable {
@@ -472,12 +494,12 @@ impl Database {
             if c.readable {
                 c.value = stored.clone();
             }
-            Change { aid, iid, value: stored, origin: Some(context.connection) }
+            Change { aid, iid, value: stored.clone(), origin: Some(context.connection) }
         };
         // Send errors only mean nobody is listening.
         let _ = self.writes.send(change.clone());
         let _ = self.changes.send(change);
-        Ok(())
+        Ok(stored)
     }
 
     /// Sends an event without storing a value, for stateless things such as
@@ -533,7 +555,12 @@ mod tests {
     }
 
     fn context() -> WriteContext {
-        WriteContext { connection: 1, local_ip: "10.0.0.2".parse().unwrap(), peer_ip: "10.0.0.9".parse().unwrap() }
+        WriteContext {
+            connection: 1,
+            local_ip: "10.0.0.2".parse().unwrap(),
+            peer_ip: "10.0.0.9".parse().unwrap(),
+            shared_secret: None,
+        }
     }
 
     #[test]
@@ -561,16 +588,16 @@ mod tests {
                 _ => Ok(None),
             }),
         );
-        assert_eq!(db.write(2, iid, &json!("ask"), &context()), Ok(()));
+        assert_eq!(db.write(2, iid, &json!("ask"), &context()), Ok(json!("answer for 10.0.0.9")));
         assert_eq!(db.read(2, iid), Ok(json!("answer for 10.0.0.9")));
         assert_eq!(db.write(2, iid, &json!("bad"), &context()), Err(status::INVALID_VALUE));
         assert_eq!(db.read(2, iid), Ok(json!("answer for 10.0.0.9")), "a rejected write stores nothing");
-        assert_eq!(db.write(2, iid, &json!("plain"), &context()), Ok(()));
+        assert_eq!(db.write(2, iid, &json!("plain"), &context()), Ok(json!("plain")));
         assert_eq!(db.read(2, iid), Ok(json!("plain")));
 
         let (accessory, iid) = build();
         db.replace(accessory);
-        assert_eq!(db.write(2, iid, &json!("ask"), &context()), Ok(()));
+        assert_eq!(db.write(2, iid, &json!("ask"), &context()), Ok(json!("ask")));
         assert_eq!(db.read(2, iid), Ok(json!("ask")), "the old handler is gone");
         assert_eq!(db.to_json()["accessories"].as_array().unwrap().len(), 1);
     }
@@ -649,7 +676,7 @@ mod tests {
         assert_eq!(db.read(9, 1), Err(status::NOT_FOUND));
         let ctx = context();
         assert_eq!(db.write(2, iid, &json!(5.0), &ctx), Err(status::READ_ONLY));
-        assert_eq!(db.write(2, 2, &json!(1), &ctx), Ok(()));
+        assert_eq!(db.write(2, 2, &json!(1), &ctx), Ok(json!(true)));
         assert_eq!(db.write(2, 2, &json!("x"), &ctx), Err(status::INVALID_VALUE));
     }
 }

@@ -11,6 +11,7 @@ mod mdns;
 pub mod opack;
 pub mod model;
 mod pairing;
+pub mod recording;
 mod server;
 mod session;
 mod srp;

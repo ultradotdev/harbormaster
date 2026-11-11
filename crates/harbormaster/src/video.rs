@@ -724,7 +724,12 @@ mod tests {
     }
 
     fn context(connection: u64) -> WriteContext {
-        WriteContext { connection, local_ip: "127.0.0.1".parse().unwrap(), peer_ip: "127.0.0.1".parse().unwrap() }
+        WriteContext {
+            connection,
+            local_ip: "127.0.0.1".parse().unwrap(),
+            peer_ip: "127.0.0.1".parse().unwrap(),
+            shared_secret: None,
+        }
     }
 
     /// Builds the two controller writes the way an Apple device would.
