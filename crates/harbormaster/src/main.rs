@@ -3,9 +3,12 @@
 //! `harbormaster daemon` runs the bridge. `harbormaster` (or `harbormaster
 //! tui`) attaches a terminal interface to a running daemon.
 
+mod config;
 mod control;
 mod daemon;
+mod keychain;
 mod logbuf;
+mod protect_check;
 mod qr;
 mod tui;
 
@@ -22,9 +25,11 @@ Usage: harbormaster [COMMAND] [OPTIONS]
 Commands:
   tui      attach the terminal interface to a running daemon (default)
   daemon   run the HomeKit bridge
+  protect-check
+           test the UniFi Protect connection and list its cameras
 
 Options:
-  --state-dir DIR   where pairing state and the control socket live
+  --state-dir DIR   where config.toml, pairing state and the control socket live
   --listen ADDR     daemon: address and port to serve HomeKit on
                     (default 0.0.0.0:51826, which serves IPv4 and IPv6)
   --demo            daemon: publish a simulated temperature sensor";
@@ -32,6 +37,7 @@ Options:
 enum Command {
     Tui,
     Daemon,
+    ProtectCheck,
 }
 
 struct Args {
@@ -59,6 +65,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
         match arg.as_str() {
             "tui" => args.command = Command::Tui,
             "daemon" => args.command = Command::Daemon,
+            "protect-check" => args.command = Command::ProtectCheck,
             "--state-dir" => args.state_dir = value()?.into(),
             "--listen" => args.listen = value()?.parse().context("--listen expects ADDRESS:PORT")?,
             "--demo" => args.demo = true,
@@ -79,6 +86,9 @@ fn main() -> Result<()> {
     let args = parse_args(std::env::args().skip(1))?;
     match args.command {
         Command::Tui => tui::run(&args.state_dir),
+        Command::ProtectCheck => {
+            tokio::runtime::Runtime::new()?.block_on(protect_check::run(&args.state_dir))
+        }
         Command::Daemon => {
             let logs = logbuf::LogBuffer::new();
             tracing_subscriber::registry()
