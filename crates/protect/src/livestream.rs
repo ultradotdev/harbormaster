@@ -197,11 +197,15 @@ impl Default for FeedOptions {
 /// The query string that asks the console for a feed. `camera_id` must
 /// already be known to contain only letters and digits.
 pub(crate) fn query(camera_id: &str, options: FeedOptions) -> String {
+    // Two feeds of the same camera can be open at once (a viewer and a
+    // recording), so each request gets its own label.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Parameters with no value are switches: fragments are sent as they
     // are produced, without waiting for a whole group of pictures.
     format!(
         "allowPartialGOP=&camera={camera_id}&channel={}&chunkSize=4096&fragmentDurationMillis={}&lens=0\
-         &progressive=&rebaseTimestampsToZero=true&requestId={camera_id}-{}&type=fmp4&useWallClock=false",
+         &progressive=&rebaseTimestampsToZero=true&requestId={camera_id}-{}-{serial}&type=fmp4&useWallClock=false",
         options.channel,
         options.fragment_ms.max(100),
         options.channel
@@ -349,7 +353,8 @@ mod tests {
     fn builds_the_request_and_keeps_only_the_path_of_the_answer() {
         let q = query("abc123", FeedOptions { channel: 1, fragment_ms: 20 });
         assert!(q.starts_with("allowPartialGOP=&camera=abc123&channel=1&chunkSize=4096&fragmentDurationMillis=100&"), "{q}");
-        assert!(q.ends_with("&requestId=abc123-1&type=fmp4&useWallClock=false"), "{q}");
+        assert!(q.contains("&requestId=abc123-1-") && q.ends_with("&type=fmp4&useWallClock=false"), "{q}");
+        assert_ne!(q, query("abc123", FeedOptions { channel: 1, fragment_ms: 20 }), "each request is labelled apart");
         assert!(!q.contains(' '), "{q}");
 
         assert_eq!(path_of("wss://192.168.1.1:7443/ws/livestream?token=ab-c_d&x=1"), Some("/ws/livestream?token=ab-c_d&x=1"));

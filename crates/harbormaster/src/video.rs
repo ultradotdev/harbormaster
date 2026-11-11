@@ -9,6 +9,7 @@
 use std::net::{IpAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use harbormaster_hap::camera::{
@@ -47,8 +48,10 @@ fn input_args() -> Vec<String> {
         "200000",
         "-probesize",
         "200000",
-        "-hwaccel",
-        "videotoolbox",
+        // Decoding stays in software: the hardware decoder rejected the
+        // first frames of nearly every stream, and those include the
+        // keyframe everything after depends on. Encoding, the expensive
+        // half, still runs on the GPU.
         "-f",
         "mp4",
         "-i",
@@ -328,9 +331,12 @@ impl Stream {
         // Hand the camera's video to ffmpeg as it arrives. Closing ffmpeg's
         // input when the feed ends lets it finish cleanly.
         let stdin = child.stdin.take();
+        let progress = Arc::new(Progress::default());
+        let counting = progress.clone();
         let writer = tokio::spawn(async move {
             let Some(mut stdin) = stdin else { return };
             while let Some(data) = feed.recv().await {
+                counting.received.fetch_add(data.len() as u64, Ordering::Relaxed);
                 if stdin.write_all(&data).await.is_err() {
                     break;
                 }
@@ -344,12 +350,16 @@ impl Stream {
             let _socket = pending.socket;
             if let Some(stderr) = stderr {
                 let name = stream.name.clone();
+                let progress = progress.clone();
                 tokio::spawn(async move {
                     // ffmpeg repeats a complaint for every frame it cannot
                     // use, so each distinct one is logged once and counted.
                     let mut seen = Repeats::default();
                     let mut lines = BufReader::new(stderr).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
+                        if progress.note(&line) {
+                            continue;
+                        }
                         if seen.first(&line) {
                             tracing::warn!("{name}: ffmpeg: {line}");
                         }
@@ -371,6 +381,14 @@ impl Stream {
                     tracing::info!("{}: stream stopped", stream.name);
                 }
             }
+            // Whether video actually flowed, which the lines above cannot say.
+            tracing::info!(
+                "{}: the camera supplied {} kB; ffmpeg sent {} frames, {} kB",
+                stream.name,
+                progress.received.load(Ordering::Relaxed) / 1000,
+                progress.frames.load(Ordering::Relaxed),
+                progress.sent.load(Ordering::Relaxed) / 1000
+            );
             // Dropping the feed is what tells the source to stop reading.
             writer.abort();
             let mut state = stream.state.lock().unwrap();
@@ -382,6 +400,37 @@ impl Stream {
                 stream.set_status(camera::STATUS_AVAILABLE);
             }
         });
+    }
+}
+
+/// How much video went into and came out of one ffmpeg.
+#[derive(Default)]
+struct Progress {
+    /// Bytes of camera video handed to ffmpeg.
+    received: AtomicU64,
+    /// Video frames ffmpeg reports having sent.
+    frames: AtomicU64,
+    /// Bytes ffmpeg reports having sent.
+    sent: AtomicU64,
+}
+
+impl Progress {
+    /// Takes a line of ffmpeg's output and says whether it was one of its
+    /// periodic `key=value` progress reports rather than a complaint.
+    fn note(&self, line: &str) -> bool {
+        let Some((key, value)) = line.split_once('=') else { return false };
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') {
+            return false;
+        }
+        let target = match key {
+            "frame" => &self.frames,
+            "total_size" => &self.sent,
+            _ => return true,
+        };
+        if let Ok(n) = value.trim().parse() {
+            target.store(n, Ordering::Relaxed);
+        }
+        true
     }
 }
 
@@ -425,7 +474,9 @@ fn ffmpeg_args(
     let port = request.video_port;
     let fixed = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-    let mut args = fixed(&["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    // Progress is reported on the error stream every two seconds, where it
+    // is counted instead of logged.
+    let mut args = fixed(&["-hide_banner", "-loglevel", "error", "-nostdin", "-progress", "pipe:2", "-stats_period", "2"]);
     args.extend_from_slice(input);
     args.extend(fixed(&["-map", "0:v:0", "-an", "-sn", "-dn"]));
     args.extend([
@@ -580,6 +631,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn progress_reports_are_counted_and_complaints_are_not() {
+        let progress = Progress::default();
+        assert!(progress.note("frame=150"));
+        assert!(progress.note("total_size=   204800"));
+        assert!(progress.note("out_time_ms=5000000"));
+        assert!(progress.note("progress=continue"));
+        assert!(progress.note("stream_0_0_q=-0.0"));
+        assert!(!progress.note("[h264 @ 0x1] hardware accelerator failed to decode picture"));
+        assert!(!progress.note("Error opening output file srtp://x?rtcpport=1&pkt_size=2"));
+        assert!(!progress.note("Conversion failed!"));
+        assert_eq!(progress.frames.load(Ordering::Relaxed), 150);
+        assert_eq!(progress.sent.load(Ordering::Relaxed), 204800);
+    }
+
+    #[test]
     fn repeated_ffmpeg_messages_are_logged_once_and_counted() {
         let mut seen = Repeats::default();
         assert!(seen.first("[h264 @ 0x13660a3f0] hardware accelerator failed to decode picture"));
@@ -616,7 +682,7 @@ pub(crate) mod tests {
         let line = args.join(" ");
         assert!(!line.contains("aac_at"), "no sound was selected: {line}");
         for expected in [
-            "-hwaccel videotoolbox -f mp4 -i pipe:0",
+            "-probesize 200000 -f mp4 -i pipe:0",
             "-vf scale=1280:720",
             "-r 30",
             "-codec:v h264_videotoolbox",

@@ -521,7 +521,9 @@ fn ffmpeg_args(format: &SelectedRecording, audio: bool) -> Vec<String> {
     let fixed = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
     let mut args = fixed(&["-hide_banner", "-loglevel", "error", "-nostdin"]);
-    args.extend(fixed(&["-hwaccel", "videotoolbox", "-f", "mp4", "-i", "pipe:0"]));
+    // Software decoding, as for live view: the hardware decoder drops the
+    // opening keyframe.
+    args.extend(fixed(&["-f", "mp4", "-i", "pipe:0"]));
     args.extend(fixed(&["-map", "0:v:0", "-sn", "-dn"]));
     args.extend([
         "-vf".into(),
