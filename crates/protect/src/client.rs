@@ -8,6 +8,7 @@ use hyper_util::rt::TokioIo;
 
 use crate::model::Bootstrap;
 use crate::tls::{self, Fingerprint};
+use crate::updates::UpdateStream;
 
 /// Largest response accepted. Bootstrap documents for big sites run to a few
 /// megabytes; this leaves generous room without being unbounded.
@@ -135,6 +136,13 @@ impl Client {
 
     /// Reads Protect's full device inventory.
     pub async fn bootstrap(&self) -> Result<Bootstrap, Error> {
+        let raw = self.bootstrap_raw().await?;
+        serde_json::from_value(raw).map_err(|e| Error::Protocol(format!("bootstrap: {e}")))
+    }
+
+    /// The bootstrap document as the console sent it. It contains account
+    /// details and access keys, so treat it as sensitive.
+    pub async fn bootstrap_raw(&self) -> Result<serde_json::Value, Error> {
         if self.session.is_none() {
             return Err(Error::NotSignedIn);
         }
@@ -155,5 +163,42 @@ impl Client {
             return Err(Error::ProtectNotFound);
         }
         serde_json::from_slice(response.body()).map_err(|e| Error::Protocol(format!("bootstrap: {e}")))
+    }
+
+    /// Opens the realtime update stream. Pass the bootstrap's
+    /// `last_update_id` so nothing is missed between the two.
+    pub async fn updates(&self, last_update_id: Option<&str>) -> Result<UpdateStream, Error> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let session = self.session.as_ref().ok_or(Error::NotSignedIn)?;
+        let mut url = format!("wss://{}:{}/proxy/protect/ws/updates", self.host, self.port);
+        if let Some(id) = last_update_id {
+            // Update ids are UUIDs; refuse anything that would need escaping.
+            if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                return Err(Error::Protocol("unexpected characters in update id".into()));
+            }
+            url.push_str("?lastUpdateId=");
+            url.push_str(id);
+        }
+        let protocol = |e: &dyn std::fmt::Display| Error::Protocol(format!("update stream: {e}"));
+        let mut request = url.into_client_request().map_err(|e| protocol(&e))?;
+        request.headers_mut().insert(COOKIE, HeaderValue::from_str(&session.cookie).map_err(|e| protocol(&e))?);
+
+        let connect = async {
+            let stream = tls::connect(&self.host, self.port, self.pin).await.map_err(|e| {
+                let text = e.to_string();
+                if text.contains("fingerprint mismatch") {
+                    Error::CertificateMismatch(text)
+                } else {
+                    Error::Connect(e)
+                }
+            })?;
+            use tokio_tungstenite::tungstenite::Error as Ws;
+            match tokio_tungstenite::client_async(request, stream).await {
+                Ok((socket, _)) => Ok(UpdateStream::new(socket)),
+                Err(Ws::Http(response)) if matches!(response.status().as_u16(), 401 | 403) => Err(Error::NotSignedIn),
+                Err(e) => Err(protocol(&e)),
+            }
+        };
+        tokio::time::timeout(REQUEST_TIMEOUT, connect).await.map_err(|_| Error::Timeout)?
     }
 }

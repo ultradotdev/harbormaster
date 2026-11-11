@@ -10,6 +10,7 @@ mod keychain;
 mod logbuf;
 mod protect_check;
 mod qr;
+mod secrets;
 mod tui;
 
 use std::net::SocketAddr;
@@ -27,17 +28,21 @@ Commands:
   daemon   run the HomeKit bridge
   protect-check
            test the UniFi Protect connection and list its cameras
+  protect-capture
+           record Protect's inventory and live updates to files for development
 
 Options:
   --state-dir DIR   where config.toml, pairing state and the control socket live
   --listen ADDR     daemon: address and port to serve HomeKit on
                     (default 0.0.0.0:51826, which serves IPv4 and IPv6)
-  --demo            daemon: publish a simulated temperature sensor";
+  --demo            daemon: publish a simulated temperature sensor
+  --seconds N       protect-capture: how long to record (default 120)";
 
 enum Command {
     Tui,
     Daemon,
     ProtectCheck,
+    ProtectCapture,
 }
 
 struct Args {
@@ -45,6 +50,7 @@ struct Args {
     state_dir: PathBuf,
     listen: SocketAddr,
     demo: bool,
+    seconds: u64,
 }
 
 fn default_state_dir() -> Result<PathBuf> {
@@ -58,6 +64,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
         state_dir: PathBuf::new(),
         listen: "0.0.0.0:51826".parse()?,
         demo: false,
+        seconds: 120,
     };
     let mut input = input.into_iter();
     while let Some(arg) = input.next() {
@@ -66,6 +73,8 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
             "tui" => args.command = Command::Tui,
             "daemon" => args.command = Command::Daemon,
             "protect-check" => args.command = Command::ProtectCheck,
+            "protect-capture" => args.command = Command::ProtectCapture,
+            "--seconds" => args.seconds = value()?.parse().context("--seconds expects a number")?,
             "--state-dir" => args.state_dir = value()?.into(),
             "--listen" => args.listen = value()?.parse().context("--listen expects ADDRESS:PORT")?,
             "--demo" => args.demo = true,
@@ -88,6 +97,9 @@ fn main() -> Result<()> {
         Command::Tui => tui::run(&args.state_dir),
         Command::ProtectCheck => {
             tokio::runtime::Runtime::new()?.block_on(protect_check::run(&args.state_dir))
+        }
+        Command::ProtectCapture => {
+            tokio::runtime::Runtime::new()?.block_on(protect_check::capture(&args.state_dir, args.seconds))
         }
         Command::Daemon => {
             let logs = logbuf::LogBuffer::new();
