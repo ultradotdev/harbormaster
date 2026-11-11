@@ -355,6 +355,9 @@ fn ffmpeg_args(input: &[String], request: &SetupRequest, video: &SelectedVideo, 
         bitrate.clone(),
         "-maxrate".into(),
         bitrate,
+        // B-frames would make the encoder hold frames back to reorder them.
+        "-bf".into(),
+        "0".into(),
         // A keyframe every two seconds lets a viewer recover from loss.
         "-g".into(),
         (fps as u32 * 2).to_string(),
@@ -422,6 +425,7 @@ mod tests {
             "-profile:v main",
             "-level:v 4.0",
             "-b:v 299k",
+            "-bf 0",
             "-g 60",
             "-payload_type 99",
             "-ssrc 12345",

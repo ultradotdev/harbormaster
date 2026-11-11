@@ -181,28 +181,56 @@ pub fn pair_verify(
             (response, None)
         }
         (Some(3), Some(v)) => match finish_verify(&v, store, &req) {
-            Some(controller_id) => (
+            Ok(controller_id) => (
                 Tlv::new().with(tlv::STATE, &[4]).encode(),
                 Some(Verified { controller_id, shared_secret: v.shared }),
             ),
-            None => (fail(4, error::AUTHENTICATION), None),
+            Err(reason) => {
+                // An unknown identity is routine: Apple devices try pairings
+                // they remember from before the bridge was last added to a
+                // home, then retry. A bad signature is not routine.
+                match reason {
+                    VerifyFailure::UnknownController => {
+                        tracing::debug!("pair-verify refused: controller identity is not paired")
+                    }
+                    VerifyFailure::Malformed => tracing::warn!("pair-verify refused: malformed or undecryptable request"),
+                    VerifyFailure::BadSignature => {
+                        tracing::warn!("pair-verify refused: a paired controller identity sent a bad signature")
+                    }
+                }
+                (fail(4, error::AUTHENTICATION), None)
+            }
         },
         (Some(3), None) => (fail(4, error::UNKNOWN), None),
         _ => (fail(0, error::UNKNOWN), None),
     }
 }
 
-fn finish_verify(v: &VerifyState, store: &Store, req: &Tlv) -> Option<String> {
-    let plain = open(&v.session_key, b"PV-Msg03", &[], req.get(tlv::ENCRYPTED_DATA)?)?;
-    let inner = Tlv::decode(&plain).ok()?;
-    let controller_id = std::str::from_utf8(inner.get(tlv::IDENTIFIER)?).ok()?;
-    let pairing = store.pairing(controller_id)?;
-    let public_key = key32(&from_hex(&pairing.public_key)?)?;
+enum VerifyFailure {
+    Malformed,
+    UnknownController,
+    BadSignature,
+}
+
+fn finish_verify(v: &VerifyState, store: &Store, req: &Tlv) -> Result<String, VerifyFailure> {
+    use VerifyFailure::*;
+    let sealed = req.get(tlv::ENCRYPTED_DATA).ok_or(Malformed)?;
+    let plain = open(&v.session_key, b"PV-Msg03", &[], sealed).ok_or(Malformed)?;
+    let inner = Tlv::decode(&plain).map_err(|_| Malformed)?;
+    let controller_id =
+        inner.get(tlv::IDENTIFIER).and_then(|id| std::str::from_utf8(id).ok()).ok_or(Malformed)?;
+    let signature = inner.get(tlv::SIGNATURE).ok_or(Malformed)?;
+    let pairing = store.pairing(controller_id).ok_or(UnknownController)?;
+    let public_key = from_hex(&pairing.public_key).and_then(|k| key32(&k)).ok_or(Malformed)?;
 
     let mut signed = v.controller_public.to_vec();
     signed.extend_from_slice(controller_id.as_bytes());
     signed.extend_from_slice(&v.accessory_public);
-    verify_signature(&public_key, &signed, inner.get(tlv::SIGNATURE)?).then(|| controller_id.to_owned())
+    if verify_signature(&public_key, &signed, signature) {
+        Ok(controller_id.to_owned())
+    } else {
+        Err(BadSignature)
+    }
 }
 
 /// Add, remove or list pairings. Only admin controllers may call this.

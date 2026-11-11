@@ -440,9 +440,9 @@ impl Connection {
             }
             ("POST", "/pair-verify", _) => {
                 let (body, verified) = pairing::pair_verify(&mut self.verify, &store, &request.body);
-                if verified.is_none() {
-                    self.log_pairing_step("pair-verify", &request.body, &body);
-                }
+                // Verification happens on every connection; the pairing module
+                // reports the refusals that matter, so only trace progress here.
+                tracing::debug!("connection {} pair-verify exchange", self.id);
                 let session = verified.map(|v| {
                     tracing::debug!("connection {} verified as {}", self.id, v.controller_id);
                     if let Some(info) = self.shared.connections.lock().unwrap().get_mut(&self.id) {

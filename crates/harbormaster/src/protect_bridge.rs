@@ -261,10 +261,31 @@ impl VideoSource for ProtectVideo {
         let channel = available.iter().find(|c| c.width >= width).or(available.last())?;
         let url = format!("rtsps://{}:{}/{}?enableSrtp", self.live.host, inner.rtsps_port, channel.alias);
         Some(
-            ["-hwaccel", "videotoolbox", "-rtsp_transport", "tcp", "-i", url.as_str()]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            [
+                // Whatever ffmpeg reads while working out what the stream is
+                // gets sent in a burst afterwards, and the viewer then stays
+                // that far behind for the whole session. So probe as little
+                // as possible and never buffer input.
+                "-fflags",
+                "nobuffer",
+                "-flags",
+                "low_delay",
+                "-fpsprobesize",
+                "0",
+                "-analyzeduration",
+                "200000",
+                "-probesize",
+                "200000",
+                "-hwaccel",
+                "videotoolbox",
+                "-rtsp_transport",
+                "tcp",
+                "-i",
+                url.as_str(),
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         )
     }
 }
