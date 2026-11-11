@@ -4,10 +4,12 @@
 //! the console's own certificate. Nothing here talks to Ubiquiti's cloud.
 
 mod client;
+mod livestream;
 pub mod model;
 mod tls;
 mod updates;
 
 pub use client::{Client, Error};
+pub use livestream::{Decoder, FeedError, FeedOptions, FrameCounts, Livestream, Segment};
 pub use tls::{fetch_fingerprint, BadFingerprint, Fingerprint};
 pub use updates::{decode_packet, DecodeError, Update, UpdateStream};

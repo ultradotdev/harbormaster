@@ -32,19 +32,24 @@ Commands:
            test the UniFi Protect connection and list its cameras
   protect-capture
            record Protect's inventory and live updates to files for development
+  protect-feed
+           record a few seconds of a camera's native live feed for development
 
 Options:
   --state-dir DIR   where config.toml, pairing state and the control socket live
   --listen ADDR     daemon: address and port to serve HomeKit on
                     (default 0.0.0.0:51826, which serves IPv4 and IPv6)
   --demo            daemon: publish a simulated temperature sensor
-  --seconds N       protect-capture: how long to record (default 120)";
+  --seconds N       protect-capture, protect-feed: how long to record (default 120)
+  --camera NAME     protect-feed: which camera (default: the first in `devices`)
+  --channel N       protect-feed: which quality, 0 being the best (default 0)";
 
 enum Command {
     Tui,
     Daemon,
     ProtectCheck,
     ProtectCapture,
+    ProtectFeed,
 }
 
 struct Args {
@@ -53,6 +58,8 @@ struct Args {
     listen: SocketAddr,
     demo: bool,
     seconds: u64,
+    camera: Option<String>,
+    channel: u8,
 }
 
 fn default_state_dir() -> Result<PathBuf> {
@@ -67,6 +74,8 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
         listen: "0.0.0.0:51826".parse()?,
         demo: false,
         seconds: 120,
+        camera: None,
+        channel: 0,
     };
     let mut input = input.into_iter();
     while let Some(arg) = input.next() {
@@ -76,6 +85,9 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
             "daemon" => args.command = Command::Daemon,
             "protect-check" => args.command = Command::ProtectCheck,
             "protect-capture" => args.command = Command::ProtectCapture,
+            "protect-feed" => args.command = Command::ProtectFeed,
+            "--camera" => args.camera = Some(value()?),
+            "--channel" => args.channel = value()?.parse().context("--channel expects a small number")?,
             "--seconds" => args.seconds = value()?.parse().context("--seconds expects a number")?,
             "--state-dir" => args.state_dir = value()?.into(),
             "--listen" => args.listen = value()?.parse().context("--listen expects ADDRESS:PORT")?,
@@ -103,6 +115,12 @@ fn main() -> Result<()> {
         Command::ProtectCapture => {
             tokio::runtime::Runtime::new()?.block_on(protect_check::capture(&args.state_dir, args.seconds))
         }
+        Command::ProtectFeed => tokio::runtime::Runtime::new()?.block_on(protect_check::feed(
+            &args.state_dir,
+            args.camera.as_deref(),
+            args.channel,
+            args.seconds,
+        )),
         Command::Daemon => {
             let logs = logbuf::LogBuffer::new();
             tracing_subscriber::registry()
@@ -131,6 +149,9 @@ mod tests {
         assert!(matches!(args.command, Command::Daemon) && args.demo);
         assert_eq!((args.state_dir, args.listen.port()), (PathBuf::from("/x"), 1));
         assert!(matches!(parse(&["--state-dir", "/x"]).unwrap().command, Command::Tui));
+        let feed = parse(&["protect-feed", "--camera", "Front Door", "--channel", "1", "--seconds", "5"]).unwrap();
+        assert!(matches!(feed.command, Command::ProtectFeed));
+        assert_eq!((feed.camera.as_deref(), feed.channel, feed.seconds), (Some("Front Door"), 1, 5));
         assert!(parse(&["bogus"]).is_err());
         assert!(parse(&["--listen"]).is_err());
     }

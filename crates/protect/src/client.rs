@@ -6,6 +6,11 @@ use hyper::header::{HeaderValue, CONTENT_TYPE, COOKIE, HOST, SET_COOKIE};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 
+use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
+use tokio_tungstenite::WebSocketStream;
+
+use crate::livestream::{self, FeedOptions, Livestream};
 use crate::model::Bootstrap;
 use crate::tls::{self, Fingerprint};
 use crate::updates::UpdateStream;
@@ -201,8 +206,9 @@ impl Client {
     /// Opens the realtime update stream. Pass the bootstrap's
     /// `last_update_id` so nothing is missed between the two.
     pub async fn updates(&self, last_update_id: Option<&str>) -> Result<UpdateStream, Error> {
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        let session = self.session.as_ref().ok_or(Error::NotSignedIn)?;
+        if self.session.is_none() {
+            return Err(Error::NotSignedIn);
+        }
         let mut url = format!("wss://{}:{}/proxy/protect/ws/updates", self.host, self.port);
         if let Some(id) = last_update_id {
             // Update ids are UUIDs; refuse anything that would need escaping.
@@ -212,7 +218,40 @@ impl Client {
             url.push_str("?lastUpdateId=");
             url.push_str(id);
         }
-        let protocol = |e: &dyn std::fmt::Display| Error::Protocol(format!("update stream: {e}"));
+        Ok(UpdateStream::new(self.websocket(url, "update stream").await?))
+    }
+
+    /// Opens a camera's native live video feed.
+    pub async fn livestream(&self, camera_id: &str, options: FeedOptions) -> Result<Livestream, Error> {
+        if self.session.is_none() {
+            return Err(Error::NotSignedIn);
+        }
+        if camera_id.is_empty() || !camera_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(Error::Protocol("unexpected characters in camera id".into()));
+        }
+        // The console first hands out a one-time address for the feed.
+        let path = format!("/proxy/protect/api/ws/livestream?{}", livestream::query(camera_id, options));
+        let response = self.send(self.request(Method::GET, &path, Bytes::new())).await?;
+        match response.status() {
+            StatusCode::OK => {}
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Err(Error::NotSignedIn),
+            status => return Err(Error::Status(status)),
+        }
+        let answer: serde_json::Value =
+            serde_json::from_slice(response.body()).map_err(|e| Error::Protocol(format!("live feed: {e}")))?;
+        let minted = answer["url"]
+            .as_str()
+            .and_then(livestream::path_of)
+            .ok_or_else(|| Error::Protocol("live feed: the console gave no usable address".into()))?;
+        let url = format!("wss://{}:{}/proxy/protect{minted}", self.host, self.port);
+        Ok(Livestream::new(self.websocket(url, "live feed").await?))
+    }
+
+    /// Opens a WebSocket to the pinned console with the session attached.
+    async fn websocket(&self, url: String, what: &str) -> Result<WebSocketStream<TlsStream<TcpStream>>, Error> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let session = self.session.as_ref().ok_or(Error::NotSignedIn)?;
+        let protocol = |e: &dyn std::fmt::Display| Error::Protocol(format!("{what}: {e}"));
         let mut request = url.into_client_request().map_err(|e| protocol(&e))?;
         request.headers_mut().insert(COOKIE, HeaderValue::from_str(&session.cookie).map_err(|e| protocol(&e))?);
 
@@ -227,7 +266,7 @@ impl Client {
             })?;
             use tokio_tungstenite::tungstenite::Error as Ws;
             match tokio_tungstenite::client_async(request, stream).await {
-                Ok((socket, _)) => Ok(UpdateStream::new(socket)),
+                Ok((socket, _)) => Ok(socket),
                 Err(Ws::Http(response)) if matches!(response.status().as_u16(), 401 | 403) => Err(Error::NotSignedIn),
                 Err(e) => Err(protocol(&e)),
             }

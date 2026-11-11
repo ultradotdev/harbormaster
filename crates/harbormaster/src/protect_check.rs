@@ -169,6 +169,85 @@ pub async fn capture(state_dir: &Path, seconds: u64) -> Result<()> {
     Ok(())
 }
 
+/// `harbormaster protect-feed`: records a few seconds of a camera's native
+/// live feed to a playable file and reports how the feed behaved.
+pub async fn feed(state_dir: &Path, camera: Option<&str>, channel: u8, seconds: u64) -> Result<()> {
+    use harbormaster_protect::{FeedOptions, Segment};
+    use std::io::Write;
+    let Some((client, protect)) = sign_in(state_dir).await? else { return Ok(()) };
+    let bootstrap = client.bootstrap().await?;
+    let wanted = camera.map(str::to_owned).or_else(|| protect.devices.as_ref()?.first().cloned());
+    let Some(wanted) = wanted else { bail!("say which camera with --camera NAME") };
+    let Some(found) = bootstrap
+        .cameras
+        .iter()
+        .find(|c| c.device.display_name().eq_ignore_ascii_case(&wanted) || c.device.id == wanted)
+    else {
+        bail!("no camera named {wanted}; protect-check lists them");
+    };
+    let name = found.device.display_name();
+    for c in &found.channels {
+        println!("channel {}: {} {}x{} at {} fps{}", c.id, c.name, c.width, c.height, c.fps, if c.enabled { "" } else { " (off)" });
+    }
+
+    let dir = state_dir.join("protect-capture");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(format!("feed-{channel}.mp4"));
+    let mut file = std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+
+    let started = std::time::Instant::now();
+    let mut stream = client.livestream(&found.device.id, FeedOptions { channel, ..Default::default() }).await?;
+    println!("{name}: feed for channel {channel} opened after {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let (mut fragments, mut bytes, mut largest) = (0u64, 0u64, 0usize);
+    let (mut first, mut last) = (None, started);
+    let mut longest_gap = std::time::Duration::ZERO;
+    loop {
+        let segment = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Err(_) => break,
+            Ok(Ok(Some(segment))) => segment,
+            Ok(Ok(None)) => {
+                println!("The console closed the feed.");
+                break;
+            }
+            Ok(Err(e)) => return Err(e.into()),
+        };
+        let at = started.elapsed().as_secs_f64() * 1000.0;
+        let data = match &segment {
+            Segment::Init { codec, data } => {
+                println!("{at:>7.0} ms  header, {} bytes, codec {}", data.len(), codec.as_deref().unwrap_or("not given"));
+                data
+            }
+            Segment::Media(data) => {
+                let now = std::time::Instant::now();
+                if first.is_none() {
+                    println!("{at:>7.0} ms  first fragment, {} bytes", data.len());
+                    first = Some(now);
+                } else {
+                    longest_gap = longest_gap.max(now - last);
+                }
+                last = now;
+                fragments += 1;
+                largest = largest.max(data.len());
+                data
+            }
+        };
+        bytes += data.len() as u64;
+        file.write_all(data).with_context(|| format!("writing {}", path.display()))?;
+    }
+    let span = first.map_or(0.0, |f| (last - f).as_secs_f64());
+    println!(
+        "{fragments} fragments over {span:.1} s ({:.0} ms apart on average, longest gap {:.0} ms), {} kB, largest {} bytes",
+        if fragments > 1 { span * 1000.0 / (fragments - 1) as f64 } else { 0.0 },
+        longest_gap.as_secs_f64() * 1000.0,
+        bytes / 1000,
+        largest
+    );
+    println!("frames seen: {:?}", stream.counts());
+    println!("Wrote {}", path.display());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
