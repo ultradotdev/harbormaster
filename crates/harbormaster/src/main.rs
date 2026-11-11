@@ -1,21 +1,41 @@
-//! Harbormaster bridge daemon.
+//! Harbormaster: a HomeKit bridge with a terminal interface.
 //!
-//! For now this publishes the bridge plus an optional demo temperature
-//! sensor, which is enough to prove pairing and events against the Home app.
+//! `harbormaster daemon` runs the bridge. `harbormaster` (or `harbormaster
+//! tui`) attaches a terminal interface to a running daemon.
+
+mod control;
+mod daemon;
+mod logbuf;
+mod qr;
+mod tui;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use harbormaster_hap::model::kind;
-use harbormaster_hap::{Accessory, Bridge, Characteristic, Config, Database, Format, Info, Store};
-use serde_json::json;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const HELP: &str = "\
+Usage: harbormaster [COMMAND] [OPTIONS]
+
+Commands:
+  tui      attach the terminal interface to a running daemon (default)
+  daemon   run the HomeKit bridge
+
+Options:
+  --state-dir DIR   where pairing state and the control socket live
+  --listen ADDR     daemon: address and port to serve HomeKit on
+                    (default 0.0.0.0:51826, which serves IPv4 and IPv6)
+  --demo            daemon: publish a simulated temperature sensor";
+
+enum Command {
+    Tui,
+    Daemon,
+}
 
 struct Args {
+    command: Command,
     state_dir: PathBuf,
     listen: SocketAddr,
     demo: bool,
@@ -26,123 +46,68 @@ fn default_state_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join("Library/Application Support/harbormaster"))
 }
 
-fn parse_args() -> Result<Args> {
-    let mut args = Args { state_dir: default_state_dir()?, listen: "0.0.0.0:51826".parse()?, demo: false };
-    let mut input = std::env::args().skip(1);
-    while let Some(flag) = input.next() {
-        let mut value = || input.next().with_context(|| format!("{flag} needs a value"));
-        match flag.as_str() {
+fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
+    let mut args = Args {
+        command: Command::Tui,
+        state_dir: PathBuf::new(),
+        listen: "0.0.0.0:51826".parse()?,
+        demo: false,
+    };
+    let mut input = input.into_iter();
+    while let Some(arg) = input.next() {
+        let mut value = || input.next().with_context(|| format!("{arg} needs a value"));
+        match arg.as_str() {
+            "tui" => args.command = Command::Tui,
+            "daemon" => args.command = Command::Daemon,
             "--state-dir" => args.state_dir = value()?.into(),
             "--listen" => args.listen = value()?.parse().context("--listen expects ADDRESS:PORT")?,
             "--demo" => args.demo = true,
             "--help" | "-h" => {
-                println!(
-                    "harbormaster {VERSION}\n\n\
-                     Options:\n  \
-                     --state-dir DIR   where pairing state lives\n  \
-                     --listen ADDR     address and port to serve HomeKit on (default 0.0.0.0:51826,\n                    \
-                    which serves both IPv4 and IPv6)\n  \
-                     --demo            publish a simulated temperature sensor"
-                );
+                println!("harbormaster {}\n\n{HELP}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
-            other => bail!("unknown option {other}; try --help"),
+            other => bail!("unknown argument {other}; try --help"),
         }
+    }
+    if args.state_dir.as_os_str().is_empty() {
+        args.state_dir = default_state_dir()?;
     }
     Ok(args)
 }
 
-/// HomeKit accessory category for a bridge.
-const CATEGORY_BRIDGE: u8 = 2;
-
-/// Shows the setup code and a scannable QR code for pairing.
-fn print_setup(store: &Store) {
-    use qrcode::render::unicode::Dense1x2;
-    println!("\nNot paired. In the Home app choose Add Accessory, then scan this code");
-    println!("or enter the setup code manually.\n");
-    match qrcode::QrCode::new(store.setup_uri(CATEGORY_BRIDGE)) {
-        // Light modules are drawn as solid blocks so the code reads correctly
-        // on a dark terminal background.
-        Ok(code) => println!(
-            "{}",
-            code.render::<Dense1x2>().dark_color(Dense1x2::Light).light_color(Dense1x2::Dark).build()
-        ),
-        Err(e) => tracing::warn!("could not draw QR code: {e}"),
+fn main() -> Result<()> {
+    let args = parse_args(std::env::args().skip(1))?;
+    match args.command {
+        Command::Tui => tui::run(&args.state_dir),
+        Command::Daemon => {
+            let logs = logbuf::LogBuffer::new();
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(logs.clone())
+                .init();
+            let options =
+                daemon::Options { state_dir: args.state_dir, listen: args.listen, demo: args.demo };
+            tokio::runtime::Runtime::new()?.block_on(daemon::run(options, logs))
+        }
     }
-    println!("\nSetup code: {}\n", store.setup_code());
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
-    let args = parse_args()?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let store = Arc::new(Store::open(args.state_dir.join("state.json"))?);
-    let device_id = store.device_id();
-    let name = format!("Harbormaster {}", device_id[12..].replace(':', ""));
-
-    let db = Database::new();
-    let mut bridge = Accessory::new(
-        1,
-        &Info {
-            name: &name,
-            manufacturer: "Harbormaster",
-            model: "Bridge",
-            serial_number: &device_id,
-            firmware_revision: VERSION,
-        },
-    );
-    bridge.add_service(
-        kind::PROTOCOL_INFORMATION,
-        false,
-        vec![Characteristic::text(kind::VERSION, "1.1.0")],
-    );
-    db.add(bridge);
-
-    if args.demo {
-        let aid = store.accessory_id("demo:temperature")?;
-        let mut sensor = Accessory::new(
-            aid,
-            &Info {
-                name: "Demo Temperature",
-                manufacturer: "Harbormaster",
-                model: "Demo",
-                serial_number: "demo-1",
-                firmware_revision: VERSION,
-            },
-        );
-        let ids = sensor.add_service(
-            kind::TEMPERATURE_SENSOR,
-            true,
-            vec![Characteristic::sensor(kind::CURRENT_TEMPERATURE, Format::Float, json!(20.0))
-                .unit("celsius")
-                .range(-100.0, 100.0, 0.1)],
-        );
-        db.add(sensor);
-        let (db, iid) = (db.clone(), ids[0]);
-        tokio::spawn(async move {
-            let mut tick = 0u32;
-            loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                tick += 1;
-                // A slow triangle wave between 18.0 and 23.0 degrees.
-                let step = (tick % 20) as f64;
-                let value = 18.0 + if step < 10.0 { step } else { 20.0 - step } * 0.5;
-                db.set(aid, iid, json!(value));
-            }
-        });
+    fn parse(args: &[&str]) -> Result<Args> {
+        parse_args(args.iter().map(|s| s.to_string()))
     }
 
-    let config = Config { name: name.clone(), model: "Harbormaster".into(), listen: args.listen, advertise: true };
-    let bridge = Bridge::start(config, store.clone(), db).await?;
-    tracing::info!("{name} listening on {}", bridge.local_addr);
-    if store.is_paired() {
-        tracing::info!("already paired with {} controller(s)", store.pairings().len());
-    } else {
-        print_setup(&store);
+    #[test]
+    fn parses_commands_and_options() {
+        let args = parse(&["daemon", "--demo", "--state-dir", "/x", "--listen", "127.0.0.1:1"]).unwrap();
+        assert!(matches!(args.command, Command::Daemon) && args.demo);
+        assert_eq!((args.state_dir, args.listen.port()), (PathBuf::from("/x"), 1));
+        assert!(matches!(parse(&["--state-dir", "/x"]).unwrap().command, Command::Tui));
+        assert!(parse(&["bogus"]).is_err());
+        assert!(parse(&["--listen"]).is_err());
     }
-
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("shutting down");
-    Ok(())
 }

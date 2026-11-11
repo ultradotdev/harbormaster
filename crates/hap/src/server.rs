@@ -1,7 +1,7 @@
 //! The HomeKit accessory server: a small HTTP/1.1 server whose connections
 //! switch to an encrypted transport once a controller has verified itself.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
@@ -46,7 +46,17 @@ pub struct Config {
     pub advertise: bool,
 }
 
+/// A controller connection, for status displays.
+#[derive(Clone, Debug)]
+pub struct ConnectionInfo {
+    pub peer: SocketAddr,
+    /// Pairing identifier, once the controller has verified itself.
+    pub controller: Option<String>,
+    pub connected_at: std::time::SystemTime,
+}
+
 struct Shared {
+    connections: Mutex<BTreeMap<u64, ConnectionInfo>>,
     store: Arc<Store>,
     db: Arc<Database>,
     failed_setup_attempts: AtomicU32,
@@ -73,6 +83,7 @@ impl Shared {
 /// A running bridge. Dropping it stops accepting connections.
 pub struct Bridge {
     pub local_addr: SocketAddr,
+    shared: Arc<Shared>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -83,6 +94,11 @@ impl Drop for Bridge {
 }
 
 impl Bridge {
+    /// Currently open controller connections, oldest first.
+    pub fn connections(&self) -> Vec<ConnectionInfo> {
+        self.shared.connections.lock().unwrap().values().cloned().collect()
+    }
+
     pub async fn start(config: Config, store: Arc<Store>, db: Arc<Database>) -> Result<Self, Error> {
         let listener = bind(config.listen).await?;
         let local_addr = listener.local_addr()?;
@@ -101,6 +117,7 @@ impl Bridge {
             None
         };
         let shared = Arc::new(Shared {
+            connections: Mutex::new(BTreeMap::new()),
             store,
             db,
             failed_setup_attempts: AtomicU32::new(0),
@@ -108,7 +125,9 @@ impl Bridge {
             pairings_changed: watch::channel(0).0,
         });
 
+        let accept_shared = shared.clone();
         let task = tokio::spawn(async move {
+            let shared = accept_shared;
             let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
             let mut next_id = 0u64;
             loop {
@@ -131,13 +150,21 @@ impl Bridge {
                     let _permit = permit;
                     tracing::debug!("connection {id} from {peer}");
                     let _ = stream.set_nodelay(true);
-                    if let Err(e) = Connection::new(shared, stream, id, peer).run().await {
+                    let info = ConnectionInfo {
+                        peer,
+                        controller: None,
+                        connected_at: std::time::SystemTime::now(),
+                    };
+                    shared.connections.lock().unwrap().insert(id, info);
+                    let result = Connection::new(shared.clone(), stream, id, peer).run().await;
+                    shared.connections.lock().unwrap().remove(&id);
+                    if let Err(e) = result {
                         tracing::debug!("connection {id} from {peer} closed: {e}");
                     }
                 });
             }
         });
-        Ok(Self { local_addr, task })
+        Ok(Self { local_addr, shared, task })
     }
 }
 
@@ -364,7 +391,7 @@ impl Connection {
                 );
                 self.log_pairing_step("pair-setup", &request.body, &body);
                 if store.is_paired() != was_paired {
-                    tracing::info!("paired with a controller at {}", self.peer.ip());
+                    tracing::info!("paired with a controller at {}", self.peer.ip().to_canonical());
                     self.shared.pairings_changed();
                 }
                 response(200, TLV, &body)
@@ -376,6 +403,9 @@ impl Connection {
                 }
                 let session = verified.map(|v| {
                     tracing::debug!("connection {} verified as {}", self.id, v.controller_id);
+                    if let Some(info) = self.shared.connections.lock().unwrap().get_mut(&self.id) {
+                        info.controller = Some(v.controller_id.clone());
+                    }
                     self.controller = Some(v.controller_id);
                     Session::new(&v.shared_secret)
                 });
@@ -418,9 +448,9 @@ impl Connection {
                     crate::tlv::error::UNAVAILABLE => "already paired",
                     _ => "malformed or out-of-order request",
                 };
-                tracing::warn!("{what} step {step} from {} refused: {reason}", self.peer.ip());
+                tracing::warn!("{what} step {step} from {} refused: {reason}", self.peer.ip().to_canonical());
             }
-            None => tracing::info!("{what} step {step} from {} ok", self.peer.ip()),
+            None => tracing::info!("{what} step {step} from {} ok", self.peer.ip().to_canonical()),
         }
     }
 
