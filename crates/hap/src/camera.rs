@@ -37,6 +37,8 @@ const H264: u8 = 0;
 /// AAC with the enhanced low delay profile, the codec HomeKit prefers for
 /// live audio.
 pub const AAC_ELD: u8 = 2;
+/// Opus, which some Apple devices ask for instead.
+pub const OPUS: u8 = 3;
 
 /// Separates repeated items of the same type in a TLV8 list.
 fn separator(tlv: &mut Tlv) {
@@ -102,17 +104,18 @@ pub fn supported_video(resolutions: &[(u16, u16, u8)]) -> Value {
     tlv_value(&Tlv::new().with(0x01, &codec.encode()))
 }
 
-/// Advertises AAC-ELD at 24 kHz and 16 kHz, variable bitrate, mono. HomeKit
-/// requires an audio offer even from a camera that sends no audio.
+/// Advertises AAC-ELD and Opus, each at 24 kHz and 16 kHz, variable bitrate,
+/// mono. HomeKit requires an audio offer even from a camera that sends no
+/// audio.
 pub fn supported_audio() -> Value {
     let mut out = Tlv::new();
     // Sample rates: 2 is 24 kHz, 1 is 16 kHz.
-    for (i, rate) in [2u8, 1].iter().enumerate() {
+    for (i, (kind, rate)) in [(AAC_ELD, 2u8), (AAC_ELD, 1), (OPUS, 2), (OPUS, 1)].iter().enumerate() {
         if i > 0 {
             separator(&mut out);
         }
         let parameters = Tlv::new().with(0x01, &[1]).with(0x02, &[0]).with(0x03, &[*rate]);
-        let codec = Tlv::new().with(0x01, &[AAC_ELD]).with(0x02, &parameters.encode());
+        let codec = Tlv::new().with(0x01, &[*kind]).with(0x02, &parameters.encode());
         out.push(0x01, &codec.encode());
     }
     // No comfort noise.
@@ -260,7 +263,7 @@ pub struct SelectedVideo {
 /// The audio settings a controller chose for a stream.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectedAudio {
-    /// The codec identifier, [`AAC_ELD`] being the only one offered.
+    /// The codec identifier: [`AAC_ELD`] or [`OPUS`].
     pub codec: u8,
     pub sample_rate_hz: u32,
     pub payload_type: u8,

@@ -207,7 +207,7 @@ impl Stream {
                 // Sound is left out rather than refusing the stream if the
                 // controller picked something that was not offered.
                 let audio = selected.audio.filter(|a| {
-                    a.codec == camera::AAC_ELD
+                    matches!(a.codec, camera::AAC_ELD | camera::OPUS)
                         && pending.request.audio_srtp.suite == camera::SRTP_AES_CM_128_HMAC_SHA1_80
                 });
                 if audio.is_none() {
@@ -269,7 +269,12 @@ impl Stream {
             video.fps,
             video.max_bitrate_kbps,
             match &audio {
-                Some(a) => format!("sound at {} kHz, {} kbps", a.sample_rate_hz / 1000, a.max_bitrate_kbps),
+                Some(a) => format!(
+                    "{} sound at {} kHz, {} kbps",
+                    if a.codec == camera::OPUS { "Opus" } else { "AAC" },
+                    a.sample_rate_hz / 1000,
+                    a.max_bitrate_kbps
+                ),
                 None => "no sound".to_owned(),
             },
             pending.request.controller_ip
@@ -418,18 +423,20 @@ fn ffmpeg_args(
         // one connection to the camera and stay in step. The `?` lets a
         // camera without a microphone still stream video.
         args.extend(fixed(&["-map", "0:a:0?", "-vn", "-sn", "-dn"]));
-        args.extend([
+        if audio.codec == camera::OPUS {
+            // Opus frames come in 20, 40 or 60 ms; use what was asked for
+            // when it is one of those.
+            let frame = if matches!(audio.packet_time_ms, 40 | 60) { audio.packet_time_ms } else { 20 };
+            args.extend(fixed(&["-codec:a", "libopus", "-application", "lowdelay", "-frame_duration"]));
+            args.push(frame.to_string());
+        } else {
             // Apple's own encoder. Profile 38 is AAC-ELD, which this
-            // encoder does not accept by name.
-            "-codec:a".into(),
-            "aac_at".into(),
-            "-profile:a".into(),
-            "38".into(),
-            "-aac_at_mode".into(),
-            "cvbr".into(),
-            // Required for this audio format to be packed into RTP.
-            "-flags".into(),
-            "+global_header".into(),
+            // encoder does not accept by name. The global header is
+            // required for this format to be packed into RTP.
+            let encoder = ["-codec:a", "aac_at", "-profile:a", "38", "-aac_at_mode", "cvbr", "-flags", "+global_header"];
+            args.extend(fixed(&encoder));
+        }
+        args.extend([
             "-ar".into(),
             audio.sample_rate_hz.to_string(),
             "-ac".into(),
@@ -599,6 +606,11 @@ mod tests {
             assert!(audio_part.contains(expected), "missing {expected:?} in {audio_part}");
         }
         assert_eq!(args.last().unwrap(), "srtp://10.0.0.9:50002?rtcpport=50002&pkt_size=188");
+
+        let opus = SelectedAudio { codec: camera::OPUS, packet_time_ms: 30, ..audio };
+        let line = ffmpeg_args(&input, &request("10.0.0.9", 50000), &video(1280, 720), 12345, Some((&opus, 777))).join(" ");
+        assert!(line.contains("-codec:a libopus -application lowdelay -frame_duration 20 -ar 16000"), "{line}");
+        assert!(!line.contains("aac_at"), "{line}");
     }
 
     struct TestPattern;
