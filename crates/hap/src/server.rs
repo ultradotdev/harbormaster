@@ -30,8 +30,8 @@ const JSON: &str = "application/hap+json";
 pub enum Error {
     #[error("network: {0}")]
     Io(#[from] std::io::Error),
-    #[error("mDNS advertisement: {0}")]
-    Mdns(#[from] mdns_sd::Error),
+    #[error("Bonjour advertisement: {0}")]
+    Mdns(#[from] crate::mdns::Error),
 }
 
 pub struct Config {
@@ -57,9 +57,9 @@ struct Shared {
 
 impl Shared {
     fn publish(&self) {
-        if let Some(advertiser) = self.advertiser.lock().unwrap().as_ref() {
+        if let Some(advertiser) = self.advertiser.lock().unwrap().as_mut() {
             if let Err(e) = advertiser.publish(self.store.config_number(), self.store.is_paired()) {
-                tracing::error!("could not update mDNS advertisement: {e}");
+                tracing::error!("could not update Bonjour advertisement: {e}");
             }
         }
     }
@@ -87,13 +87,16 @@ impl Bridge {
         let listener = bind(config.listen).await?;
         let local_addr = listener.local_addr()?;
         let advertiser = if config.advertise {
-            Some(Advertiser::new(
+            let mut advertiser = Advertiser::new(
                 &config.name,
                 &config.model,
                 &store.device_id(),
                 &store.setup_hash(),
                 local_addr.port(),
-            )?)
+            )?;
+            // A bridge nobody can discover is useless, so fail loudly here.
+            advertiser.publish(store.config_number(), store.is_paired())?;
+            Some(advertiser)
         } else {
             None
         };
@@ -104,7 +107,6 @@ impl Bridge {
             advertiser: Mutex::new(advertiser),
             pairings_changed: watch::channel(0).0,
         });
-        shared.publish();
 
         let task = tokio::spawn(async move {
             let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
