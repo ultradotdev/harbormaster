@@ -265,9 +265,10 @@ impl VideoSource for ProtectVideo {
                 // Whatever ffmpeg reads while working out what the stream is
                 // gets sent in a burst afterwards, and the viewer then stays
                 // that far behind for the whole session. So probe as little
-                // as possible and never buffer input.
-                "-fflags",
-                "nobuffer",
+                // as possible. What it does read must be kept, though: the
+                // console starts each stream on a keyframe, and discarding
+                // it (`-fflags nobuffer`) leaves no picture until the next
+                // one, five seconds later on some cameras.
                 "-flags",
                 "low_delay",
                 "-fpsprobesize",

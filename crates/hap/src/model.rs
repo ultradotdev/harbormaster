@@ -422,6 +422,11 @@ impl Database {
                 shape.push_str(&format!("s{}:{}", s.iid, s.kind));
                 for c in &s.characteristics {
                     shape.push_str(&format!("c{}:{}", c.iid, c.kind));
+                    // Fixed structured values, such as the codecs a camera
+                    // offers, are part of what a controller remembers.
+                    if matches!(c.format, Format::Tlv8) && !c.writable && !c.notifies {
+                        shape.push_str(&format!("={}", c.value));
+                    }
                 }
             }
         }

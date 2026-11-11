@@ -193,6 +193,7 @@ impl Stream {
         match selected.command {
             Command::Start => {
                 let video = selected.video.ok_or(status::INVALID_VALUE)?;
+                let selected_audio = selected.audio.clone();
                 let pending = {
                     let mut state = self.state.lock().unwrap();
                     match state.pending.take() {
@@ -209,6 +210,17 @@ impl Stream {
                     a.codec == camera::AAC_ELD
                         && pending.request.audio_srtp.suite == camera::SRTP_AES_CM_128_HMAC_SHA1_80
                 });
+                if audio.is_none() {
+                    match &selected_audio {
+                        Some(a) => tracing::info!(
+                            "{}: no sound: the controller chose audio codec {} at {} Hz, which was not offered",
+                            self.name,
+                            a.codec,
+                            a.sample_rate_hz
+                        ),
+                        None => tracing::info!("{}: no sound: the controller sent no usable audio settings", self.name),
+                    }
+                }
                 self.start(pending, video, audio);
             }
             Command::End => self.stop_if(|running| running.session_id == selected.session_id),
