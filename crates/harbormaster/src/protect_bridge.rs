@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -328,6 +329,11 @@ struct Handles {
     /// One per sensor service, all tracking whether the device is online.
     active: Vec<u64>,
     motion: Option<u64>,
+    /// Whether the device currently reports plain motion, and whether it
+    /// reports a recognised person, vehicle or the like. Some cameras only
+    /// ever report the second, and either one counts as motion in HomeKit.
+    plain_motion: AtomicBool,
+    smart_motion: AtomicBool,
     ring: Option<u64>,
     contact: Option<u64>,
     temperature: Option<u64>,
@@ -505,7 +511,14 @@ impl Devices {
             }
         }
         let motion = if model_key == "light" { "isPirMotionDetected" } else { "isMotionDetected" };
-        if let (Some(detected), Some(iid)) = (data[motion].as_bool(), h.motion) {
+        if let Some(detected) = data[motion].as_bool() {
+            h.plain_motion.store(detected, Ordering::Relaxed);
+        }
+        if let Some(detected) = data["isSmartDetected"].as_bool() {
+            h.smart_motion.store(detected, Ordering::Relaxed);
+        }
+        if let (true, Some(iid)) = (data[motion].is_boolean() || data["isSmartDetected"].is_boolean(), h.motion) {
+            let detected = h.plain_motion.load(Ordering::Relaxed) || h.smart_motion.load(Ordering::Relaxed);
             if db.set(h.aid, iid, json!(detected)) && live {
                 tracing::info!("{}: motion {}", h.name, if detected { "detected" } else { "ended" });
             }
@@ -919,7 +932,17 @@ mod tests {
         // Two rings in a row must produce two events even though nothing "changed".
         f.update("camera", "cam1", json!({"lastRing": 2000, "isSmartDetected": true}));
         f.update("camera", "cam1", json!({"lastRing": 3000}));
-        let rings: Vec<_> = std::iter::from_fn(|| changes.try_recv().ok()).collect();
+        let all: Vec<_> = std::iter::from_fn(|| changes.try_recv().ok()).collect();
+        // A recognised person counts as motion even with no plain motion
+        // report, which is all some doorbells ever send.
+        assert_eq!(all.iter().filter(|c| c.iid == iid::MOTION + 1).map(|c| c.value.clone()).collect::<Vec<_>>(), [json!(true)]);
+        f.update("camera", "cam1", json!({"isMotionDetected": true}));
+        f.update("camera", "cam1", json!({"isSmartDetected": false}));
+        assert_eq!(f.db.read(door, iid::MOTION + 1), Ok(json!(true)), "plain motion is still in progress");
+        f.update("camera", "cam1", json!({"isMotionDetected": false}));
+        assert_eq!(f.db.read(door, iid::MOTION + 1), Ok(json!(false)));
+        while changes.try_recv().is_ok() {}
+        let rings: Vec<_> = all.into_iter().filter(|c| c.iid != iid::MOTION + 1).collect();
         assert_eq!(rings.len(), 2);
         assert!(rings.iter().all(|c| c.aid == door && c.iid == iid::DOORBELL + 1 && c.value == json!(0)));
         // The press itself is never stored.
