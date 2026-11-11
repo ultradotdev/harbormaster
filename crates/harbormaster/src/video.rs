@@ -17,15 +17,46 @@ use harbormaster_hap::camera::{
 use harbormaster_hap::model::status;
 use harbormaster_hap::{Accessory, Database};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::oneshot;
+use bytes::Bytes;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{mpsc, oneshot};
 
 /// Where a camera's video comes from.
 pub trait VideoSource: Send + Sync {
-    /// ffmpeg input arguments for a stream about `width` pixels wide, or
-    /// `None` if the camera cannot be reached right now. These may contain
-    /// secrets and must not be logged.
-    fn input_args(&self, width: u16) -> Option<Vec<String>>;
+    /// Whether the camera can be reached right now.
+    fn available(&self) -> bool;
+
+    /// Starts reading a stream about `width` pixels wide, or returns `None`
+    /// if the camera cannot be reached. What arrives is fragmented MP4, the
+    /// header first; the source stops reading when the receiver is dropped.
+    /// Must be called from within the async runtime.
+    fn open(&self, width: u16) -> Option<mpsc::Receiver<Bytes>>;
+}
+
+/// How ffmpeg is told to read the stream handed to it on standard input.
+fn input_args() -> Vec<String> {
+    [
+        // Whatever ffmpeg reads while working out what the stream is gets
+        // sent in a burst afterwards, and the viewer then stays that far
+        // behind for the whole session. So probe as little as possible.
+        "-flags",
+        "low_delay",
+        "-fpsprobesize",
+        "0",
+        "-analyzeduration",
+        "200000",
+        "-probesize",
+        "200000",
+        "-hwaccel",
+        "videotoolbox",
+        "-f",
+        "mp4",
+        "-i",
+        "pipe:0",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// Finds ffmpeg. A service started by launchd has a minimal `PATH`, so the
@@ -162,7 +193,7 @@ impl Stream {
         if request.video_srtp.suite != camera::SRTP_AES_CM_128_HMAC_SHA1_80 {
             return unavailable("the controller asked for an encryption suite that was not offered");
         }
-        if self.source.input_args(0).is_none() {
+        if !self.source.available() {
             return unavailable("the camera is not reachable");
         }
         // Reserve a local port for the controller's control traffic.
@@ -247,13 +278,14 @@ impl Stream {
     }
 
     fn start(self: &Arc<Self>, pending: Pending, video: SelectedVideo, audio: Option<SelectedAudio>) {
-        let Some(input) = self.source.input_args(video.width) else {
+        let Some(mut feed) = self.source.open(video.width) else {
             tracing::warn!("{}: the camera became unreachable before the stream started", self.name);
             return;
         };
-        let args = ffmpeg_args(&input, &pending.request, &video, pending.ssrc, audio.as_ref().map(|a| (a, pending.audio_ssrc)));
+        let args =
+            ffmpeg_args(&input_args(), &pending.request, &video, pending.ssrc, audio.as_ref().map(|a| (a, pending.audio_ssrc)));
         let mut command = tokio::process::Command::new(&self.ffmpeg);
-        command.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
+        command.args(&args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -289,6 +321,18 @@ impl Stream {
         }
         self.set_status(camera::STATUS_IN_USE);
 
+        // Hand the camera's video to ffmpeg as it arrives. Closing ffmpeg's
+        // input when the feed ends lets it finish cleanly.
+        let stdin = child.stdin.take();
+        let writer = tokio::spawn(async move {
+            let Some(mut stdin) = stdin else { return };
+            while let Some(data) = feed.recv().await {
+                if stdin.write_all(&data).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         let stream = self.clone();
         let stderr = child.stderr.take();
         tokio::spawn(async move {
@@ -323,6 +367,8 @@ impl Stream {
                     tracing::info!("{}: stream stopped", stream.name);
                 }
             }
+            // Dropping the feed is what tells the source to stop reading.
+            writer.abort();
             let mut state = stream.state.lock().unwrap();
             if state.running.as_ref().is_some_and(|r| r.session_id == session_id) {
                 state.running = None;
@@ -345,8 +391,8 @@ fn random_bytes() -> [u8; 4] {
     (hasher.finish() as u32).to_le_bytes()
 }
 
-/// The ffmpeg command line for one stream. `input` comes from the video
-/// source; everything after it is determined by what the controller asked.
+/// The ffmpeg command line for one stream. `input` says how to read the
+/// camera; everything after it is determined by what the controller asked.
 fn ffmpeg_args(
     input: &[String],
     request: &SetupRequest,
@@ -561,12 +607,12 @@ mod tests {
 
     #[test]
     fn ffmpeg_command_carries_the_negotiated_settings() {
-        let input = vec!["-i".to_owned(), "SOURCE".to_owned()];
+        let input = input_args();
         let args = ffmpeg_args(&input, &request("10.0.0.9", 50000), &video(1280, 720), 12345, None);
         let line = args.join(" ");
         assert!(!line.contains("aac_at"), "no sound was selected: {line}");
         for expected in [
-            "-i SOURCE",
+            "-hwaccel videotoolbox -f mp4 -i pipe:0",
             "-vf scale=1280:720",
             "-r 30",
             "-codec:v h264_videotoolbox",
@@ -613,19 +659,56 @@ mod tests {
         assert!(!line.contains("aac_at"), "{line}");
     }
 
-    struct TestPattern;
+    /// A stand-in camera: a second ffmpeg that produces a test picture and
+    /// tone as fragmented MP4 in real time, the shape of a real feed.
+    struct TestPattern(PathBuf);
 
     impl VideoSource for TestPattern {
-        fn input_args(&self, _width: u16) -> Option<Vec<String>> {
-            let source = "testsrc=size=640x480:rate=30[out0];sine=frequency=440:sample_rate=48000[out1]";
-            Some(["-re", "-f", "lavfi", "-i", source].iter().map(|s| s.to_string()).collect())
+        fn available(&self) -> bool {
+            true
+        }
+
+        fn open(&self, _width: u16) -> Option<mpsc::Receiver<Bytes>> {
+            use tokio::io::AsyncReadExt;
+            let args = [
+                "-hide_banner", "-loglevel", "error", "-nostdin", "-re",
+                "-f", "lavfi", "-i", "testsrc=size=640x480:rate=30",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+                "-codec:v", "h264_videotoolbox", "-g", "30", "-codec:a", "aac",
+                "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-frag_duration", "100000",
+                "-f", "mp4", "pipe:1",
+            ];
+            let mut child = tokio::process::Command::new(&self.0)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .ok()?;
+            let mut stdout = child.stdout.take()?;
+            let (sender, receiver) = mpsc::channel(32);
+            tokio::spawn(async move {
+                let _child = child;
+                let mut chunk = vec![0u8; 16 * 1024];
+                while let Ok(n) = stdout.read(&mut chunk).await {
+                    if n == 0 || sender.send(Bytes::copy_from_slice(&chunk[..n])).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Some(receiver)
         }
     }
 
     struct Offline;
 
     impl VideoSource for Offline {
-        fn input_args(&self, _width: u16) -> Option<Vec<String>> {
+        fn available(&self) -> bool {
+            false
+        }
+
+        fn open(&self, _width: u16) -> Option<mpsc::Receiver<Bytes>> {
             None
         }
     }
@@ -694,7 +777,7 @@ mod tests {
             eprintln!("ffmpeg not installed; skipping");
             return;
         };
-        let (db, ids) = camera(Arc::new(TestPattern), &ffmpeg);
+        let (db, ids) = camera(Arc::new(TestPattern(ffmpeg.clone())), &ffmpeg);
         let (receiver, audio_receiver) = receivers().await;
         let port = receiver.local_addr().unwrap().port();
         let (setup, start) = controller_writes(port, 1);

@@ -796,6 +796,7 @@ name = "harbormaster"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "harbormaster-hap",
  "harbormaster-protect",
  "qrcode",

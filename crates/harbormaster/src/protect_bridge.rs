@@ -12,7 +12,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use harbormaster_hap::model::kind;
 use harbormaster_hap::{Accessory, Bridge, Characteristic, Database, Format, Info, SnapshotSource, Store};
-use harbormaster_protect::{Client, Fingerprint, Update};
+use bytes::Bytes;
+use harbormaster_protect::{Client, FeedOptions, Fingerprint, Segment, Update};
+use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -154,31 +156,30 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
     out
 }
 
-/// One of a camera's video streams, as Protect serves it over RTSP.
+/// One of a camera's video streams: the same picture at one quality.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Channel {
+    /// The number Protect knows the stream by; 0 is the best quality.
+    id: u8,
     width: u16,
     height: u16,
-    /// The secret path component of the stream's address.
-    alias: String,
 }
 
-/// A camera's usable streams. Only channels with RTSP switched on in
-/// Protect can be read.
+/// A camera's usable streams.
 fn channels(camera: &Value) -> Vec<Channel> {
     camera["channels"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|c| c["enabled"] != false && c["isRtspEnabled"] == true)
+        .filter(|c| c["enabled"] != false)
         // A doorbell's package camera is a second lens with a different
         // view, so it must never stand in for the main picture.
         .filter(|c| c["name"] != "Package Camera")
         .filter_map(|c| {
             Some(Channel {
+                id: u8::try_from(c["id"].as_u64()?).ok()?,
                 width: u16::try_from(c["width"].as_u64()?).ok()?,
                 height: u16::try_from(c["height"].as_u64()?).ok()?,
-                alias: c["rtspAlias"].as_str().filter(|a| !a.is_empty())?.to_owned(),
             })
         })
         .filter(|c| c.width > 0 && c.height > 0)
@@ -189,7 +190,6 @@ fn channels(camera: &Value) -> Vec<Channel> {
 /// serve video and snapshots on demand.
 #[derive(Default)]
 pub struct Live {
-    host: String,
     inner: RwLock<LiveInner>,
 }
 
@@ -197,7 +197,6 @@ pub struct Live {
 struct LiveInner {
     /// Present while signed in.
     client: Option<Arc<Client>>,
-    rtsps_port: u16,
     channels: HashMap<String, Vec<Channel>>,
     /// Which camera each accessory is.
     cameras: HashMap<u64, String>,
@@ -207,7 +206,6 @@ impl Live {
     fn update(&self, client: Arc<Client>, bootstrap: &Value) {
         let mut inner = self.inner.write().unwrap();
         inner.client = Some(client);
-        inner.rtsps_port = bootstrap["nvr"]["ports"]["rtsps"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(7441);
         inner.channels = bootstrap["cameras"]
             .as_array()
             .into_iter()
@@ -246,48 +244,65 @@ impl SnapshotSource for Live {
     }
 }
 
-/// Reads one camera's video from the console.
+/// Reads one camera's video from the console's native live feed.
 struct ProtectVideo {
     live: Arc<Live>,
     camera: String,
 }
 
-impl VideoSource for ProtectVideo {
-    fn input_args(&self, width: u16) -> Option<Vec<String>> {
+impl ProtectVideo {
+    /// The signed-in client and the stream to read for a picture about
+    /// `width` pixels wide: the smallest that is at least that wide, else
+    /// the largest.
+    fn choose(&self, width: u16) -> Option<(Arc<Client>, u8)> {
         let inner = self.live.inner.read().unwrap();
         let mut available: Vec<&Channel> = inner.channels.get(&self.camera)?.iter().collect();
         available.sort_by_key(|c| c.width);
-        // The smallest stream that is at least as wide as asked, else the largest.
         let channel = available.iter().find(|c| c.width >= width).or(available.last())?;
-        let url = format!("rtsps://{}:{}/{}?enableSrtp", self.live.host, inner.rtsps_port, channel.alias);
-        Some(
-            [
-                // Whatever ffmpeg reads while working out what the stream is
-                // gets sent in a burst afterwards, and the viewer then stays
-                // that far behind for the whole session. So probe as little
-                // as possible. What it does read must be kept, though: the
-                // console starts each stream on a keyframe, and discarding
-                // it (`-fflags nobuffer`) leaves no picture until the next
-                // one, five seconds later on some cameras.
-                "-flags",
-                "low_delay",
-                "-fpsprobesize",
-                "0",
-                "-analyzeduration",
-                "200000",
-                "-probesize",
-                "200000",
-                "-hwaccel",
-                "videotoolbox",
-                "-rtsp_transport",
-                "tcp",
-                "-i",
-                url.as_str(),
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        )
+        Some((inner.client.clone()?, channel.id))
+    }
+}
+
+impl VideoSource for ProtectVideo {
+    fn available(&self) -> bool {
+        self.choose(0).is_some()
+    }
+
+    fn open(&self, width: u16) -> Option<mpsc::Receiver<Bytes>> {
+        let (client, channel) = self.choose(width)?;
+        let camera = self.camera.clone();
+        // A little slack so a brief stall in ffmpeg does not stall the
+        // connection to the console; fragments are a tenth of a second.
+        let (sender, receiver) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let options = FeedOptions { channel, ..FeedOptions::default() };
+            let mut feed = match client.livestream(&camera, options).await {
+                Ok(feed) => feed,
+                Err(e) => {
+                    tracing::warn!("could not open the live feed: {e}");
+                    return;
+                }
+            };
+            loop {
+                let data = match feed.next().await {
+                    Ok(Some(Segment::Init { data, .. } | Segment::Media(data))) => data,
+                    Ok(None) => {
+                        tracing::info!("the console closed a live feed");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("live feed stopped: {e}");
+                        return;
+                    }
+                };
+                // The receiver goes away when the viewer does, which ends
+                // this task and closes the feed.
+                if sender.send(data).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Some(receiver)
     }
 }
 
@@ -592,7 +607,7 @@ impl ProtectBridge {
             .context("[protect] has no fingerprint yet; run `harbormaster protect-check` first")?
             .parse()
             .context("fingerprint in config.toml")?;
-        let live = Arc::new(Live { host: config.host.clone(), ..Live::default() });
+        let live = Arc::new(Live::default());
         let ffmpeg = video::find_ffmpeg();
         if ffmpeg.is_none() {
             tracing::warn!("ffmpeg is not installed, so cameras will have no video");
@@ -642,14 +657,6 @@ impl ProtectBridge {
 
         let bootstrap = client.bootstrap_raw().await?;
         self.live.update(client.clone(), &bootstrap);
-        for camera in bootstrap["cameras"].as_array().into_iter().flatten() {
-            if channels(camera).is_empty() && camera["isAdopted"] != false {
-                tracing::warn!(
-                    "{} has no RTSP stream enabled in Protect, so it will have no video",
-                    camera["name"].as_str().unwrap_or("a camera")
-                );
-            }
-        }
         let all = definitions(&bootstrap);
         let filter = self.config.devices.as_deref();
         for entry in filter.into_iter().flatten() {
@@ -772,43 +779,44 @@ mod tests {
 
     fn doorbell_with_channels() -> Value {
         json!({
-            "nvr": {"ports": {"rtsps": 7441}},
             "cameras": [{
                 "id": "cam1", "mac": "AA01", "name": "Front Door", "type": "UVC G4 Doorbell Pro", "state": "CONNECTED",
                 "featureFlags": {"isDoorbell": true},
                 "channels": [
-                    {"id": 0, "name": "High", "enabled": true, "isRtspEnabled": true, "rtspAlias": "HIGH", "width": 1600, "height": 1200},
-                    {"id": 1, "name": "Medium", "enabled": true, "isRtspEnabled": true, "rtspAlias": "MED", "width": 960, "height": 720},
-                    {"id": 2, "name": "Low", "enabled": true, "isRtspEnabled": false, "rtspAlias": "LOW", "width": 480, "height": 360},
-                    {"id": 3, "name": "Package Camera", "enabled": true, "isRtspEnabled": true, "rtspAlias": "PKG", "width": 1600, "height": 1200}
+                    {"id": 0, "name": "High", "enabled": true, "width": 1600, "height": 1200},
+                    {"id": 1, "name": "Medium", "enabled": true, "width": 960, "height": 720},
+                    {"id": 2, "name": "Low", "enabled": false, "width": 480, "height": 360},
+                    {"id": 3, "name": "Package Camera", "enabled": true, "width": 1600, "height": 1200}
                 ]
             }]
         })
     }
 
     #[test]
-    fn camera_video_uses_rtsp_channels_and_never_the_package_camera() {
+    fn camera_video_picks_a_fitting_stream_and_never_the_package_camera() {
         let bootstrap = doorbell_with_channels();
         let defs = definitions(&bootstrap);
         assert_eq!(defs[0].video, Some((1600, 1200)));
-        // A camera with no RTSP stream offers no video.
+        // A camera that lists no streams offers no video.
         assert_eq!(definitions(&super::tests::bootstrap())[0].video, None);
 
-        let live = Arc::new(Live { host: "10.0.0.5".into(), ..Live::default() });
+        let live = Arc::new(Live::default());
         let source = ProtectVideo { live: live.clone(), camera: "cam1".into() };
-        assert!(source.input_args(1280).is_none(), "nothing is available before the console is reached");
+        assert!(!source.available(), "nothing is available before the console is reached");
 
         let pin: Fingerprint = "00".repeat(32).parse().unwrap();
         live.update(Arc::new(Client::new("10.0.0.5", 443, pin)), &bootstrap);
-        let url = |width| source.input_args(width).unwrap().pop().unwrap();
-        assert_eq!(url(640), "rtsps://10.0.0.5:7441/MED?enableSrtp");
-        assert_eq!(url(960), "rtsps://10.0.0.5:7441/MED?enableSrtp");
-        assert_eq!(url(1280), "rtsps://10.0.0.5:7441/HIGH?enableSrtp");
-        assert_eq!(url(1920), "rtsps://10.0.0.5:7441/HIGH?enableSrtp", "falls back to the largest");
-        assert!(!url(1600).contains("PKG") && !url(1600).contains("LOW"));
+        assert!(source.available());
+        let channel = |width| source.choose(width).unwrap().1;
+        assert_eq!(channel(640), 1);
+        assert_eq!(channel(960), 1);
+        assert_eq!(channel(1280), 0);
+        assert_eq!(channel(1920), 0, "falls back to the largest");
+        // Never the switched-off stream (2) or the package camera (3).
+        assert!((0..=2000).step_by(40).all(|width| channel(width) < 2));
 
         live.disconnected();
-        assert!(source.input_args(640).is_none());
+        assert!(!source.available());
     }
 
     #[tokio::test]
