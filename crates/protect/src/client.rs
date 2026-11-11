@@ -165,6 +165,39 @@ impl Client {
         serde_json::from_slice(response.body()).map_err(|e| Error::Protocol(format!("bootstrap: {e}")))
     }
 
+    /// A current still image from a camera, as JPEG. The console scales it
+    /// to about the requested size.
+    pub async fn snapshot(&self, camera_id: &str, width: u32, height: u32) -> Result<Bytes, Error> {
+        if self.session.is_none() {
+            return Err(Error::NotSignedIn);
+        }
+        // Ids are hex strings; refuse anything that could alter the path.
+        if camera_id.is_empty() || !camera_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(Error::Protocol("unexpected characters in camera id".into()));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let path = format!(
+            "/proxy/protect/api/cameras/{camera_id}/snapshot?ts={now}&force=true&w={width}&h={height}"
+        );
+        let response = self.send(self.request(Method::GET, &path, Bytes::new())).await?;
+        match response.status() {
+            StatusCode::OK => {}
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Err(Error::NotSignedIn),
+            status => return Err(Error::Status(status)),
+        }
+        let is_jpeg = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("image/jpeg"));
+        if !is_jpeg {
+            return Err(Error::Protocol("snapshot was not a JPEG image".into()));
+        }
+        Ok(response.into_body())
+    }
+
     /// Opens the realtime update stream. Pass the bootstrap's
     /// `last_update_id` so nothing is missed between the two.
     pub async fn updates(&self, last_update_id: Option<&str>) -> Result<UpdateStream, Error> {

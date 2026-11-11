@@ -6,16 +6,17 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use harbormaster_hap::model::kind;
-use harbormaster_hap::{Accessory, Bridge, Characteristic, Database, Format, Info, Store};
+use harbormaster_hap::{Accessory, Bridge, Characteristic, Database, Format, Info, SnapshotSource, Store};
 use harbormaster_protect::{Client, Fingerprint, Update};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::video::{self, StreamIds, VideoSource};
 use crate::{config, secrets};
 
 /// Remembers the devices last seen, so the same accessories can be published
@@ -34,6 +35,8 @@ mod iid {
     pub const LIGHT_LEVEL: u64 = 150;
     pub const LEAK: u64 = 160;
     pub const BATTERY: u64 = 170;
+    /// HomeKit expects a camera to handle two viewers at once.
+    pub const STREAMS: [u64; 2] = [200, 210];
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -86,6 +89,9 @@ pub struct DeviceDef {
     pub mac: String,
     pub firmware: String,
     pub features: Features,
+    /// Size of the camera's best stream, if it has video to offer.
+    #[serde(default)]
+    pub video: Option<(u16, u16)>,
 }
 
 impl DeviceDef {
@@ -130,8 +136,12 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
                 .into_iter()
                 .find(|n| !n.is_empty())
                 .unwrap_or_else(|| "Protect device".to_owned());
+            let video = (kind == Kind::Camera)
+                .then(|| channels(device).into_iter().map(|c| (c.width, c.height)).max())
+                .flatten();
             out.push(DeviceDef {
                 kind,
+                video,
                 id,
                 name,
                 model: [text("marketName"), model].into_iter().find(|m| !m.is_empty()).unwrap_or_default(),
@@ -142,6 +152,121 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
         }
     }
     out
+}
+
+/// One of a camera's video streams, as Protect serves it over RTSP.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Channel {
+    width: u16,
+    height: u16,
+    /// The secret path component of the stream's address.
+    alias: String,
+}
+
+/// A camera's usable streams. Only channels with RTSP switched on in
+/// Protect can be read.
+fn channels(camera: &Value) -> Vec<Channel> {
+    camera["channels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["enabled"] != false && c["isRtspEnabled"] == true)
+        // A doorbell's package camera is a second lens with a different
+        // view, so it must never stand in for the main picture.
+        .filter(|c| c["name"] != "Package Camera")
+        .filter_map(|c| {
+            Some(Channel {
+                width: u16::try_from(c["width"].as_u64()?).ok()?,
+                height: u16::try_from(c["height"].as_u64()?).ok()?,
+                alias: c["rtspAlias"].as_str().filter(|a| !a.is_empty())?.to_owned(),
+            })
+        })
+        .filter(|c| c.width > 0 && c.height > 0)
+        .collect()
+}
+
+/// What is known about the console right now, shared with the parts that
+/// serve video and snapshots on demand.
+#[derive(Default)]
+pub struct Live {
+    host: String,
+    inner: RwLock<LiveInner>,
+}
+
+#[derive(Default)]
+struct LiveInner {
+    /// Present while signed in.
+    client: Option<Arc<Client>>,
+    rtsps_port: u16,
+    channels: HashMap<String, Vec<Channel>>,
+    /// Which camera each accessory is.
+    cameras: HashMap<u64, String>,
+}
+
+impl Live {
+    fn update(&self, client: Arc<Client>, bootstrap: &Value) {
+        let mut inner = self.inner.write().unwrap();
+        inner.client = Some(client);
+        inner.rtsps_port = bootstrap["nvr"]["ports"]["rtsps"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(7441);
+        inner.channels = bootstrap["cameras"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| Some((c["id"].as_str()?.to_owned(), channels(c))))
+            .collect();
+    }
+
+    fn disconnected(&self) {
+        let mut inner = self.inner.write().unwrap();
+        inner.client = None;
+        inner.channels.clear();
+    }
+}
+
+impl SnapshotSource for Live {
+    fn snapshot(
+        &self,
+        aid: u64,
+        width: u32,
+        height: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
+        Box::pin(async move {
+            let (client, camera) = {
+                let inner = self.inner.read().unwrap();
+                (inner.client.clone()?, inner.cameras.get(&aid)?.clone())
+            };
+            match client.snapshot(&camera, width, height).await {
+                Ok(jpeg) => Some(jpeg.to_vec()),
+                Err(e) => {
+                    tracing::warn!("snapshot failed: {e}");
+                    None
+                }
+            }
+        })
+    }
+}
+
+/// Reads one camera's video from the console.
+struct ProtectVideo {
+    live: Arc<Live>,
+    camera: String,
+}
+
+impl VideoSource for ProtectVideo {
+    fn input_args(&self, width: u16) -> Option<Vec<String>> {
+        let inner = self.live.inner.read().unwrap();
+        let mut available: Vec<&Channel> = inner.channels.get(&self.camera)?.iter().collect();
+        available.sort_by_key(|c| c.width);
+        // The smallest stream that is at least as wide as asked, else the largest.
+        let channel = available.iter().find(|c| c.width >= width).or(available.last())?;
+        let url = format!("rtsps://{}:{}/{}?enableSrtp", self.live.host, inner.rtsps_port, channel.alias);
+        Some(
+            ["-hwaccel", "videotoolbox", "-rtsp_transport", "tcp", "-i", url.as_str()]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+    }
 }
 
 /// Whether the `devices` filter in the config selects this device.
@@ -170,13 +295,14 @@ struct Handles {
     leak: Option<u64>,
     battery_level: Option<u64>,
     low_battery: Option<u64>,
+    streams: Vec<StreamIds>,
 }
 
 fn status_active() -> Characteristic {
     Characteristic::sensor(kind::STATUS_ACTIVE, Format::Bool, json!(false))
 }
 
-fn build_accessory(aid: u64, def: &DeviceDef) -> (Accessory, Handles) {
+fn build_accessory(aid: u64, def: &DeviceDef, with_video: bool) -> (Accessory, Handles) {
     let firmware = if def.firmware.is_empty() { "0" } else { &def.firmware };
     let mut accessory = Accessory::new(
         aid,
@@ -240,6 +366,10 @@ fn build_accessory(aid: u64, def: &DeviceDef) -> (Accessory, Handles) {
         let (value, active) = sensor(&mut accessory, iid::LIGHT_LEVEL, kind::LIGHT_SENSOR, state);
         (handles.light_level, _) = (Some(value), handles.active.push(active));
     }
+    if let (true, Some((width, height))) = (with_video, def.video) {
+        let offered = video::resolutions(width, height);
+        handles.streams = iid::STREAMS.iter().map(|iid| video::add_stream_service(&mut accessory, *iid, &offered)).collect();
+    }
     if f.battery {
         let ids = accessory.add_service_at(
             iid::BATTERY,
@@ -264,25 +394,43 @@ fn build_accessory(aid: u64, def: &DeviceDef) -> (Accessory, Handles) {
 pub struct Devices {
     defs: Vec<DeviceDef>,
     handles: HashMap<(&'static str, String), Handles>,
+    /// Set when live video can be served: the shared console state and the
+    /// ffmpeg to run.
+    video: Option<(Arc<Live>, PathBuf)>,
 }
 
 impl Devices {
-    /// Publishes any devices not already present. Returns how many were added.
-    fn add(&mut self, defs: &[DeviceDef], store: &Store, db: &Database) -> Result<usize> {
-        let mut added = 0;
+    /// Publishes devices that are new, and rebuilds any whose definition
+    /// changed (a feature switched on in Protect, say). Returns how many
+    /// accessories were added or rebuilt.
+    fn add(&mut self, defs: &[DeviceDef], store: &Store, db: &Arc<Database>) -> Result<usize> {
+        let mut changed = 0;
         for def in defs {
             let key = (def.kind.model_key(), def.id.clone());
-            if self.handles.contains_key(&key) {
+            let existing = self.defs.iter().position(|d| d.kind == def.kind && d.id == def.id);
+            if existing.is_some_and(|i| self.defs[i] == *def) {
                 continue;
             }
             let aid = store.accessory_id(&def.store_key())?;
-            let (accessory, handles) = build_accessory(aid, def);
-            db.add(accessory);
+            let (accessory, handles) = build_accessory(aid, def, self.video.is_some());
+            db.replace(accessory);
+            if let Some((live, ffmpeg)) = &self.video {
+                for ids in &handles.streams {
+                    let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone() });
+                    video::install(db, aid, *ids, &def.name, source, ffmpeg);
+                }
+                if def.kind == Kind::Camera {
+                    live.inner.write().unwrap().cameras.insert(aid, def.id.clone());
+                }
+            }
             self.handles.insert(key, handles);
-            self.defs.push(def.clone());
-            added += 1;
+            match existing {
+                Some(i) => self.defs[i] = def.clone(),
+                None => self.defs.push(def.clone()),
+            }
+            changed += 1;
         }
-        Ok(added)
+        Ok(changed)
     }
 
     /// Applies changed fields of one device. `live` is false when replaying
@@ -398,6 +546,7 @@ fn save_cache(state_dir: &Path, defs: &[DeviceDef]) {
 }
 
 pub struct ProtectBridge {
+    live: Arc<Live>,
     state_dir: PathBuf,
     config: config::Protect,
     pin: Fingerprint,
@@ -421,14 +570,24 @@ impl ProtectBridge {
             .context("[protect] has no fingerprint yet; run `harbormaster protect-check` first")?
             .parse()
             .context("fingerprint in config.toml")?;
-        let mut devices = Devices::default();
+        let live = Arc::new(Live { host: config.host.clone(), ..Live::default() });
+        let ffmpeg = video::find_ffmpeg();
+        if ffmpeg.is_none() {
+            tracing::warn!("ffmpeg is not installed, so cameras will have no video");
+        }
+        let mut devices = Devices { video: ffmpeg.map(|path| (live.clone(), path)), ..Devices::default() };
         let mut cached = load_cache(state_dir);
         cached.retain(|def| selected(def, config.devices.as_deref()));
         devices.add(&cached, &store, &db)?;
         if !cached.is_empty() {
             tracing::info!("publishing {} UniFi Protect devices from the last run", cached.len());
         }
-        Ok(Self { state_dir: state_dir.to_owned(), config, pin, store, db, devices })
+        Ok(Self { live, state_dir: state_dir.to_owned(), config, pin, store, db, devices })
+    }
+
+    /// Where the HomeKit server gets camera snapshots.
+    pub fn snapshots(&self) -> Arc<dyn SnapshotSource> {
+        self.live.clone()
     }
 
     /// Stays connected to the console forever, reconnecting as needed.
@@ -441,6 +600,7 @@ impl ProtectBridge {
                 Err(e) => tracing::warn!("UniFi Protect connection lost: {e:#}"),
             }
             self.devices.mark_offline(&self.db);
+            self.live.disconnected();
             // A session that lasted a while was healthy, so start over quickly.
             if started.elapsed() > Duration::from_secs(60) {
                 delay = Duration::from_secs(1);
@@ -456,8 +616,18 @@ impl ProtectBridge {
         let mut client = Client::new(&self.config.host, self.config.port, self.pin);
         client.login(&self.config.username, &password).await?;
         drop(password);
+        let client = Arc::new(client);
 
         let bootstrap = client.bootstrap_raw().await?;
+        self.live.update(client.clone(), &bootstrap);
+        for camera in bootstrap["cameras"].as_array().into_iter().flatten() {
+            if channels(camera).is_empty() && camera["isAdopted"] != false {
+                tracing::warn!(
+                    "{} has no RTSP stream enabled in Protect, so it will have no video",
+                    camera["name"].as_str().unwrap_or("a camera")
+                );
+            }
+        }
         let all = definitions(&bootstrap);
         let filter = self.config.devices.as_deref();
         for entry in filter.into_iter().flatten() {
@@ -469,7 +639,7 @@ impl ProtectBridge {
         let added = self.devices.add(&defs, &self.store, &self.db)?;
         if added > 0 {
             save_cache(&self.state_dir, &self.devices.defs);
-            tracing::info!("added {added} UniFi Protect devices");
+            tracing::info!("added or updated {added} UniFi Protect devices");
             bridge.config_changed();
         }
         self.devices.apply_snapshot(&self.db, &bootstrap);
@@ -576,6 +746,77 @@ mod tests {
             defs[3].features,
             Features { temperature: true, humidity: true, light_level: true, battery: true, ..Features::default() }
         );
+    }
+
+    fn doorbell_with_channels() -> Value {
+        json!({
+            "nvr": {"ports": {"rtsps": 7441}},
+            "cameras": [{
+                "id": "cam1", "mac": "AA01", "name": "Front Door", "type": "UVC G4 Doorbell Pro", "state": "CONNECTED",
+                "featureFlags": {"isDoorbell": true},
+                "channels": [
+                    {"id": 0, "name": "High", "enabled": true, "isRtspEnabled": true, "rtspAlias": "HIGH", "width": 1600, "height": 1200},
+                    {"id": 1, "name": "Medium", "enabled": true, "isRtspEnabled": true, "rtspAlias": "MED", "width": 960, "height": 720},
+                    {"id": 2, "name": "Low", "enabled": true, "isRtspEnabled": false, "rtspAlias": "LOW", "width": 480, "height": 360},
+                    {"id": 3, "name": "Package Camera", "enabled": true, "isRtspEnabled": true, "rtspAlias": "PKG", "width": 1600, "height": 1200}
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn camera_video_uses_rtsp_channels_and_never_the_package_camera() {
+        let bootstrap = doorbell_with_channels();
+        let defs = definitions(&bootstrap);
+        assert_eq!(defs[0].video, Some((1600, 1200)));
+        // A camera with no RTSP stream offers no video.
+        assert_eq!(definitions(&super::tests::bootstrap())[0].video, None);
+
+        let live = Arc::new(Live { host: "10.0.0.5".into(), ..Live::default() });
+        let source = ProtectVideo { live: live.clone(), camera: "cam1".into() };
+        assert!(source.input_args(1280).is_none(), "nothing is available before the console is reached");
+
+        let pin: Fingerprint = "00".repeat(32).parse().unwrap();
+        live.update(Arc::new(Client::new("10.0.0.5", 443, pin)), &bootstrap);
+        let url = |width| source.input_args(width).unwrap().pop().unwrap();
+        assert_eq!(url(640), "rtsps://10.0.0.5:7441/MED?enableSrtp");
+        assert_eq!(url(960), "rtsps://10.0.0.5:7441/MED?enableSrtp");
+        assert_eq!(url(1280), "rtsps://10.0.0.5:7441/HIGH?enableSrtp");
+        assert_eq!(url(1920), "rtsps://10.0.0.5:7441/HIGH?enableSrtp", "falls back to the largest");
+        assert!(!url(1600).contains("PKG") && !url(1600).contains("LOW"));
+
+        live.disconnected();
+        assert!(source.input_args(640).is_none());
+    }
+
+    #[tokio::test]
+    async fn changed_definition_rebuilds_the_accessory_with_video() {
+        let dir = std::env::temp_dir().join(format!("hm-protect-{}-video", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(dir.join("state.json")).unwrap());
+        let db = Database::new();
+        let live = Arc::new(Live::default());
+        let mut devices =
+            Devices { video: Some((live.clone(), PathBuf::from("/nonexistent/ffmpeg"))), ..Devices::default() };
+
+        // From the cache of an older run: the camera is known, but not its video.
+        let mut cached = definitions(&doorbell_with_channels());
+        cached[0].video = None;
+        assert_eq!(devices.add(&cached, &store, &db).unwrap(), 1);
+        let aid = devices.handles[&("camera", "cam1".to_owned())].aid;
+        let before = db.layout();
+        assert_eq!(db.read(aid, iid::STREAMS[0] + 3), Err(harbormaster_hap::model::status::NOT_FOUND));
+
+        // The console is reached and reports the camera's streams.
+        assert_eq!(devices.add(&definitions(&doorbell_with_channels()), &store, &db).unwrap(), 1);
+        assert_eq!(devices.handles[&("camera", "cam1".to_owned())].aid, aid, "same accessory id");
+        assert_ne!(db.layout(), before, "controllers must be told the accessory changed");
+        assert_eq!(devices.handles[&("camera", "cam1".to_owned())].streams.len(), 2);
+        assert!(db.read(aid, iid::STREAMS[0] + 3).is_ok() && db.read(aid, iid::STREAMS[1] + 3).is_ok());
+        assert_eq!(live.inner.read().unwrap().cameras.get(&aid).map(String::as_str), Some("cam1"));
+        // Unchanged definitions are left alone.
+        assert_eq!(devices.add(&definitions(&doorbell_with_channels()), &store, &db).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

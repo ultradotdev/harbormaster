@@ -292,6 +292,53 @@ pub fn parse_selected(value: &Value) -> Option<Selected> {
     Some(Selected { session_id: control.get(0x01)?.try_into().ok()?, command, video })
 }
 
+/// Builds the values a controller would write, for tests of code that sits
+/// on top of this module. Not part of the stable interface.
+#[doc(hidden)]
+pub mod test_support {
+    use super::*;
+
+    pub fn setup_value(ip: &str, video_port: u16) -> Value {
+        let srtp = Srtp { suite: SRTP_AES_CM_128_HMAC_SHA1_80, key: vec![1; 16], salt: vec![2; 14] };
+        let address = Tlv::new()
+            .with(0x01, &[if ip.contains(':') { 1 } else { 0 }])
+            .with(0x02, ip.as_bytes())
+            .with(0x03, &video_port.to_le_bytes())
+            .with(0x04, &(video_port + 2).to_le_bytes());
+        tlv_value(
+            &Tlv::new()
+                .with(0x01, &[7u8; 16])
+                .with(0x03, &address.encode())
+                .with(0x04, &srtp.encode())
+                .with(0x05, &srtp.encode()),
+        )
+    }
+
+    pub fn selected_value(command: u8, width: u16, height: u16, fps: u8, kbps: u16) -> Value {
+        let control = Tlv::new().with(0x01, &[7u8; 16]).with(0x02, &[command]);
+        let parameters = Tlv::new().with(0x01, &[1]).with(0x02, &[2]).with(0x03, &[0]);
+        let attributes =
+            Tlv::new().with(0x01, &width.to_le_bytes()).with(0x02, &height.to_le_bytes()).with(0x03, &[fps]);
+        let rtp = Tlv::new()
+            .with(0x01, &[99])
+            .with(0x02, &1u32.to_le_bytes())
+            .with(0x03, &kbps.to_le_bytes())
+            .with(0x04, &0.5f32.to_le_bytes())
+            .with(0x05, &1378u16.to_le_bytes());
+        let video = Tlv::new()
+            .with(0x01, &[H264])
+            .with(0x02, &parameters.encode())
+            .with(0x03, &attributes.encode())
+            .with(0x04, &rtp.encode());
+        tlv_value(&Tlv::new().with(0x01, &control.encode()).with(0x02, &video.encode()))
+    }
+
+    /// The status field of a setup response: 0 is success.
+    pub fn setup_status(value: &Value) -> Option<u8> {
+        decode(value)?.get_u8(0x02)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,7 +455,7 @@ mod tests {
         let decoded = Tlv::decode(&bytes).unwrap();
         let first = nested(&decoded, 0x03).unwrap();
         assert_eq!((u16_le(&first, 0x01), u16_le(&first, 0x02), first.get_u8(0x03)), (Some(1920), Some(1080), Some(30)));
-        assert_eq!(bytes.windows(2).filter(|w| *w == [0x00, 0x00]).count() >= 2, true);
+        assert!(bytes.windows(2).filter(|w| *w == [0x00, 0x00]).count() >= 2);
         assert_eq!(stream_characteristics(&[(1280, 720, 30)]).len(), 6);
     }
 

@@ -73,7 +73,7 @@ pub fn base64_encode(bytes: &[u8]) -> String {
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     let digits = text.trim_end_matches('=').as_bytes();
     // Padding only ever stands in for one or two missing characters.
-    if text.len() % 4 != 0 || text.len() - digits.len() > 2 {
+    if !text.len().is_multiple_of(4) || text.len() - digits.len() > 2 {
         return None;
     }
     let mut out = Vec::with_capacity(digits.len() * 3 / 4);

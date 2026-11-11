@@ -62,6 +62,10 @@ fn answer(request: &str, behaviour: Behaviour) -> String {
             reply("200 OK", "Content-Type: application/json; charset=utf-8\r\n", BOOTSTRAP)
         }
         ("GET /proxy/protect/api/bootstrap HTTP/1.1", _) => reply("401 Unauthorized", "", "{}"),
+        (line, _) if line.starts_with("GET /proxy/protect/api/cameras/c1/snapshot?") && signed_in => {
+            let wants_size = line.contains("&w=640&h=480");
+            reply("200 OK", "Content-Type: image/jpeg\r\n", if wants_size { "JPEG-640" } else { "JPEG" })
+        }
         _ => reply("404 Not Found", "", "{}"),
     }
 }
@@ -177,4 +181,18 @@ async fn unreachable_console_is_a_connect_error() {
     let pin: Fingerprint = "00".repeat(32).parse().unwrap();
     let mut client = Client::new("127.0.0.1", port, pin);
     assert!(matches!(client.login("a", "b").await, Err(Error::Connect(_))));
+}
+
+#[tokio::test]
+async fn fetches_snapshots_and_refuses_odd_camera_ids() {
+    let console = start(Behaviour::Normal).await;
+    let mut client = Client::new("localhost", console.port, console.fingerprint);
+    assert!(matches!(client.snapshot("c1", 640, 480).await, Err(Error::NotSignedIn)));
+    client.login("harbormaster", "correct horse").await.unwrap();
+    assert_eq!(&client.snapshot("c1", 640, 480).await.unwrap()[..], b"JPEG-640");
+    let before = console.requests.load(Ordering::SeqCst);
+    assert!(matches!(client.snapshot("../users", 1, 1).await, Err(Error::Protocol(_))));
+    assert!(matches!(client.snapshot("", 1, 1).await, Err(Error::Protocol(_))));
+    assert_eq!(console.requests.load(Ordering::SeqCst), before, "bad ids never reach the console");
+    assert!(matches!(client.snapshot("missing", 1, 1).await, Err(Error::Status(_))));
 }

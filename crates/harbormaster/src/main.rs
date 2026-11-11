@@ -13,6 +13,7 @@ mod protect_check;
 mod qr;
 mod secrets;
 mod tui;
+mod video;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
