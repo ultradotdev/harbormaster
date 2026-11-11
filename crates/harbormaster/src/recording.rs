@@ -555,6 +555,10 @@ fn ffmpeg_args(format: &SelectedRecording, audio: bool) -> Vec<String> {
         "0".into(),
         "-force_key_frames".into(),
         format!("expr:gte(t,n_forced*{seconds})"),
+        // And none in between: ffmpeg's default of one every twelve frames
+        // would cut the recording into pieces a fraction of a second long.
+        "-g".into(),
+        ((fps as f64 * seconds).round() as u32).to_string(),
     ]);
     if audio {
         args.extend(fixed(&["-map", "0:a:0?", "-codec:a", "aac_at"]));
@@ -593,7 +597,7 @@ mod tests {
             "-vf scale=640:480 -r 30",
             "-codec:v h264_videotoolbox",
             "-profile:v high -level:v 4.0 -b:v 800k",
-            "-force_key_frames expr:gte(t,n_forced*4)",
+            "-force_key_frames expr:gte(t,n_forced*4) -g 120",
             "-map 0:a:0? -codec:a aac_at -ar 48000 -ac 1 -b:a 24k",
             "-movflags frag_keyframe+empty_moov+default_base_moof+skip_sidx -f mp4 pipe:1",
         ] {
@@ -709,7 +713,9 @@ mod tests {
         while camera.buffer.lock().unwrap().segments.iter().filter(|s| s.keyframe).count() < 5 {
             tokio::time::sleep(Duration::from_millis(250)).await;
             waited += 1;
-            assert!(waited < 80, "the buffer never filled with keyframes");
+            // Generous: under load the test feed can fail to start and is
+            // retried after a pause, as a real camera's would be.
+            assert!(waited < 240, "the buffer never filled with keyframes");
         }
         let asked = Instant::now();
         let mut pieces = recorder.open(2).unwrap();
@@ -724,8 +730,13 @@ mod tests {
         // The first piece comes from buffered video, so it arrives well
         // before four seconds of new video could have been recorded.
         assert!(asked.elapsed() < Duration::from_secs(3), "the first piece took {:?}", asked.elapsed());
+        let before_second = Instant::now();
         let second = next(&mut pieces).await;
-        for piece in [&first, &second] {
+        // Pieces are four seconds long: the first two come from buffered
+        // video, and the third has to wait for new video to be recorded.
+        let third = next(&mut pieces).await;
+        assert!(before_second.elapsed() > Duration::from_secs(1), "pieces are shorter than asked for");
+        for piece in [&first, &second, &third] {
             assert_eq!(&piece[4..8], b"moof");
             assert!(fmp4::has_keyframe(piece, track), "each piece must hold a keyframe");
         }
