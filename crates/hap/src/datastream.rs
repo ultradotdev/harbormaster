@@ -95,8 +95,8 @@ impl DataStreams {
                     *count += 1;
                 }
                 tokio::spawn(async move {
-                    if let Err(why) = streams.serve(socket).await {
-                        tracing::debug!("data stream from {} ended: {why}", peer.ip());
+                    if let Err(why) = streams.serve(socket, peer.ip()).await {
+                        tracing::info!("data stream from {} ended: {why}", peer.ip());
                     }
                     *streams.connections.lock().unwrap() -= 1;
                 });
@@ -139,7 +139,7 @@ impl DataStreams {
         Some((prepared.remove(index), plain))
     }
 
-    async fn serve(&self, socket: TcpStream) -> Result<(), &'static str> {
+    async fn serve(&self, socket: TcpStream, peer: std::net::IpAddr) -> Result<(), &'static str> {
         let (mut reader, mut writer) = socket.into_split();
         let mut frames = Frames::default();
 
@@ -191,6 +191,7 @@ impl DataStreams {
             Value::Dict(Vec::new()),
         );
         outgoing.send(hello_reply).await.map_err(|_| "the connection closed")?;
+        tracing::info!("data stream opened by {peer} for accessory {}", session.aid);
 
         let mut counter = 1u64;
         // The recording being sent, if any, and the id the hub gave it.
@@ -216,7 +217,10 @@ impl DataStreams {
                         ((Some("ipcamera.recording"), Some("controller")), Some(stream_id)) => {
                             self.source.open(session.aid).map(|fragments| (stream_id, fragments))
                         }
-                        _ => Err(Refusal::Unexpected),
+                        _ => {
+                            tracing::info!("data stream from {peer}: refusing a request for {wanted:?}");
+                            Err(Refusal::Unexpected)
+                        }
                     };
                     let answer = match opened {
                         Ok((stream_id, fragments)) => {
@@ -242,6 +246,11 @@ impl DataStreams {
                 ("dataSend", "close" | "ack", Kind::Event)
                     if sending.as_ref().is_some_and(|(id, _)| Some(*id) == stream_id) =>
                 {
+                    tracing::info!(
+                        "data stream from {peer}: the hub sent {} (reason {:?})",
+                        message.topic,
+                        message.body.get("reason").and_then(Value::as_i64)
+                    );
                     if let Some((_, task)) = sending.take() {
                         task.abort();
                     }

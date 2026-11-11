@@ -356,10 +356,12 @@ impl Recorder {
         });
 
         let recorder = self.clone();
+        let name = name.to_owned();
         db.on_write(
             aid,
             ids.transport_setup,
             Arc::new(move |value, context| {
+                tracing::info!("{name}: {} is setting up a data stream", context.peer_ip);
                 let salt = recording::parse_transport_setup(value).ok_or(status::INVALID_VALUE)?;
                 let secret = context.shared_secret.ok_or(status::INVALID_VALUE)?;
                 let streams = recorder.streams.lock().unwrap().clone().ok_or(status::INVALID_VALUE)?;
