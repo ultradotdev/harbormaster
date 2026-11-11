@@ -313,6 +313,15 @@ impl Recorder {
         db.set(aid, ids.audio, on(settings.audio));
         db.set(aid, ids.selected, json!(settings.selected));
         camera.refresh(&settings);
+        tracing::info!(
+            "{name}: HomeKit recording is {}",
+            match (settings.wanted(), settings.active, settings.format().is_some()) {
+                (Some(f), ..) => format!("on at {}x{}, keeping the last {} s ready", f.width, f.height, KEEP.as_secs()),
+                (None, true, false) => "switched on, but no hub has chosen a format yet".to_owned(),
+                (None, true, true) => "switched on, but the camera is switched off in HomeKit".to_owned(),
+                (None, false, _) => "off".to_owned(),
+            }
+        );
 
         // Each switch updates one field, is saved, and re-evaluates buffering.
         let handle = |iid: u64, apply: fn(&mut Settings, &Value) -> bool| {

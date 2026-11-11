@@ -505,8 +505,10 @@ impl Devices {
             }
         }
         let motion = if model_key == "light" { "isPirMotionDetected" } else { "isMotionDetected" };
-        if let Some(detected) = data[motion].as_bool() {
-            set(h.motion, json!(detected));
+        if let (Some(detected), Some(iid)) = (data[motion].as_bool(), h.motion) {
+            if db.set(h.aid, iid, json!(detected)) && live {
+                tracing::info!("{}: motion {}", h.name, if detected { "detected" } else { "ended" });
+            }
         }
         if let (true, Some(iid), true) = (live, h.ring, data["lastRing"].is_number()) {
             tracing::info!("doorbell ring: {}", h.name);

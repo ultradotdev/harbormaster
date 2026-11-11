@@ -42,6 +42,7 @@ Options:
   --listen ADDR     daemon: address and port to serve HomeKit on
                     (default 0.0.0.0:51826, which serves IPv4 and IPv6)
   --demo            daemon: publish a simulated temperature sensor
+  --verbose         daemon: also log each event sent to a controller
   --seconds N       protect-capture, protect-feed: how long to record (default 120)
   --camera NAME     protect-feed: which camera (default: the first in `devices`)
   --channel N       protect-feed: which quality, 0 being the best (default 0)";
@@ -59,6 +60,7 @@ struct Args {
     state_dir: PathBuf,
     listen: SocketAddr,
     demo: bool,
+    verbose: bool,
     seconds: u64,
     camera: Option<String>,
     channel: u8,
@@ -75,6 +77,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
         state_dir: PathBuf::new(),
         listen: "0.0.0.0:51826".parse()?,
         demo: false,
+        verbose: false,
         seconds: 120,
         camera: None,
         channel: 0,
@@ -94,6 +97,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
             "--state-dir" => args.state_dir = value()?.into(),
             "--listen" => args.listen = value()?.parse().context("--listen expects ADDRESS:PORT")?,
             "--demo" => args.demo = true,
+            "--verbose" => args.verbose = true,
             "--help" | "-h" => {
                 println!("harbormaster {}\n\n{HELP}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -127,7 +131,11 @@ fn main() -> Result<()> {
             let logs = logbuf::LogBuffer::new();
             tracing_subscriber::registry()
                 .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(if args.verbose {
+                    tracing_subscriber::filter::LevelFilter::DEBUG
+                } else {
+                    tracing_subscriber::filter::LevelFilter::INFO
+                })
                 .with(logs.clone())
                 .init();
             let options =

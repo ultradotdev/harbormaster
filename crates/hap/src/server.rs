@@ -399,6 +399,12 @@ impl Connection {
                     Ok(change) => {
                         let wanted = self.subscriptions.contains(&(change.aid, change.iid));
                         if wanted && change.origin != Some(self.id) {
+                            tracing::debug!(
+                                "telling {} that accessory {} characteristic {} changed",
+                                self.peer.ip(),
+                                change.aid,
+                                change.iid
+                            );
                             self.send(&event(&[&change])).await?;
                         }
                     }
@@ -628,7 +634,10 @@ impl Connection {
                     (None, _) => code = status::NOT_FOUND,
                     (Some(false), _) => code = status::NO_NOTIFICATIONS,
                     (Some(true), Some(true)) => {
-                        self.subscriptions.insert((aid, iid));
+                        if self.subscriptions.insert((aid, iid)) {
+                            let kind = self.shared.db.with(aid, iid, |c| c.kind).unwrap_or("unknown");
+                            tracing::debug!("{} now follows accessory {aid} characteristic {iid} (type {kind})", self.peer.ip());
+                        }
                     }
                     (Some(true), Some(false)) => {
                         self.subscriptions.remove(&(aid, iid));
