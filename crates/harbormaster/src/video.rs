@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use harbormaster_hap::camera::{
-    self, kind, parse_selected, parse_setup, Command, SelectedVideo, SetupRequest, SetupResponse,
+    self, kind, parse_selected, parse_setup, Command, SelectedAudio, SelectedVideo, SetupRequest, SetupResponse,
 };
 use harbormaster_hap::model::status;
 use harbormaster_hap::{Accessory, Database};
@@ -78,6 +78,7 @@ pub fn add_stream_service(accessory: &mut Accessory, iid: u64, offered: &[(u16, 
 struct Pending {
     request: SetupRequest,
     ssrc: u32,
+    audio_ssrc: u32,
     connection: u64,
     /// Held so the port reported to the controller stays reserved.
     socket: UdpSocket,
@@ -171,17 +172,19 @@ impl Stream {
         // ffmpeg takes the stream identifier as a signed number, so keep it
         // positive, and never zero.
         let ssrc = (u32::from_le_bytes(random_bytes()) & 0x7fff_ffff).max(1);
+        let audio_ssrc = (ssrc ^ 0x0100_0000).max(1);
         let response = SetupResponse {
             request: &request,
             local_ip,
             video_port: port,
-            // No audio is sent yet; the same port absorbs anything addressed to it.
+            // Nothing the controller sends back is used, so one port takes
+            // the control traffic for both video and audio.
             audio_port: port,
             video_ssrc: ssrc,
-            audio_ssrc: ssrc ^ 0x0100_0000,
+            audio_ssrc,
         }
         .encode();
-        self.state.lock().unwrap().pending = Some(Pending { request, ssrc, connection, socket });
+        self.state.lock().unwrap().pending = Some(Pending { request, ssrc, audio_ssrc, connection, socket });
         Ok(Some(response))
     }
 
@@ -200,7 +203,13 @@ impl Stream {
                         }
                     }
                 };
-                self.start(pending, video);
+                // Sound is left out rather than refusing the stream if the
+                // controller picked something that was not offered.
+                let audio = selected.audio.filter(|a| {
+                    a.codec == camera::AAC_ELD
+                        && pending.request.audio_srtp.suite == camera::SRTP_AES_CM_128_HMAC_SHA1_80
+                });
+                self.start(pending, video, audio);
             }
             Command::End => self.stop_if(|running| running.session_id == selected.session_id),
             // Pausing and bitrate changes are accepted but not acted on.
@@ -225,12 +234,12 @@ impl Stream {
         }
     }
 
-    fn start(self: &Arc<Self>, pending: Pending, video: SelectedVideo) {
+    fn start(self: &Arc<Self>, pending: Pending, video: SelectedVideo, audio: Option<SelectedAudio>) {
         let Some(input) = self.source.input_args(video.width) else {
             tracing::warn!("{}: the camera became unreachable before the stream started", self.name);
             return;
         };
-        let args = ffmpeg_args(&input, &pending.request, &video, pending.ssrc);
+        let args = ffmpeg_args(&input, &pending.request, &video, pending.ssrc, audio.as_ref().map(|a| (a, pending.audio_ssrc)));
         let mut command = tokio::process::Command::new(&self.ffmpeg);
         command.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut child = match command.spawn() {
@@ -241,12 +250,16 @@ impl Stream {
             }
         };
         tracing::info!(
-            "{}: streaming {}x{} at {} fps, {} kbps to {}",
+            "{}: streaming {}x{} at {} fps, {} kbps, {} to {}",
             self.name,
             video.width,
             video.height,
             video.fps,
             video.max_bitrate_kbps,
+            match &audio {
+                Some(a) => format!("sound at {} kHz, {} kbps", a.sample_rate_hz / 1000, a.max_bitrate_kbps),
+                None => "no sound".to_owned(),
+            },
             pending.request.controller_ip
         );
 
@@ -317,7 +330,13 @@ fn random_bytes() -> [u8; 4] {
 
 /// The ffmpeg command line for one stream. `input` comes from the video
 /// source; everything after it is determined by what the controller asked.
-fn ffmpeg_args(input: &[String], request: &SetupRequest, video: &SelectedVideo, ssrc: u32) -> Vec<String> {
+fn ffmpeg_args(
+    input: &[String],
+    request: &SetupRequest,
+    video: &SelectedVideo,
+    ssrc: u32,
+    audio: Option<(&SelectedAudio, u32)>,
+) -> Vec<String> {
     let profile = match video.profile {
         0 => "baseline",
         1 => "main",
@@ -381,6 +400,45 @@ fn ffmpeg_args(input: &[String], request: &SetupRequest, video: &SelectedVideo, 
         request.video_srtp.key_material(),
         format!("srtp://{host}:{port}?rtcpport={port}&pkt_size={packet}"),
     ]);
+    if let Some((audio, ssrc)) = audio {
+        let port = request.audio_port;
+        // A second output of the same process, so sound and picture share
+        // one connection to the camera and stay in step. The `?` lets a
+        // camera without a microphone still stream video.
+        args.extend(fixed(&["-map", "0:a:0?", "-vn", "-sn", "-dn"]));
+        args.extend([
+            // Apple's own encoder. Profile 38 is AAC-ELD, which this
+            // encoder does not accept by name.
+            "-codec:a".into(),
+            "aac_at".into(),
+            "-profile:a".into(),
+            "38".into(),
+            "-aac_at_mode".into(),
+            "cvbr".into(),
+            // Required for this audio format to be packed into RTP.
+            "-flags".into(),
+            "+global_header".into(),
+            "-ar".into(),
+            audio.sample_rate_hz.to_string(),
+            "-ac".into(),
+            "1".into(),
+            "-b:a".into(),
+            format!("{}k", audio.max_bitrate_kbps.clamp(8, 64)),
+            "-payload_type".into(),
+            audio.payload_type.to_string(),
+            "-ssrc".into(),
+            ssrc.to_string(),
+            "-f".into(),
+            "rtp".into(),
+            "-srtp_out_suite".into(),
+            "AES_CM_128_HMAC_SHA1_80".into(),
+            "-srtp_out_params".into(),
+            request.audio_srtp.key_material(),
+            // Small packets so each carries one frame of sound and none
+            // waits for the next.
+            format!("srtp://{host}:{port}?rtcpport={port}&pkt_size=188"),
+        ]);
+    }
     args
 }
 
@@ -485,8 +543,9 @@ mod tests {
     #[test]
     fn ffmpeg_command_carries_the_negotiated_settings() {
         let input = vec!["-i".to_owned(), "SOURCE".to_owned()];
-        let args = ffmpeg_args(&input, &request("10.0.0.9", 50000), &video(1280, 720), 12345);
+        let args = ffmpeg_args(&input, &request("10.0.0.9", 50000), &video(1280, 720), 12345, None);
         let line = args.join(" ");
+        assert!(!line.contains("aac_at"), "no sound was selected: {line}");
         for expected in [
             "-i SOURCE",
             "-vf scale=1280:720",
@@ -504,15 +563,38 @@ mod tests {
         ] {
             assert!(line.contains(expected), "missing {expected:?} in {line}");
         }
-        let v6 = ffmpeg_args(&input, &request("fe80::1", 50000), &video(320, 240), 1);
+        let v6 = ffmpeg_args(&input, &request("fe80::1", 50000), &video(320, 240), 1, None);
         assert!(v6.last().unwrap().starts_with("srtp://[fe80::1]:50000?"));
+    }
+
+    #[test]
+    fn ffmpeg_command_adds_sound_as_a_second_output() {
+        let input = vec!["-i".to_owned(), "SOURCE".to_owned()];
+        let audio =
+            SelectedAudio { codec: camera::AAC_ELD, sample_rate_hz: 16000, payload_type: 110, max_bitrate_kbps: 24, packet_time_ms: 30 };
+        let args = ffmpeg_args(&input, &request("10.0.0.9", 50000), &video(1280, 720), 12345, Some((&audio, 777)));
+        let line = args.join(" ");
+        // Everything after the video destination belongs to the sound.
+        let (video_part, audio_part) = line.split_once("pkt_size=1378 ").expect("video output comes first");
+        assert!(video_part.contains("-map 0:v:0 -an"), "{video_part}");
+        for expected in [
+            "-map 0:a:0? -vn",
+            "-codec:a aac_at -profile:a 38",
+            "-ar 16000 -ac 1 -b:a 24k",
+            "-payload_type 110 -ssrc 777",
+            "-srtp_out_suite AES_CM_128_HMAC_SHA1_80",
+        ] {
+            assert!(audio_part.contains(expected), "missing {expected:?} in {audio_part}");
+        }
+        assert_eq!(args.last().unwrap(), "srtp://10.0.0.9:50002?rtcpport=50002&pkt_size=188");
     }
 
     struct TestPattern;
 
     impl VideoSource for TestPattern {
         fn input_args(&self, _width: u16) -> Option<Vec<String>> {
-            Some(["-re", "-f", "lavfi", "-i", "testsrc=size=640x480:rate=30"].iter().map(|s| s.to_string()).collect())
+            let source = "testsrc=size=640x480:rate=30[out0];sine=frequency=440:sample_rate=48000[out1]";
+            Some(["-re", "-f", "lavfi", "-i", source].iter().map(|s| s.to_string()).collect())
         }
     }
 
@@ -553,8 +635,35 @@ mod tests {
         assert_eq!(harbormaster_hap::camera::test_support::setup_status(&answer), Some(2));
     }
 
-    /// Runs a real ffmpeg with a test pattern and checks encrypted RTP
-    /// actually arrives. Skipped where ffmpeg is not installed.
+    /// Two sockets two ports apart, the way a controller lays out the
+    /// video and audio ports it listens on.
+    async fn receivers() -> (tokio::net::UdpSocket, tokio::net::UdpSocket) {
+        for _ in 0..50 {
+            let video = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = video.local_addr().unwrap().port();
+            if let Ok(audio) = tokio::net::UdpSocket::bind(("127.0.0.1", port.wrapping_add(2))).await {
+                return (video, audio);
+            }
+        }
+        panic!("no pair of free UDP ports");
+    }
+
+    /// Reads until something other than a control packet (sender reports,
+    /// types 200 to 204, share the port) arrives; returns its payload type.
+    async fn media_payload_type(socket: &tokio::net::UdpSocket) -> u8 {
+        let mut packet = [0u8; 2048];
+        loop {
+            let n = socket.recv(&mut packet).await.unwrap();
+            assert!(n > 12, "packet too short to be RTP");
+            assert_eq!(packet[0] >> 6, 2, "RTP version");
+            if !(200..=204).contains(&packet[1]) {
+                return packet[1] & 0x7f;
+            }
+        }
+    }
+
+    /// Runs a real ffmpeg with a test pattern and tone and checks encrypted
+    /// RTP actually arrives for both. Skipped where ffmpeg is not installed.
     #[tokio::test]
     async fn real_ffmpeg_delivers_rtp_and_stops_on_end_or_disconnect() {
         let Some(ffmpeg) = find_ffmpeg() else {
@@ -562,7 +671,7 @@ mod tests {
             return;
         };
         let (db, ids) = camera(Arc::new(TestPattern), &ffmpeg);
-        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (receiver, audio_receiver) = receivers().await;
         let port = receiver.local_addr().unwrap().port();
         let (setup, start) = controller_writes(port, 1);
 
@@ -572,23 +681,15 @@ mod tests {
         db.write(2, ids.selected, &start, &context(7)).unwrap();
         assert_eq!(db.read(2, ids.status).unwrap(), camera::streaming_status(camera::STATUS_IN_USE));
 
-        // Control packets (sender reports, types 200 to 204) share the port
-        // with video, so read until a video packet shows up.
         let mut packet = [0u8; 2048];
-        let video_packet = async {
-            loop {
-                let n = receiver.recv(&mut packet).await.unwrap();
-                assert!(n > 12, "packet too short to be RTP");
-                assert_eq!(packet[0] >> 6, 2, "RTP version");
-                if !(200..=204).contains(&packet[1]) {
-                    return packet[1] & 0x7f;
-                }
-            }
-        };
-        let payload_type = tokio::time::timeout(Duration::from_secs(15), video_packet)
+        let payload_type = tokio::time::timeout(Duration::from_secs(15), media_payload_type(&receiver))
             .await
             .expect("no video arrived from ffmpeg");
         assert_eq!(payload_type, 99, "the negotiated payload type");
+        let payload_type = tokio::time::timeout(Duration::from_secs(15), media_payload_type(&audio_receiver))
+            .await
+            .expect("no sound arrived from ffmpeg");
+        assert_eq!(payload_type, 110, "the negotiated audio payload type");
 
         // A controller that disconnects without saying "end" stops the stream.
         db.connection_closed(7);

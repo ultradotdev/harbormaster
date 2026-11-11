@@ -34,7 +34,9 @@ pub const STATUS_AVAILABLE: u8 = 0;
 pub const STATUS_IN_USE: u8 = 1;
 
 const H264: u8 = 0;
-const OPUS: u8 = 3;
+/// AAC with the enhanced low delay profile, the codec HomeKit prefers for
+/// live audio.
+pub const AAC_ELD: u8 = 2;
 
 /// Separates repeated items of the same type in a TLV8 list.
 fn separator(tlv: &mut Tlv) {
@@ -100,7 +102,7 @@ pub fn supported_video(resolutions: &[(u16, u16, u8)]) -> Value {
     tlv_value(&Tlv::new().with(0x01, &codec.encode()))
 }
 
-/// Advertises Opus at 24 kHz and 16 kHz, variable bitrate, mono. HomeKit
+/// Advertises AAC-ELD at 24 kHz and 16 kHz, variable bitrate, mono. HomeKit
 /// requires an audio offer even from a camera that sends no audio.
 pub fn supported_audio() -> Value {
     let mut out = Tlv::new();
@@ -110,7 +112,7 @@ pub fn supported_audio() -> Value {
             separator(&mut out);
         }
         let parameters = Tlv::new().with(0x01, &[1]).with(0x02, &[0]).with(0x03, &[*rate]);
-        let codec = Tlv::new().with(0x01, &[OPUS]).with(0x02, &parameters.encode());
+        let codec = Tlv::new().with(0x01, &[AAC_ELD]).with(0x02, &parameters.encode());
         out.push(0x01, &codec.encode());
     }
     // No comfort noise.
@@ -255,12 +257,26 @@ pub struct SelectedVideo {
     pub mtu: Option<u16>,
 }
 
+/// The audio settings a controller chose for a stream.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectedAudio {
+    /// The codec identifier, [`AAC_ELD`] being the only one offered.
+    pub codec: u8,
+    pub sample_rate_hz: u32,
+    pub payload_type: u8,
+    pub max_bitrate_kbps: u16,
+    /// How much sound each packet should carry, in milliseconds.
+    pub packet_time_ms: u8,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Selected {
     pub session_id: [u8; 16],
     pub command: Command,
     /// Present for start and reconfigure.
     pub video: Option<SelectedVideo>,
+    /// Present for start; absent or unusable settings mean no sound.
+    pub audio: Option<SelectedAudio>,
 }
 
 pub fn parse_selected(value: &Value) -> Option<Selected> {
@@ -289,7 +305,23 @@ pub fn parse_selected(value: &Value) -> Option<Selected> {
             mtu: u16_le(&rtp, 0x05),
         })
     });
-    Some(Selected { session_id: control.get(0x01)?.try_into().ok()?, command, video })
+    let audio = nested(&tlv, 0x03).and_then(|audio| {
+        let parameters = nested(&audio, 0x02)?;
+        let rtp = nested(&audio, 0x03)?;
+        Some(SelectedAudio {
+            codec: audio.get_u8(0x01)?,
+            sample_rate_hz: match parameters.get_u8(0x03)? {
+                0 => 8000,
+                1 => 16000,
+                2 => 24000,
+                _ => return None,
+            },
+            payload_type: rtp.get_u8(0x01)?,
+            max_bitrate_kbps: u16_le(&rtp, 0x03)?,
+            packet_time_ms: parameters.get_u8(0x04).unwrap_or(30),
+        })
+    });
+    Some(Selected { session_id: control.get(0x01)?.try_into().ok()?, command, video, audio })
 }
 
 /// Builds the values a controller would write, for tests of code that sits
@@ -330,7 +362,21 @@ pub mod test_support {
             .with(0x02, &parameters.encode())
             .with(0x03, &attributes.encode())
             .with(0x04, &rtp.encode());
-        tlv_value(&Tlv::new().with(0x01, &control.encode()).with(0x02, &video.encode()))
+        tlv_value(
+            &Tlv::new().with(0x01, &control.encode()).with(0x02, &video.encode()).with(0x03, &selected_audio_tlv()),
+        )
+    }
+
+    /// The audio part of a selection: AAC-ELD, mono, 16 kHz, 24 kbps.
+    pub fn selected_audio_tlv() -> Vec<u8> {
+        let parameters = Tlv::new().with(0x01, &[1]).with(0x02, &[0]).with(0x03, &[1]).with(0x04, &[30]);
+        let rtp = Tlv::new()
+            .with(0x01, &[110])
+            .with(0x02, &2u32.to_le_bytes())
+            .with(0x03, &24u16.to_le_bytes())
+            .with(0x04, &5f32.to_le_bytes())
+            .with(0x06, &[13]);
+        Tlv::new().with(0x01, &[AAC_ELD]).with(0x02, &parameters.encode()).with(0x03, &rtp.encode()).with(0x04, &[0]).encode()
     }
 
     /// The status field of a setup response: 0 is success.
@@ -419,6 +465,7 @@ mod tests {
                 .with(0x03, &attributes.encode())
                 .with(0x04, &rtp.encode());
             tlv.push(0x02, &video.encode());
+            tlv.push(0x03, &test_support::selected_audio_tlv());
         }
         tlv_value(&tlv)
     }
@@ -440,8 +487,18 @@ mod tests {
                 mtu: Some(1378),
             })
         );
+        assert_eq!(
+            start.audio,
+            Some(SelectedAudio {
+                codec: AAC_ELD,
+                sample_rate_hz: 16000,
+                payload_type: 110,
+                max_bitrate_kbps: 24,
+                packet_time_ms: 30,
+            })
+        );
         let end = parse_selected(&selected_value(0, false)).unwrap();
-        assert_eq!((end.command, end.video), (Command::End, None));
+        assert_eq!((end.command, end.video, end.audio), (Command::End, None, None));
         assert!(parse_selected(&selected_value(9, false)).is_none());
     }
 
