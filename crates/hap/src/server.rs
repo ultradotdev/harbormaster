@@ -38,7 +38,9 @@ pub struct Config {
     /// Name shown while pairing, and the Bonjour instance name.
     pub name: String,
     pub model: String,
-    /// Address to listen on. Port 0 picks a free port.
+    /// Address to listen on. Port 0 picks a free port. An unspecified
+    /// address (`0.0.0.0` or `[::]`) listens on both IPv4 and IPv6, which
+    /// matters because Apple devices prefer the advertised IPv6 addresses.
     pub listen: SocketAddr,
     /// Whether to advertise over Bonjour. Tests turn this off.
     pub advertise: bool,
@@ -82,10 +84,16 @@ impl Drop for Bridge {
 
 impl Bridge {
     pub async fn start(config: Config, store: Arc<Store>, db: Arc<Database>) -> Result<Self, Error> {
-        let listener = TcpListener::bind(config.listen).await?;
+        let listener = bind(config.listen).await?;
         let local_addr = listener.local_addr()?;
         let advertiser = if config.advertise {
-            Some(Advertiser::new(&config.name, &config.model, &store.device_id(), local_addr.port())?)
+            Some(Advertiser::new(
+                &config.name,
+                &config.model,
+                &store.device_id(),
+                &store.setup_hash(),
+                local_addr.port(),
+            )?)
         } else {
             None
         };
@@ -121,13 +129,30 @@ impl Bridge {
                     let _permit = permit;
                     tracing::debug!("connection {id} from {peer}");
                     let _ = stream.set_nodelay(true);
-                    if let Err(e) = Connection::new(shared, stream, id).run().await {
+                    if let Err(e) = Connection::new(shared, stream, id, peer).run().await {
                         tracing::debug!("connection {id} from {peer} closed: {e}");
                     }
                 });
             }
         });
         Ok(Self { local_addr, task })
+    }
+}
+
+/// Binds the listener. For an unspecified address this prefers a dual-stack
+/// IPv6 socket, which also accepts IPv4, and falls back to IPv4 alone on
+/// hosts with IPv6 disabled.
+async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    if !addr.ip().is_unspecified() {
+        return TcpListener::bind(addr).await;
+    }
+    let dual = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, addr.port()));
+    match TcpListener::bind(dual).await {
+        Ok(listener) => Ok(listener),
+        Err(e) => {
+            tracing::warn!("IPv6 listener unavailable ({e}); serving IPv4 only");
+            TcpListener::bind(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, addr.port()))).await
+        }
     }
 }
 
@@ -226,6 +251,7 @@ struct Connection {
     shared: Arc<Shared>,
     stream: TcpStream,
     id: u64,
+    peer: SocketAddr,
     session: Option<Session>,
     /// Identifier of the verified controller, once pair-verify has succeeded.
     controller: Option<String>,
@@ -235,11 +261,12 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(shared: Arc<Shared>, stream: TcpStream, id: u64) -> Self {
+    fn new(shared: Arc<Shared>, stream: TcpStream, id: u64, peer: SocketAddr) -> Self {
         Self {
             shared,
             stream,
             id,
+            peer,
             session: None,
             controller: None,
             setup: SetupState::default(),
@@ -328,14 +355,18 @@ impl Connection {
                     &self.shared.failed_setup_attempts,
                     &request.body,
                 );
+                self.log_pairing_step("pair-setup", &request.body, &body);
                 if store.is_paired() != was_paired {
-                    tracing::info!("paired with a controller");
+                    tracing::info!("paired with a controller at {}", self.peer.ip());
                     self.shared.pairings_changed();
                 }
                 response(200, TLV, &body)
             }
             ("POST", "/pair-verify", _) => {
                 let (body, verified) = pairing::pair_verify(&mut self.verify, &store, &request.body);
+                if verified.is_none() {
+                    self.log_pairing_step("pair-verify", &request.body, &body);
+                }
                 let session = verified.map(|v| {
                     tracing::debug!("connection {} verified as {}", self.id, v.controller_id);
                     self.controller = Some(v.controller_id);
@@ -365,6 +396,25 @@ impl Connection {
             _ => response(404, JSON, b"{}"),
         };
         (reply, None)
+    }
+
+    /// Pairing is rare and hard to debug from the phone side, so each step
+    /// is logged: progress at info level, refusals as warnings.
+    fn log_pairing_step(&self, what: &str, request: &[u8], reply: &[u8]) {
+        use crate::tlv::{Tlv, ERROR, STATE};
+        let step = Tlv::decode(request).ok().and_then(|t| t.get_u8(STATE)).unwrap_or(0);
+        match Tlv::decode(reply).ok().and_then(|t| t.get_u8(ERROR)) {
+            Some(code) => {
+                let reason = match code {
+                    crate::tlv::error::AUTHENTICATION => "wrong setup code or unknown controller",
+                    crate::tlv::error::MAX_TRIES => "too many failed attempts; restart to retry",
+                    crate::tlv::error::UNAVAILABLE => "already paired",
+                    _ => "malformed or out-of-order request",
+                };
+                tracing::warn!("{what} step {step} from {} refused: {reason}", self.peer.ip());
+            }
+            None => tracing::info!("{what} step {step} from {} ok", self.peer.ip()),
+        }
     }
 
     fn read_characteristics(&self, query: &str) -> Vec<u8> {

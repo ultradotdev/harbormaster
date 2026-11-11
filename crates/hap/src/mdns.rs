@@ -11,16 +11,24 @@ pub struct Advertiser {
     name: String,
     model: String,
     device_id: String,
+    setup_hash: String,
     port: u16,
 }
 
 impl Advertiser {
-    pub fn new(name: &str, model: &str, device_id: &str, port: u16) -> Result<Self, mdns_sd::Error> {
+    pub fn new(
+        name: &str,
+        model: &str,
+        device_id: &str,
+        setup_hash: &str,
+        port: u16,
+    ) -> Result<Self, mdns_sd::Error> {
         Ok(Self {
             daemon: ServiceDaemon::new()?,
             name: name.to_owned(),
             model: model.to_owned(),
             device_id: device_id.to_owned(),
+            setup_hash: setup_hash.to_owned(),
             port,
         })
     }
@@ -39,6 +47,7 @@ impl Advertiser {
             ("s#", "1"),
             ("sf", if paired { "0" } else { "1" }),
             ("ci", CATEGORY_BRIDGE),
+            ("sh", self.setup_hash.as_str()),
         ];
         let host = format!("harbormaster-{}.local.", self.device_id.replace(':', "").to_lowercase());
         let info = ServiceInfo::new(SERVICE_TYPE, &self.name, &host, (), self.port, &properties[..])?

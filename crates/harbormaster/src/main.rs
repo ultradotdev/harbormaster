@@ -40,7 +40,8 @@ fn parse_args() -> Result<Args> {
                     "harbormaster {VERSION}\n\n\
                      Options:\n  \
                      --state-dir DIR   where pairing state lives\n  \
-                     --listen ADDR     address and port to serve HomeKit on (default 0.0.0.0:51826)\n  \
+                     --listen ADDR     address and port to serve HomeKit on (default 0.0.0.0:51826,\n                    \
+                    which serves both IPv4 and IPv6)\n  \
                      --demo            publish a simulated temperature sensor"
                 );
                 std::process::exit(0);
@@ -49,6 +50,26 @@ fn parse_args() -> Result<Args> {
         }
     }
     Ok(args)
+}
+
+/// HomeKit accessory category for a bridge.
+const CATEGORY_BRIDGE: u8 = 2;
+
+/// Shows the setup code and a scannable QR code for pairing.
+fn print_setup(store: &Store) {
+    use qrcode::render::unicode::Dense1x2;
+    println!("\nNot paired. In the Home app choose Add Accessory, then scan this code");
+    println!("or enter the setup code manually.\n");
+    match qrcode::QrCode::new(store.setup_uri(CATEGORY_BRIDGE)) {
+        // Light modules are drawn as solid blocks so the code reads correctly
+        // on a dark terminal background.
+        Ok(code) => println!(
+            "{}",
+            code.render::<Dense1x2>().dark_color(Dense1x2::Light).light_color(Dense1x2::Dark).build()
+        ),
+        Err(e) => tracing::warn!("could not draw QR code: {e}"),
+    }
+    println!("\nSetup code: {}\n", store.setup_code());
 }
 
 #[tokio::main]
@@ -118,7 +139,7 @@ async fn main() -> Result<()> {
     if store.is_paired() {
         tracing::info!("already paired with {} controller(s)", store.pairings().len());
     } else {
-        tracing::info!("not paired; add it in the Home app with setup code {}", store.setup_code());
+        print_setup(&store);
     }
 
     tokio::signal::ctrl_c().await?;

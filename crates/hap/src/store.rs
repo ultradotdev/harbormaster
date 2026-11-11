@@ -34,6 +34,9 @@ struct State {
     /// Accessory pairing identifier, formatted like a MAC address.
     device_id: String,
     setup_code: String,
+    /// Four-character id that ties a scanned QR code to this bridge.
+    #[serde(default)]
+    setup_id: String,
     /// Accessory long-term Ed25519 secret key, hex.
     secret_key: String,
     /// Bumped whenever the accessory database changes shape.
@@ -47,6 +50,55 @@ struct State {
 pub struct Store {
     path: PathBuf,
     state: Mutex<State>,
+}
+
+fn new_setup_id() -> String {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    // 252 is the largest multiple of 36 below 256, so the modulo is unbiased.
+    random::<64>()
+        .iter()
+        .filter(|b| **b < 252)
+        .take(4)
+        .map(|b| char::from(ALPHABET[(*b % 36) as usize]))
+        .collect()
+}
+
+fn base36(mut value: u64, width: usize) -> String {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut digits = Vec::new();
+    while value > 0 {
+        digits.push(ALPHABET[(value % 36) as usize]);
+        value /= 36;
+    }
+    while digits.len() < width {
+        digits.push(b'0');
+    }
+    digits.iter().rev().map(|d| char::from(*d)).collect()
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().fold(0u32, |n, b| n << 8 | *b as u32) << (8 * (3 - chunk.len()));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The payload of a HomeKit setup QR code: the setup code, an "IP accessory"
+/// flag and the accessory category packed into a base-36 number, followed by
+/// the setup id.
+fn setup_uri(setup_code: &str, setup_id: &str, category: u8) -> String {
+    const IP_ACCESSORY: u64 = 1 << 28;
+    let code: u64 = setup_code.replace('-', "").parse().expect("setup code is numeric");
+    format!("X-HM://{}{setup_id}", base36(code | IP_ACCESSORY | (category as u64) << 31, 9))
 }
 
 fn new_setup_code() -> String {
@@ -75,10 +127,14 @@ impl Store {
         let path = path.as_ref().to_owned();
         let state = match std::fs::read(&path) {
             Ok(bytes) => {
-                let state: State = serde_json::from_slice(&bytes)
+                let mut state: State = serde_json::from_slice(&bytes)
                     .map_err(|e| StoreError::Corrupt(path.clone(), e.to_string()))?;
                 if from_hex(&state.secret_key).map(|k| k.len()) != Some(32) {
                     return Err(StoreError::Corrupt(path, "bad secret key".into()));
+                }
+                // State files written before setup ids existed.
+                if state.setup_id.is_empty() {
+                    state.setup_id = new_setup_id();
                 }
                 state
             }
@@ -87,6 +143,7 @@ impl Store {
                 State {
                     device_id: id.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":"),
                     setup_code: new_setup_code(),
+                    setup_id: new_setup_id(),
                     secret_key: to_hex(&random::<32>()),
                     config_number: 1,
                     pairings: BTreeMap::new(),
@@ -133,6 +190,21 @@ impl Store {
 
     pub fn setup_code(&self) -> String {
         self.state.lock().unwrap().setup_code.clone()
+    }
+
+    /// What a HomeKit setup QR code for this bridge must contain.
+    pub fn setup_uri(&self, category: u8) -> String {
+        let state = self.state.lock().unwrap();
+        setup_uri(&state.setup_code, &state.setup_id, category)
+    }
+
+    /// Advertised so a controller that scanned the QR code can find the
+    /// matching bridge without learning the setup code from the network.
+    pub fn setup_hash(&self) -> String {
+        use sha2::{Digest, Sha512};
+        let state = self.state.lock().unwrap();
+        let digest = Sha512::digest(format!("{}{}", state.setup_id, state.device_id));
+        base64(&digest[..4])
     }
 
     pub fn config_number(&self) -> u32 {
@@ -231,6 +303,27 @@ mod tests {
         std::fs::write(&path, b"{not json").unwrap();
         assert!(matches!(Store::open(&path), Err(StoreError::Corrupt(..))));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn setup_uri_matches_known_example() {
+        // Published example: code 841-31-633, category 8 (switch), IP accessory.
+        assert_eq!(setup_uri("841-31-633", "7OSX", 8), "X-HM://0081YCYEP7OSX");
+    }
+
+    #[test]
+    fn base64_pads_correctly() {
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+    }
+
+    #[test]
+    fn setup_id_is_four_base36_characters() {
+        let id = new_setup_id();
+        assert_eq!(id.len(), 4);
+        assert!(id.chars().all(|c| c.is_ascii_digit() || c.is_ascii_uppercase()));
     }
 
     #[test]
