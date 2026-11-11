@@ -1,0 +1,42 @@
+.eva/
+.cursor/rules/eva-loader.mdc
+.cursor/hooks.json
+.cursor/hooks/eva-session-start.sh
+.cursor/hooks/eva-reflect.sh
+.claude/CLAUDE.local.md
+.claude/settings.local.json
+.claude/hooks/eva-session-start.sh
+.claude/hooks/eva-reflect.sh
+.codex/agents.md
+.codex/config.toml
+.codex/hooks.json
+.codex/hooks/eva-session-start.sh
+.codex/hooks/eva-reflect.sh
+.kiro/steering/eva-loader.md
+.agents/rules/eva-loader.md
+.github/instructions/eva.instructions.md
+.github/hooks/eva.json
+.github/hooks/eva-session-start.sh
+.github/hooks/eva-reflect.sh
+.github/agents/eva-*.agent.md
+.opencode/instructions/eva-loader.md
+
+# Cortex internals
+.cortex/
+
+# Cortex local hook config
+.mcp.json
+
+# Cortex local hook config
+.claude/hooks/cortex-*.sh
+.claude/agents/cortex-capture.md
+.claude/worktrees/
+
+# Cortex local hook config
+.codex/hooks/cortex-*.sh
+
+# Cortex local hook config
+.opencode/plugins/cortex.js
+.opencode/hooks/cortex-session-start.sh
+.opencode/hooks/cortex-stop.sh
+.opencode/agents/cortex-capture.md
