@@ -15,6 +15,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 
 use crate::control::{self, Message, Reading, State};
+use crate::protect_bridge::ProtectBridge;
+use crate::config;
 use crate::logbuf::LogBuffer;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,7 +34,7 @@ struct Daemon {
     started: Instant,
     store: Arc<Store>,
     db: Arc<Database>,
-    bridge: Bridge,
+    bridge: Arc<Bridge>,
     logs: LogBuffer,
 }
 
@@ -65,15 +67,25 @@ pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
     if options.demo {
         add_demo_sensor(&store, &db)?;
     }
+    // Publish known Protect devices before HomeKit can connect, so that a
+    // restart never looks like the accessories were removed.
+    let protect = match config::load(&options.state_dir)?.protect {
+        Some(protect) => Some(ProtectBridge::prepare(&options.state_dir, protect, store.clone(), db.clone())?),
+        None => None,
+    };
 
     let config =
         Config { name: name.clone(), model: "Harbormaster".into(), listen: options.listen, advertise: true };
-    let bridge = Bridge::start(config, store.clone(), db.clone()).await?;
+    let bridge = Arc::new(Bridge::start(config, store.clone(), db.clone()).await?);
     tracing::info!("{name} listening on {}", bridge.local_addr);
     if store.is_paired() {
         tracing::info!("paired with {} controller(s)", store.pairings().len());
     } else {
         print_setup(&store);
+    }
+
+    if let Some(protect) = protect {
+        tokio::spawn(protect.run(bridge.clone()));
     }
 
     let daemon = Arc::new(Daemon { name, started: Instant::now(), store, db, bridge, logs });
@@ -290,6 +302,8 @@ fn accessories(db: &Value) -> Vec<control::Accessory> {
                         (kind::ACCESSORY_INFORMATION, kind::SERIAL_NUMBER) => out.serial_number = text(),
                         (kind::ACCESSORY_INFORMATION | kind::PROTOCOL_INFORMATION, _) => {}
                         _ if value.is_null() => {}
+                        // One "Online" row is enough however many services report it.
+                        (_, kind::STATUS_ACTIVE) if out.readings.iter().any(|r| r.label == "Online") => {}
                         _ => out.readings.push(reading(ty, value, c["unit"].as_str())),
                     }
                 }
@@ -303,6 +317,14 @@ fn reading(ty: &str, value: &Value, unit: Option<&str>) -> Reading {
     let label = match ty {
         kind::CURRENT_TEMPERATURE => "Temperature".to_owned(),
         kind::CURRENT_RELATIVE_HUMIDITY => "Humidity".to_owned(),
+        kind::MOTION_DETECTED => "Motion".to_owned(),
+        kind::CONTACT_SENSOR_STATE => "Contact".to_owned(),
+        kind::LEAK_DETECTED => "Leak".to_owned(),
+        kind::CURRENT_AMBIENT_LIGHT_LEVEL => "Light level".to_owned(),
+        kind::BATTERY_LEVEL => "Battery".to_owned(),
+        kind::STATUS_LOW_BATTERY => "Low battery".to_owned(),
+        kind::STATUS_ACTIVE => "Online".to_owned(),
+        kind::CHARGING_STATE => "Charging".to_owned(),
         other => format!("Characteristic {other}"),
     };
     let suffix = match unit {
@@ -311,12 +333,23 @@ fn reading(ty: &str, value: &Value, unit: Option<&str>) -> Reading {
         Some("lux") => " lux",
         _ => "",
     };
-    let value = match value {
+    let yes_no = |on: bool| if on { "yes" } else { "no" }.to_owned();
+    let value = match (ty, value) {
+        (kind::CONTACT_SENSOR_STATE, v) => if v == &json!(1) { "open" } else { "closed" }.to_owned(),
+        (kind::LEAK_DETECTED | kind::STATUS_LOW_BATTERY, v) => yes_no(v == &json!(1)),
+        (kind::CHARGING_STATE, _) => "not chargeable".to_owned(),
+        (_, Value::Bool(on)) => yes_no(*on),
+        (_, value) => plain(value, suffix),
+    };
+    Reading { label, value }
+}
+
+fn plain(value: &Value, suffix: &str) -> String {
+    match value {
         Value::Number(n) if n.is_f64() => format!("{:.1}{suffix}", n.as_f64().unwrap_or(0.0)),
         Value::String(s) => s.clone(),
         other => format!("{other}{suffix}"),
-    };
-    Reading { label, value }
+    }
 }
 
 #[cfg(test)]

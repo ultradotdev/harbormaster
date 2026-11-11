@@ -211,6 +211,16 @@ impl Store {
         self.state.lock().unwrap().config_number
     }
 
+    /// Call when accessories or services are added or removed, so that
+    /// controllers know to re-read the accessory database. The number wraps
+    /// within the range HomeKit allows.
+    pub fn bump_config_number(&self) -> Result<u32, StoreError> {
+        self.update(|s| {
+            s.config_number = if s.config_number >= 65535 { 1 } else { s.config_number + 1 };
+            s.config_number
+        })
+    }
+
     pub fn signing_key(&self) -> SigningKey {
         let bytes = from_hex(&self.state.lock().unwrap().secret_key).expect("validated on open");
         SigningKey::from_bytes(&bytes.try_into().expect("validated on open"))

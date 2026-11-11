@@ -94,6 +94,15 @@ impl Drop for Bridge {
 }
 
 impl Bridge {
+    /// Tells controllers the set of accessories or services has changed.
+    pub fn config_changed(&self) {
+        match self.shared.store.bump_config_number() {
+            Ok(number) => tracing::info!("accessory database changed (configuration {number})"),
+            Err(e) => tracing::error!("could not save configuration number: {e}"),
+        }
+        self.shared.publish();
+    }
+
     /// Currently open controller connections, oldest first.
     pub fn connections(&self) -> Vec<ConnectionInfo> {
         self.shared.connections.lock().unwrap().values().cloned().collect()

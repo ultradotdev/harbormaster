@@ -33,6 +33,23 @@ pub mod kind {
     pub const VERSION: &str = "37";
     pub const CURRENT_TEMPERATURE: &str = "11";
     pub const CURRENT_RELATIVE_HUMIDITY: &str = "10";
+
+    pub const MOTION_SENSOR: &str = "85";
+    pub const CONTACT_SENSOR: &str = "80";
+    pub const LIGHT_SENSOR: &str = "84";
+    pub const LEAK_SENSOR: &str = "83";
+    pub const BATTERY: &str = "96";
+    pub const DOORBELL: &str = "121";
+
+    pub const MOTION_DETECTED: &str = "22";
+    pub const CONTACT_SENSOR_STATE: &str = "6A";
+    pub const CURRENT_AMBIENT_LIGHT_LEVEL: &str = "6B";
+    pub const LEAK_DETECTED: &str = "70";
+    pub const BATTERY_LEVEL: &str = "68";
+    pub const CHARGING_STATE: &str = "8F";
+    pub const STATUS_LOW_BATTERY: &str = "79";
+    pub const STATUS_ACTIVE: &str = "75";
+    pub const PROGRAMMABLE_SWITCH_EVENT: &str = "73";
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,6 +266,31 @@ impl Accessory {
         ids
     }
 
+    /// Adds a service at a fixed instance id, with its characteristics
+    /// numbered consecutively after it.
+    ///
+    /// HomeKit remembers accessories by instance id, so optional services
+    /// should each get a reserved id. That way enabling or disabling one
+    /// never renumbers the others.
+    pub fn add_service_at(
+        &mut self,
+        iid: u64,
+        kind: &'static str,
+        primary: bool,
+        characteristics: Vec<Characteristic>,
+    ) -> Vec<u64> {
+        let end = iid + characteristics.len() as u64;
+        let in_use = |id: u64| {
+            self.services.iter().any(|s| s.iid == id || s.characteristics.iter().any(|c| c.iid == id))
+        };
+        assert!(!(iid..=end).any(in_use), "instance ids {iid}..={end} overlap an existing service");
+        let restore = self.next_iid;
+        self.next_iid = iid;
+        let ids = self.add_service(kind, primary, characteristics);
+        self.next_iid = restore.max(end + 1);
+        ids
+    }
+
     fn characteristic(&self, iid: u64) -> Option<&Characteristic> {
         self.services.iter().flat_map(|s| &s.characteristics).find(|c| c.iid == iid)
     }
@@ -359,6 +401,17 @@ impl Database {
         Ok(())
     }
 
+    /// Sends an event without storing a value, for stateless things such as
+    /// a doorbell press where every occurrence matters even if it repeats.
+    pub fn emit(&self, aid: u64, iid: u64, value: Value) {
+        let _ = self.changes.send(Change { aid, iid, value, origin: None });
+    }
+
+    /// Whether an accessory with this id has been added.
+    pub fn contains(&self, aid: u64) -> bool {
+        self.accessories.read().unwrap().iter().any(|a| a.aid == aid)
+    }
+
     /// Updates a value from an integration. Returns `false` if the
     /// characteristic does not exist. Unchanged values send no event.
     pub fn set(&self, aid: u64, iid: u64, value: Value) -> bool {
@@ -410,6 +463,38 @@ mod tests {
         assert_eq!(json["accessories"][0]["services"][1]["iid"], 8);
         assert_eq!(json["accessories"][0]["services"][0]["characteristics"][0]["perms"], json!(["pw"]));
         assert!(json["accessories"][0]["services"][0]["characteristics"][0].get("value").is_none());
+    }
+
+    #[test]
+    fn fixed_instance_ids_stay_put_and_overlaps_panic() {
+        let info = Info { name: "n", manufacturer: "m", model: "m", serial_number: "s", firmware_revision: "1" };
+        let mut accessory = Accessory::new(2, &info);
+        let motion = accessory.add_service_at(
+            100,
+            kind::MOTION_SENSOR,
+            true,
+            vec![Characteristic::sensor(kind::MOTION_DETECTED, Format::Bool, json!(false))],
+        );
+        assert_eq!(motion, vec![101]);
+        // Sequential allocation continues after the reserved block.
+        let next = accessory.add_service(kind::BATTERY, false, vec![Characteristic::sensor(kind::BATTERY_LEVEL, Format::Uint8, json!(50))]);
+        assert_eq!(next, vec![103]);
+        let overlap = std::panic::catch_unwind(move || {
+            accessory.add_service_at(101, kind::LEAK_SENSOR, false, vec![]);
+        });
+        assert!(overlap.is_err());
+    }
+
+    #[test]
+    fn emit_always_notifies_and_stores_nothing() {
+        let (db, iid) = sample();
+        let mut changes = db.subscribe_changes();
+        db.emit(2, iid, json!(0));
+        db.emit(2, iid, json!(0));
+        assert_eq!(changes.try_recv().unwrap().value, json!(0));
+        assert_eq!(changes.try_recv().unwrap().value, json!(0));
+        assert_eq!(db.read(2, iid), Ok(json!(20.0)));
+        assert!(db.contains(2) && !db.contains(3));
     }
 
     #[test]

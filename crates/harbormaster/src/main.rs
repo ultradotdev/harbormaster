@@ -8,6 +8,7 @@ mod control;
 mod daemon;
 mod keychain;
 mod logbuf;
+mod protect_bridge;
 mod protect_check;
 mod qr;
 mod secrets;

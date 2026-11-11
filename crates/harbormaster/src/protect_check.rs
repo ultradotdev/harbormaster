@@ -91,9 +91,10 @@ const CAPTURE_SECTIONS: [&str; 9] =
     ["nvr", "cameras", "lights", "sensors", "chimes", "viewers", "bridges", "doorlocks", "lastUpdateId"];
 
 /// Field names, lowercased, that mark a value as secret or personal.
-const SENSITIVE: [&str; 14] = [
+const SENSITIVE: [&str; 21] = [
     "password", "token", "secret", "credential", "apikey", "accesskey", "privatekey", "psk", "ssid",
-    "email", "rtspalias", "latitude", "longitude", "certificate",
+    "email", "rtspalias", "latitude", "longitude", "certificate", "publicip", "wanip", "firstname",
+    "lastname", "username", "cloudaccount", "lastloginip",
 ];
 
 /// Removes secrets and personal details from captured console data.
@@ -148,6 +149,10 @@ pub async fn capture(state_dir: &Path, seconds: u64) -> Result<()> {
             }
             Ok(Err(e)) => return Err(e.into()),
         };
+        // Account changes and sign-in records are about people, not devices.
+        if update.model_key == "user" || update.data["type"] == "access" {
+            continue;
+        }
         let mut data = update.data;
         redact(&mut data);
         let line = serde_json::json!({
