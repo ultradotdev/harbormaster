@@ -70,11 +70,11 @@ pub struct DataStreams {
 impl DataStreams {
     /// Starts listening on a free port. Must be called from within the
     /// async runtime.
-    pub async fn start(source: Arc<dyn RecordingSource>) -> std::io::Result<Arc<Self>> {
-        let listener = match TcpListener::bind("[::]:0").await {
-            Ok(listener) => listener,
-            Err(_) => TcpListener::bind("0.0.0.0:0").await?,
-        };
+    pub fn start(source: Arc<dyn RecordingSource>) -> std::io::Result<Arc<Self>> {
+        let listener =
+            std::net::TcpListener::bind("[::]:0").or_else(|_| std::net::TcpListener::bind("0.0.0.0:0"))?;
+        listener.set_nonblocking(true)?;
+        let listener = TcpListener::from_std(listener)?;
         let port = listener.local_addr()?.port();
         let streams =
             Arc::new(Self { port, prepared: Mutex::new(Vec::new()), connections: Mutex::new(0), source });
@@ -467,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn sends_a_recording_in_numbered_chunks() {
-        let streams = DataStreams::start(Arc::new(Canned { allow: true })).await.unwrap();
+        let streams = DataStreams::start(Arc::new(Canned { allow: true })).unwrap();
         let mut client = Client::connect(&streams, &[4; 32]).await;
         client.hello().await;
         assert_eq!(client.open_recording().await.body.get("status").and_then(Value::as_i64), Some(0));
@@ -508,7 +508,7 @@ mod tests {
 
     #[tokio::test]
     async fn refusals_reach_the_hub_and_strangers_are_dropped() {
-        let streams = DataStreams::start(Arc::new(Canned { allow: false })).await.unwrap();
+        let streams = DataStreams::start(Arc::new(Canned { allow: false })).unwrap();
         let mut client = Client::connect(&streams, &[4; 32]).await;
         client.hello().await;
         let reply = client.open_recording().await;
@@ -527,7 +527,7 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_requests_are_limited() {
-        let streams = DataStreams::start(Arc::new(Canned { allow: true })).await.unwrap();
+        let streams = DataStreams::start(Arc::new(Canned { allow: true })).unwrap();
         for _ in 0..MAX_PREPARED {
             assert!(streams.prepare(5, &[1; 32], &[2; 32]).is_some());
         }

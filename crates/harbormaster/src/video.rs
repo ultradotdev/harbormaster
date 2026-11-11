@@ -510,7 +510,7 @@ fn ffmpeg_args(
 /// Counts repeated ffmpeg messages so a burst of identical complaints takes
 /// one log line and a total rather than one line per video frame.
 #[derive(Default)]
-struct Repeats {
+pub(crate) struct Repeats {
     /// Message with addresses removed, first full line, and times seen.
     seen: Vec<(String, String, u32)>,
 }
@@ -521,7 +521,7 @@ impl Repeats {
     const LIMIT: usize = 32;
 
     /// Records a line and says whether it should be logged now.
-    fn first(&mut self, line: &str) -> bool {
+    pub(crate) fn first(&mut self, line: &str) -> bool {
         let key = without_addresses(line);
         if let Some(entry) = self.seen.iter_mut().find(|(k, _, _)| *k == key) {
             entry.2 = entry.2.saturating_add(1);
@@ -534,7 +534,7 @@ impl Repeats {
     }
 
     /// Messages seen more than once, with how many times beyond the first.
-    fn repeated(&self) -> impl Iterator<Item = (&str, u32)> {
+    pub(crate) fn repeated(&self) -> impl Iterator<Item = (&str, u32)> {
         self.seen.iter().filter(|(_, _, n)| *n > 1).map(|(_, line, n)| (line.as_str(), n - 1))
     }
 }
@@ -552,7 +552,7 @@ fn without_addresses(line: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use harbormaster_hap::camera::Srtp;
     use harbormaster_hap::model::WriteContext;
@@ -661,7 +661,7 @@ mod tests {
 
     /// A stand-in camera: a second ffmpeg that produces a test picture and
     /// tone as fragmented MP4 in real time, the shape of a real feed.
-    struct TestPattern(PathBuf);
+    pub(crate) struct TestPattern(pub(crate) PathBuf);
 
     impl VideoSource for TestPattern {
         fn available(&self) -> bool {

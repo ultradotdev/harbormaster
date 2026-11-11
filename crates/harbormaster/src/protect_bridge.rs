@@ -18,7 +18,9 @@ use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::recording::{self, Recorder, RecordingIds};
 use crate::video::{self, StreamIds, VideoSource};
+use harbormaster_hap::recording::{TRIGGER_DOORBELL, TRIGGER_MOTION};
 use crate::{config, secrets};
 
 /// Remembers the devices last seen, so the same accessories can be published
@@ -39,6 +41,8 @@ mod iid {
     pub const BATTERY: u64 = 170;
     /// HomeKit expects a camera to handle two viewers at once.
     pub const STREAMS: [u64; 2] = [200, 210];
+    /// Three services, ten ids apart: camera switches, recording, data stream.
+    pub const RECORDING: u64 = 300;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -333,6 +337,7 @@ struct Handles {
     battery_level: Option<u64>,
     low_battery: Option<u64>,
     streams: Vec<StreamIds>,
+    recording: Option<RecordingIds>,
 }
 
 fn status_active() -> Characteristic {
@@ -406,6 +411,10 @@ fn build_accessory(aid: u64, def: &DeviceDef, with_video: bool) -> (Accessory, H
     if let (true, Some((width, height))) = (with_video, def.video) {
         let offered = video::resolutions(width, height);
         handles.streams = iid::STREAMS.iter().map(|iid| video::add_stream_service(&mut accessory, *iid, &offered)).collect();
+        let triggers = TRIGGER_MOTION | if f.doorbell { TRIGGER_DOORBELL } else { 0 };
+        let motion_service = handles.motion.is_some().then_some(iid::MOTION);
+        handles.recording =
+            Some(recording::add_services(&mut accessory, iid::RECORDING, &offered, triggers, motion_service));
     }
     if f.battery {
         let ids = accessory.add_service_at(
@@ -434,6 +443,8 @@ pub struct Devices {
     /// Set when live video can be served: the shared console state and the
     /// ffmpeg to run.
     video: Option<(Arc<Live>, PathBuf)>,
+    /// Set when recordings can be made for HomeKit.
+    recorder: Option<Arc<Recorder>>,
 }
 
 impl Devices {
@@ -455,6 +466,10 @@ impl Devices {
                 for ids in &handles.streams {
                     let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone() });
                     video::install(db, aid, *ids, &def.name, source, ffmpeg);
+                }
+                if let (Some(ids), Some(recorder)) = (handles.recording, &self.recorder) {
+                    let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone() });
+                    recorder.install(db, aid, ids, &def.name, &def.id, source);
                 }
                 if def.kind == Kind::Camera {
                     live.inner.write().unwrap().cameras.insert(aid, def.id.clone());
@@ -612,7 +627,9 @@ impl ProtectBridge {
         if ffmpeg.is_none() {
             tracing::warn!("ffmpeg is not installed, so cameras will have no video");
         }
-        let mut devices = Devices { video: ffmpeg.map(|path| (live.clone(), path)), ..Devices::default() };
+        let recorder = ffmpeg.as_deref().map(|path| Recorder::new(state_dir, path));
+        let mut devices =
+            Devices { video: ffmpeg.map(|path| (live.clone(), path)), recorder, ..Devices::default() };
         let mut cached = load_cache(state_dir);
         cached.retain(|def| selected(def, config.devices.as_deref()));
         devices.add(&cached, &store, &db)?;
