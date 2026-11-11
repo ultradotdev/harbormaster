@@ -28,9 +28,12 @@ use crate::fmp4::{self, Piece, Splitter};
 use crate::video::{Repeats, VideoSource};
 
 const STATE_FILE: &str = "recording.json";
-/// How much video is kept. A recording must start on a keyframe that is at
-/// least the pre-roll old, and keyframes can be five seconds apart.
-const KEEP: Duration = Duration::from_secs(12);
+/// How much video is kept. A recording must start on a keyframe from
+/// before the event; a hub can take several seconds to ask after the event
+/// began, and keyframes can be five seconds apart.
+const KEEP: Duration = Duration::from_secs(20);
+/// An event older than this is not what a new request is about.
+const EVENT_WINDOW: Duration = Duration::from_secs(15);
 /// Stops a camera's buffer from growing without limit if its timing is off.
 const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 /// No single recording runs longer than this, whatever the hub does.
@@ -191,6 +194,8 @@ struct Camera {
     key: String,
     source: Arc<dyn VideoSource>,
     buffer: Mutex<Buffer>,
+    /// When the camera last began to see motion or was rung.
+    event_at: Mutex<Option<Instant>>,
     /// The task filling the buffer, while recording is switched on.
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -278,6 +283,14 @@ impl Recorder {
         }
     }
 
+    /// Notes that a camera has just begun to see motion or been rung, so
+    /// that a recording asked for moments later can reach back to before it.
+    pub fn event_started(&self, aid: u64) {
+        if let Some(camera) = self.cameras.lock().unwrap().get(&aid) {
+            *camera.event_at.lock().unwrap() = Some(Instant::now());
+        }
+    }
+
     /// Connects a camera's recording services to its video. `key` names the
     /// camera in the settings file. Must be called from within the async
     /// runtime, after the accessory is in the database.
@@ -295,6 +308,7 @@ impl Recorder {
             key: key.to_owned(),
             source,
             buffer: Mutex::new(Buffer::new()),
+            event_at: Mutex::new(None),
             task: Mutex::new(None),
         });
         if let Some(previous) = self.cameras.lock().unwrap().insert(aid, camera.clone()) {
@@ -395,8 +409,12 @@ impl RecordingSource for Recorder {
             tracing::info!("{}: a hub asked for a recording, but recording is switched off", camera.name);
             return Err(Refusal::NotAllowed);
         };
-        let preroll = Duration::from_millis(format.prebuffer_ms as u64);
-        let Some((init, backlog, live)) = camera.buffer.lock().unwrap().start(preroll, Instant::now()) else {
+        // The hub asks some time after the event began, so reach back to
+        // before the event itself, not just before the request.
+        let now = Instant::now();
+        let since_event = camera.event_at.lock().unwrap().map(|at| now.duration_since(at));
+        let preroll = preroll(Duration::from_millis(format.prebuffer_ms as u64), since_event);
+        let Some((init, backlog, live)) = camera.buffer.lock().unwrap().start(preroll, now) else {
             tracing::warn!("{}: a hub asked for a recording, but no video has been buffered yet", camera.name);
             return Err(Refusal::Busy);
         };
@@ -413,19 +431,31 @@ impl RecordingSource for Recorder {
                 Refusal::Unexpected
             })?;
         tracing::info!(
-            "{}: recording for HomeKit at {}x{}, {} kbps, {}, starting with {} buffered pieces",
+            "{}: recording for HomeKit at {}x{}, {} kbps, {}, reaching back {:.0} s ({} buffered pieces){}",
             camera.name,
             format.width,
             format.height,
             format.bitrate_kbps,
             if settings.audio { "with sound" } else { "no sound" },
-            backlog.len()
+            preroll.as_secs_f64(),
+            backlog.len(),
+            match since_event.filter(|age| *age <= EVENT_WINDOW) {
+                Some(age) => format!("; the hub asked {:.1} s after the event began", age.as_secs_f64()),
+                None => String::new(),
+            }
         );
         let (sender, receiver) = mpsc::channel(4);
         let name = camera.name.clone();
         tokio::spawn(run(child.stdin.take(), child.stdout.take(), child.stderr.take(), child, init, backlog, live, sender, name));
         Ok(receiver)
     }
+}
+
+/// How far back a recording should begin: the pre-roll the hub wants,
+/// measured from when the event began if that was recent, not from when the
+/// hub got round to asking.
+fn preroll(wanted: Duration, since_event: Option<Duration>) -> Duration {
+    wanted + since_event.filter(|age| *age <= EVENT_WINDOW).unwrap_or_default()
 }
 
 /// Feeds one ffmpeg and forwards what it produces until the hub stops
@@ -612,6 +642,15 @@ mod tests {
     }
 
     #[test]
+    fn preroll_reaches_back_to_before_a_recent_event() {
+        let four = Duration::from_secs(4);
+        assert_eq!(preroll(four, None), four);
+        assert_eq!(preroll(four, Some(Duration::from_secs(6))), Duration::from_secs(10));
+        // An old event has nothing to do with this request.
+        assert_eq!(preroll(four, Some(Duration::from_secs(120))), four);
+    }
+
+    #[test]
     fn buffering_needs_recording_on_the_camera_on_and_a_chosen_format() {
         assert!(settings(true, true).wanted().is_some());
         assert!(settings(false, true).wanted().is_none());
@@ -671,11 +710,11 @@ mod tests {
         assert_eq!(backlog(60, 11), 12);
 
         // Old video is dropped, and the byte count follows.
-        buffer.push(segment(false), at(30));
+        buffer.push(segment(false), at(60));
         assert_eq!(buffer.segments.len(), 1);
         assert_eq!(buffer.bytes, buffer.segments[0].data.len());
         // No keyframe buffered: start with only what comes next.
-        assert_eq!(buffer.start(Duration::from_secs(4), at(30)).unwrap().1.len(), 0);
+        assert_eq!(buffer.start(Duration::from_secs(4), at(60)).unwrap().1.len(), 0);
     }
 
     /// Buffers a real test feed, then asks for a recording the way a hub

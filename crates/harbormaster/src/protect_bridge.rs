@@ -521,10 +521,16 @@ impl Devices {
             let detected = h.plain_motion.load(Ordering::Relaxed) || h.smart_motion.load(Ordering::Relaxed);
             if db.set(h.aid, iid, json!(detected)) && live {
                 tracing::info!("{}: motion {}", h.name, if detected { "detected" } else { "ended" });
+                if let (true, Some(recorder)) = (detected, &self.recorder) {
+                    recorder.event_started(h.aid);
+                }
             }
         }
         if let (true, Some(iid), true) = (live, h.ring, data["lastRing"].is_number()) {
             tracing::info!("doorbell ring: {}", h.name);
+            if let Some(recorder) = &self.recorder {
+                recorder.event_started(h.aid);
+            }
             // 0 is a single press, the only kind a doorbell has.
             db.emit(h.aid, iid, json!(0));
         }
