@@ -149,6 +149,11 @@ async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let dual = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, addr.port()));
     match TcpListener::bind(dual).await {
         Ok(listener) => Ok(listener),
+        // A busy port is busy for IPv4 too; falling back would only obscure it.
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(std::io::Error::new(
+            e.kind(),
+            format!("port {} is already in use; is another Harbormaster running?", addr.port()),
+        )),
         Err(e) => {
             tracing::warn!("IPv6 listener unavailable ({e}); serving IPv4 only");
             TcpListener::bind(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, addr.port()))).await
