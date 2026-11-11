@@ -760,10 +760,20 @@ pub(crate) mod tests {
             let (sender, receiver) = mpsc::channel(32);
             tokio::spawn(async move {
                 let _child = child;
+                // Hand over the header and then whole fragments, as the
+                // real feed does, whatever sizes the pipe delivers.
+                let mut splitter = crate::fmp4::Splitter::default();
                 let mut chunk = vec![0u8; 16 * 1024];
                 while let Ok(n) = stdout.read(&mut chunk).await {
-                    if n == 0 || sender.send(Bytes::copy_from_slice(&chunk[..n])).await.is_err() {
+                    let mut pieces = Vec::new();
+                    if n == 0 || splitter.feed(&chunk[..n], &mut pieces).is_err() {
                         break;
+                    }
+                    for piece in pieces {
+                        let (crate::fmp4::Piece::Header(data) | crate::fmp4::Piece::Fragment(data)) = piece;
+                        if sender.send(Bytes::from(data)).await.is_err() {
+                            return;
+                        }
                     }
                 }
             });
