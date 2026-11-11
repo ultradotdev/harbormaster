@@ -96,8 +96,11 @@ impl Drop for Bridge {
 impl Bridge {
     /// Tells controllers the set of accessories or services has changed.
     pub fn config_changed(&self) {
-        match self.shared.store.bump_config_number() {
-            Ok(number) => tracing::info!("accessory database changed (configuration {number})"),
+        match self.shared.store.sync_layout(&self.shared.db.layout()) {
+            Ok(true) => {
+                tracing::info!("accessory database changed (configuration {})", self.shared.store.config_number())
+            }
+            Ok(false) => {}
             Err(e) => tracing::error!("could not save configuration number: {e}"),
         }
         self.shared.publish();
@@ -109,6 +112,12 @@ impl Bridge {
     }
 
     pub async fn start(config: Config, store: Arc<Store>, db: Arc<Database>) -> Result<Self, Error> {
+        // Accessories may have been added or removed since the last run.
+        match store.sync_layout(&db.layout()) {
+            Ok(true) => tracing::info!("accessory database differs from the last run (configuration {})", store.config_number()),
+            Ok(false) => {}
+            Err(e) => tracing::error!("could not save configuration number: {e}"),
+        }
         let listener = bind(config.listen).await?;
         let local_addr = listener.local_addr()?;
         let advertiser = if config.advertise {

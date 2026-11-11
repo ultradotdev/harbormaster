@@ -14,6 +14,7 @@ pub const EXAMPLE: &str = "\
 host = \"192.0.2.10\"        # address of the console running UniFi Protect
 username = \"harbormaster\"  # a local-only account created for Harbormaster
 # fingerprint = \"...\"      # added after the first protect-check
+# devices = [\"Front Door\"] # publish only these (by name); omit for all
 ";
 
 #[derive(Debug, Default, Deserialize)]
@@ -32,6 +33,9 @@ pub struct Protect {
     /// SHA-256 fingerprint of the console's certificate. Connections are
     /// refused unless the console presents exactly this certificate.
     pub fingerprint: Option<String>,
+    /// If set, only these devices are published to HomeKit. Entries match a
+    /// device's name (ignoring case), its Protect id or its MAC address.
+    pub devices: Option<Vec<String>>,
 }
 
 fn https_port() -> u16 {
@@ -65,7 +69,9 @@ mod tests {
         let config = parse(EXAMPLE).unwrap();
         let protect = config.protect.unwrap();
         assert_eq!((protect.host.as_str(), protect.port, protect.username.as_str()), ("192.0.2.10", 443, "harbormaster"));
-        assert!(protect.fingerprint.is_none());
+        assert!(protect.fingerprint.is_none() && protect.devices.is_none());
+        let filtered = parse("[protect]\nhost = \"h\"\nusername = \"u\"\ndevices = [\"Front Door\"]\n").unwrap();
+        assert_eq!(filtered.protect.unwrap().devices.unwrap(), ["Front Door"]);
         assert!(parse("").unwrap().protect.is_none());
     }
 

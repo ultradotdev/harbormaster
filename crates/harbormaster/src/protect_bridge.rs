@@ -144,6 +144,16 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
     out
 }
 
+/// Whether the `devices` filter in the config selects this device.
+fn selected(def: &DeviceDef, filter: Option<&[String]>) -> bool {
+    filter.is_none_or(|entries| entries.iter().any(|entry| matches_entry(def, entry)))
+}
+
+fn matches_entry(def: &DeviceDef, entry: &str) -> bool {
+    let entry = entry.trim();
+    def.name.eq_ignore_ascii_case(entry) || def.id == entry || def.mac.eq_ignore_ascii_case(&entry.replace(':', ""))
+}
+
 /// Instance ids of the characteristics a device's updates feed.
 #[derive(Debug, Default)]
 struct Handles {
@@ -412,7 +422,8 @@ impl ProtectBridge {
             .parse()
             .context("fingerprint in config.toml")?;
         let mut devices = Devices::default();
-        let cached = load_cache(state_dir);
+        let mut cached = load_cache(state_dir);
+        cached.retain(|def| selected(def, config.devices.as_deref()));
         devices.add(&cached, &store, &db)?;
         if !cached.is_empty() {
             tracing::info!("publishing {} UniFi Protect devices from the last run", cached.len());
@@ -447,7 +458,14 @@ impl ProtectBridge {
         drop(password);
 
         let bootstrap = client.bootstrap_raw().await?;
-        let defs = definitions(&bootstrap);
+        let all = definitions(&bootstrap);
+        let filter = self.config.devices.as_deref();
+        for entry in filter.into_iter().flatten() {
+            if !all.iter().any(|def| matches_entry(def, entry)) {
+                tracing::warn!("no UniFi Protect device matches \"{entry}\" in the devices filter");
+            }
+        }
+        let defs: Vec<DeviceDef> = all.into_iter().filter(|def| selected(def, filter)).collect();
         let added = self.devices.add(&defs, &self.store, &self.db)?;
         if added > 0 {
             save_cache(&self.state_dir, &self.devices.defs);
@@ -558,6 +576,20 @@ mod tests {
             defs[3].features,
             Features { temperature: true, humidity: true, light_level: true, battery: true, ..Features::default() }
         );
+    }
+
+    #[test]
+    fn filter_selects_by_name_id_or_mac() {
+        let defs = definitions(&bootstrap());
+        let pick = |entries: &[&str]| -> Vec<String> {
+            let filter: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
+            defs.iter().filter(|d| selected(d, Some(&filter))).map(|d| d.name.clone()).collect()
+        };
+        assert_eq!(pick(&["front door"]), ["Front Door"]);
+        assert_eq!(pick(&["cam2", "bb:01"]), ["Garage", "Front Door Sensor"]);
+        assert!(pick(&["Front"]).is_empty(), "partial names do not match");
+        assert!(pick(&[]).is_empty(), "an empty list publishes nothing");
+        assert_eq!(defs.iter().filter(|d| selected(d, None)).count(), 5, "no filter publishes everything");
     }
 
     #[test]

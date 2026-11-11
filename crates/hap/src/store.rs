@@ -45,6 +45,9 @@ struct State {
     /// Stable accessory ids keyed by an integration-chosen device key.
     #[serde(default)]
     accessory_ids: BTreeMap<String, u64>,
+    /// Digest of the accessory database's shape when last published.
+    #[serde(default)]
+    layout: String,
 }
 
 pub struct Store {
@@ -148,6 +151,7 @@ impl Store {
                     config_number: 1,
                     pairings: BTreeMap::new(),
                     accessory_ids: BTreeMap::new(),
+                    layout: String::new(),
                 }
             }
             Err(e) => return Err(StoreError::Io(path, e)),
@@ -211,14 +215,24 @@ impl Store {
         self.state.lock().unwrap().config_number
     }
 
-    /// Call when accessories or services are added or removed, so that
-    /// controllers know to re-read the accessory database. The number wraps
-    /// within the range HomeKit allows.
-    pub fn bump_config_number(&self) -> Result<u32, StoreError> {
+    /// Records the accessory database's current shape, bumping the
+    /// configuration number if it differs from what was last published.
+    /// Returns whether it changed.
+    pub fn sync_layout(&self, layout: &str) -> Result<bool, StoreError> {
+        {
+            let state = self.state.lock().unwrap();
+            if state.layout == layout {
+                return Ok(false);
+            }
+        }
         self.update(|s| {
-            s.config_number = if s.config_number >= 65535 { 1 } else { s.config_number + 1 };
-            s.config_number
-        })
+            // The very first layout is not a change controllers need to hear about.
+            if !s.layout.is_empty() {
+                s.config_number = if s.config_number >= 65535 { 1 } else { s.config_number + 1 };
+            }
+            s.layout = layout.to_owned();
+        })?;
+        Ok(true)
     }
 
     pub fn signing_key(&self) -> SigningKey {
@@ -292,6 +306,22 @@ mod tests {
         assert_eq!(store.signing_key().to_bytes(), key);
         assert_eq!(store.accessory_id("tempest:1").unwrap(), 2);
         assert!(store.is_paired());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn layout_change_bumps_configuration_once() {
+        let path = temp_path("layout");
+        let store = Store::open(&path).unwrap();
+        assert!(store.sync_layout("one").unwrap());
+        assert_eq!(store.config_number(), 1, "the first layout is not a change");
+        assert!(!store.sync_layout("one").unwrap());
+        assert!(store.sync_layout("two").unwrap());
+        assert_eq!(store.config_number(), 2);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert!(!store.sync_layout("two").unwrap());
+        assert_eq!(store.config_number(), 2);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

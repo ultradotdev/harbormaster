@@ -364,6 +364,23 @@ impl Database {
         json!({ "accessories": accessories })
     }
 
+    /// A digest of the database's shape: which accessories, services and
+    /// characteristics exist, ignoring their values. If this differs from
+    /// the last run, controllers must be told to re-read the database.
+    pub fn layout(&self) -> String {
+        let mut shape = String::new();
+        for a in self.accessories.read().unwrap().iter() {
+            shape.push_str(&format!("a{}", a.aid));
+            for s in &a.services {
+                shape.push_str(&format!("s{}:{}", s.iid, s.kind));
+                for c in &s.characteristics {
+                    shape.push_str(&format!("c{}:{}", c.iid, c.kind));
+                }
+            }
+        }
+        crate::crypto::to_hex(&<sha2::Sha256 as sha2::Digest>::digest(shape.as_bytes()))
+    }
+
     /// Runs `f` on a characteristic, or returns `None` if it does not exist.
     pub fn with<T>(&self, aid: u64, iid: u64, f: impl FnOnce(&Characteristic) -> T) -> Option<T> {
         let accessories = self.accessories.read().unwrap();
@@ -495,6 +512,17 @@ mod tests {
         assert_eq!(changes.try_recv().unwrap().value, json!(0));
         assert_eq!(db.read(2, iid), Ok(json!(20.0)));
         assert!(db.contains(2) && !db.contains(3));
+    }
+
+    #[test]
+    fn layout_ignores_values_but_sees_structure() {
+        let (db, iid) = sample();
+        let before = db.layout();
+        db.set(2, iid, json!(30.0));
+        assert_eq!(db.layout(), before);
+        let info = Info { name: "n", manufacturer: "m", model: "m", serial_number: "s", firmware_revision: "1" };
+        db.add(Accessory::new(3, &info));
+        assert_ne!(db.layout(), before);
     }
 
     #[test]
