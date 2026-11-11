@@ -399,6 +399,12 @@ impl Connection {
                     Ok(change) => {
                         let wanted = self.subscriptions.contains(&(change.aid, change.iid));
                         if wanted && change.origin != Some(self.id) {
+                            // Motion is what makes a hub ask for a recording, so
+                            // who was told about it is worth a line of its own.
+                            let motion = self.shared.db.with(change.aid, change.iid, |c| c.kind) == Some("22");
+                            if motion && change.value == json!(true) {
+                                tracing::info!("told {} about motion on accessory {}", self.peer.ip().to_canonical(), change.aid);
+                            }
                             tracing::debug!(
                                 "telling {} that accessory {} characteristic {} changed",
                                 self.peer.ip(),
