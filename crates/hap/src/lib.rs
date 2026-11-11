@@ -6,7 +6,9 @@
 
 pub mod camera;
 mod crypto;
+pub mod datastream;
 mod mdns;
+pub mod opack;
 pub mod model;
 mod pairing;
 mod server;
