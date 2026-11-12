@@ -314,6 +314,15 @@ impl Recorder {
             }
     }
 
+    /// Forgets a camera that is no longer published and stops buffering it.
+    pub fn remove(&self, aid: u64) {
+        if let Some(camera) = self.cameras.lock().unwrap().remove(&aid) {
+            if let Some(task) = camera.task.lock().unwrap().take() {
+                task.abort();
+            }
+        }
+    }
+
     /// Notes that a camera has just begun to see motion or been rung, so
     /// that a recording asked for moments later can reach back to before it.
     pub fn event_started(&self, aid: u64) {

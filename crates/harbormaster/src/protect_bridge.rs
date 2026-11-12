@@ -670,6 +670,24 @@ impl Devices {
         Ok(changed)
     }
 
+    /// Withdraws every published device the test selects, for one deleted
+    /// in Protect or no longer chosen in the config. Returns their names.
+    fn remove_where(&mut self, db: &Database, gone: impl Fn(&DeviceDef) -> bool) -> Vec<String> {
+        let (leaving, staying): (Vec<DeviceDef>, Vec<DeviceDef>) = std::mem::take(&mut self.defs).into_iter().partition(gone);
+        self.defs = staying;
+        for def in &leaving {
+            let Some(handles) = self.handles.remove(&(def.kind.model_key(), def.handle_id())) else { continue };
+            db.remove(handles.aid);
+            if let Some(recorder) = &self.recorder {
+                recorder.remove(handles.aid);
+            }
+            if let Some(live) = &self.live {
+                live.inner.write().unwrap().cameras.remove(&handles.aid);
+            }
+        }
+        leaving.into_iter().map(|def| def.name).collect()
+    }
+
     /// Applies changed fields of one device. `live` is false when replaying
     /// a snapshot, where a past ring must not sound the doorbell again.
     fn apply(&self, db: &Database, model_key: &str, id: &str, data: &Value, live: bool) {
@@ -905,10 +923,28 @@ impl ProtectBridge {
             }
         }
         let defs: Vec<DeviceDef> = all.into_iter().filter(|def| selected(def, filter)).collect();
+        // A device the console no longer lists at all was deleted there. One
+        // that is merely being re-adopted is still listed, and is kept so
+        // HomeKit does not forget its room and automations.
+        let listed: std::collections::HashSet<(&str, &str)> = [Kind::Camera, Kind::Sensor, Kind::Light]
+            .into_iter()
+            .flat_map(|kind| {
+                let ids = bootstrap[kind.section()].as_array().into_iter().flatten();
+                ids.filter_map(move |device| Some((kind.model_key(), device["id"].as_str()?)))
+            })
+            .collect();
+        let removed = self
+            .devices
+            .remove_where(&self.db, |def| !listed.contains(&(def.kind.model_key(), def.id.as_str())) || !selected(def, filter));
+        for name in &removed {
+            tracing::info!("{name} is no longer in UniFi Protect or the devices filter; removing it from HomeKit");
+        }
         let added = self.devices.add(&defs, &self.store, &self.db)?;
         if added > 0 {
-            save_cache(&self.state_dir, &self.devices.defs);
             tracing::info!("added or updated {added} UniFi Protect devices");
+        }
+        if added > 0 || !removed.is_empty() {
+            save_cache(&self.state_dir, &self.devices.defs);
             bridge.config_changed();
         }
         self.devices.apply_snapshot(&self.db, &bootstrap);
@@ -926,6 +962,19 @@ impl ProtectBridge {
         loop {
             match tokio::time::timeout(UPDATE_SILENCE, updates.next()).await {
                 Ok(update) => match update? {
+                    // A device deleted in Protect while connected.
+                    Some(update) if update.action == "remove" => {
+                        let removed = self
+                            .devices
+                            .remove_where(&self.db, |def| def.kind.model_key() == update.model_key && def.id == update.id);
+                        if !removed.is_empty() {
+                            for name in &removed {
+                                tracing::info!("{name} was deleted in UniFi Protect; removing it from HomeKit");
+                            }
+                            save_cache(&self.state_dir, &self.devices.defs);
+                            bridge.config_changed();
+                        }
+                    }
                     Some(update) => self.devices.apply_update(&self.db, &update),
                     None => return Ok(()),
                 },
@@ -1241,6 +1290,34 @@ mod tests {
         }
         assert_eq!(db.write(light, iid::LIGHTBULB + 2, &json!(250), &context), Err(harbormaster_hap::model::status::INVALID_VALUE));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_devices_are_withdrawn_with_every_accessory_they_had() {
+        let store_dir = std::env::temp_dir().join(format!("hm-protect-{}-remove", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let store = Arc::new(Store::open(store_dir.join("state.json")).unwrap());
+        let db = Database::new();
+        let mut devices = Devices::default();
+        let mut all = definitions(&bootstrap());
+        all.extend(definitions(&doorbell_with_channels()).into_iter().filter(|d| d.lens != 0));
+        devices.add(&all, &store, &db).unwrap();
+        let before = devices.len();
+        let door = devices.handles[&("camera", "cam1".to_owned())].aid;
+        let package = devices.handles[&("camera", "cam1#lens2".to_owned())].aid;
+        let sensor = devices.handles[&("sensor", "sen1".to_owned())].aid;
+
+        // Deleting the doorbell takes its package camera with it.
+        let removed = devices.remove_where(&db, |def| def.kind == Kind::Camera && def.id == "cam1");
+        assert_eq!(removed.len(), 2, "{removed:?}");
+        assert_eq!(devices.len(), before - 2);
+        assert!(!db.contains(door) && !db.contains(package) && db.contains(sensor));
+        assert!(devices.remove_where(&db, |def| def.id == "cam1").is_empty(), "already gone");
+
+        // Adopted again later, it comes back under the same accessory id.
+        devices.add(&all, &store, &db).unwrap();
+        assert_eq!(devices.handles[&("camera", "cam1".to_owned())].aid, door);
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     #[test]

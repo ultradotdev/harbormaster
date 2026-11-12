@@ -388,6 +388,16 @@ impl Database {
         }
     }
 
+    /// Takes an accessory out of the database, with its write handlers.
+    /// Returns whether it was there.
+    pub fn remove(&self, aid: u64) -> bool {
+        self.handlers.write().unwrap().retain(|(owner, _), _| *owner != aid);
+        let mut accessories = self.accessories.write().unwrap();
+        let before = accessories.len();
+        accessories.retain(|a| a.aid != aid);
+        accessories.len() != before
+    }
+
     /// Registers the handler for writes to one characteristic.
     pub fn on_write(&self, aid: u64, iid: u64, handler: WriteHandler) {
         self.handlers.write().unwrap().insert((aid, iid), handler);
@@ -685,6 +695,7 @@ mod tests {
         assert_eq!(db.read(2, iid), Ok(json!(20.0)));
         assert_eq!(db.read(2, 2), Err(status::WRITE_ONLY));
         assert_eq!(db.read(9, 1), Err(status::NOT_FOUND));
+        assert!(!db.remove(9), "nothing to remove");
         let ctx = context();
         assert_eq!(db.write(2, iid, &json!(5.0), &ctx), Err(status::READ_ONLY));
         assert_eq!(db.write(2, 2, &json!(1), &ctx), Ok(json!(true)));
