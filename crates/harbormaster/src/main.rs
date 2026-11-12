@@ -3,6 +3,7 @@
 //! `harbormaster daemon` runs the bridge. `harbormaster` (or `harbormaster
 //! tui`) attaches a terminal interface to a running daemon.
 
+mod client;
 mod clock;
 mod config;
 mod control;
@@ -19,7 +20,9 @@ mod qr;
 mod recording;
 mod secrets;
 mod status;
+mod tty;
 mod tui;
+mod unlock;
 mod video;
 
 use std::net::SocketAddr;
@@ -35,6 +38,8 @@ Usage: harbormaster [COMMAND] [OPTIONS]
 Commands:
   tui      attach the terminal interface to a running daemon (default)
   daemon   run the HomeKit bridge
+  unlock   give the running daemon the UniFi Protect password. It is read
+           from the Keychain (unlocking it if need be) or asked for here
   protect-check
            test the UniFi Protect connection and list its cameras
   protect-capture
@@ -49,6 +54,7 @@ Options:
   --demo            daemon: publish simulated devices, to try the dashboard
                     without a UniFi Protect console
   --verbose         daemon: also log each event sent to a controller
+  --stdin           unlock: read the password from standard input instead
   --seconds N       protect-capture, protect-feed: how long to record (default 120)
   --camera NAME     protect-feed: which camera (default: the first in `devices`)
   --channel N       protect-feed: which quality, 0 being the best (default 0)
@@ -57,6 +63,7 @@ Options:
 enum Command {
     Tui,
     Daemon,
+    Unlock,
     ProtectCheck,
     ProtectCapture,
     ProtectFeed,
@@ -68,6 +75,7 @@ struct Args {
     listen: SocketAddr,
     demo: bool,
     verbose: bool,
+    stdin: bool,
     seconds: u64,
     camera: Option<String>,
     channel: u8,
@@ -86,6 +94,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
         listen: "0.0.0.0:51826".parse()?,
         demo: false,
         verbose: false,
+        stdin: false,
         seconds: 120,
         camera: None,
         channel: 0,
@@ -97,6 +106,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
         match arg.as_str() {
             "tui" => args.command = Command::Tui,
             "daemon" => args.command = Command::Daemon,
+            "unlock" => args.command = Command::Unlock,
             "protect-check" => args.command = Command::ProtectCheck,
             "protect-capture" => args.command = Command::ProtectCapture,
             "protect-feed" => args.command = Command::ProtectFeed,
@@ -108,6 +118,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
             "--listen" => args.listen = value()?.parse().context("--listen expects ADDRESS:PORT")?,
             "--demo" => args.demo = true,
             "--verbose" => args.verbose = true,
+            "--stdin" => args.stdin = true,
             "--help" | "-h" => {
                 println!("harbormaster {}\n\n{HELP}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -125,6 +136,7 @@ fn main() -> Result<()> {
     let args = parse_args(std::env::args().skip(1))?;
     match args.command {
         Command::Tui => tui::run(&args.state_dir),
+        Command::Unlock => unlock::run(&args.state_dir, args.stdin),
         Command::ProtectCheck => {
             tokio::runtime::Runtime::new()?.block_on(protect_check::run(&args.state_dir))
         }

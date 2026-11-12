@@ -614,6 +614,77 @@ fn plain(value: &Value, suffix: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A whole unlock as an attached client sees it: the password goes in,
+    /// the answer comes back, and nothing the daemon says along the way
+    /// (snapshots, log lines) repeats the password.
+    #[tokio::test]
+    async fn an_unlock_is_answered_and_the_password_is_never_sent_back() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let logs = LogBuffer::new();
+        let _logging = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        let dir = std::env::temp_dir().join(format!("hm-daemon-{}-unlock", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(dir.join("state.json")).unwrap());
+        let db = Database::new();
+        let config = Config {
+            name: "Test".into(),
+            model: "Test".into(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            advertise: false,
+            snapshots: None,
+        };
+        let bridge = Arc::new(Bridge::start(config, store.clone(), db.clone()).await.unwrap());
+        let vault = Vault::new(None);
+        let daemon = Arc::new(Daemon {
+            name: "Test".into(),
+            started: Instant::now(),
+            store,
+            db,
+            bridge,
+            logs,
+            console_host: Some("192.0.2.10".into()),
+            vault: Some(vault.clone()),
+        });
+        let waiting = daemon.state().console.unwrap();
+        assert!(waiting.waiting_for_password && !waiting.connected);
+
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let serving = daemon.clone();
+        let client = tokio::spawn(async move { serving.serve_client(theirs).await });
+        let (read, mut write) = ours.into_split();
+        let mut lines = BufReader::new(read).lines();
+        write.write_all(b"{\"type\":\"unlock\",\"password\":\"correct horse\"}\n").await.unwrap();
+
+        // The bridge's part: take the password and sign in with it.
+        let used = vault.password().await;
+        assert_eq!(used.expose(), "correct horse");
+        vault.signed_in(4);
+
+        let mut heard = String::new();
+        let reply = loop {
+            let line = lines.next_line().await.unwrap().expect("the daemon hung up");
+            heard.push_str(&line);
+            if let Ok(Message::Unlock(reply)) = serde_json::from_str(&line) {
+                break reply;
+            }
+        };
+        assert_eq!(reply, control::UnlockReply { signed_in: true, devices: 4, ..Default::default() });
+        // The snapshot that follows the answer.
+        heard.push_str(&lines.next_line().await.unwrap().unwrap());
+        assert!(heard.contains("\"waiting_for_password\":true") && heard.contains("\"waiting_for_password\":false"), "{heard}");
+        assert!(heard.contains("handed over"), "the hand-over is logged: {heard}");
+        assert!(!heard.contains("horse"), "the password came back: {heard}");
+        assert!(!format!("{:?}", daemon.state()).contains("horse"));
+
+        // With no console configured there is nothing to unlock.
+        client.abort();
+        let _ = client.await;
+        let nowhere = Daemon { vault: None, console_host: None, ..Arc::into_inner(daemon).expect("the client task is still running") };
+        let outcome = nowhere.unlock(Secret::new("x".into())).await.unwrap();
+        assert!(matches!(outcome, Outcome::Failed(why) if why.contains("no UniFi Protect console")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn flattens_database_for_display() {
         let db = Database::new();
