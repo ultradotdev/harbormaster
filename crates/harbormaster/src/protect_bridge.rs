@@ -704,6 +704,24 @@ impl Devices {
             handles.name = def.name.clone();
             db.replace(accessory);
             crate::status::global().device_kind(aid, def.kind.model_key(), &def.store_key());
+            // Tell controllers that are connected right now about the name,
+            // since a rebuilt accessory does not announce its values, and
+            // note when the Home app writes a name of its own: that shows
+            // whether it uses this field at all.
+            db.emit(aid, iid::CONFIGURED_NAME, json!(shown.name));
+            let plain = def.name.clone();
+            db.on_write(
+                aid,
+                iid::CONFIGURED_NAME,
+                Arc::new(move |value, context| {
+                    tracing::info!(
+                        "{plain}: {} set its HomeKit name to {}",
+                        context.peer_ip,
+                        value.as_str().unwrap_or("something unreadable")
+                    );
+                    Ok(None)
+                }),
+            );
             if let Some(live) = &self.live {
                 install_light_control(db, live, aid, &handles, &def.id);
             }
