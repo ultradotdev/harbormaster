@@ -569,19 +569,21 @@ async fn talk_back(
         // A free local port for ffmpeg to listen on.
         let port = tokio::net::UdpSocket::bind("127.0.0.1:0").await.ok()?.local_addr().ok()?.port();
         let rate = rate.to_string();
-        let args = [
-            "-hide_banner", "-loglevel", "error",
-            "-protocol_whitelist", "pipe,udp,rtp,file,crypto",
-            "-probesize", "32", "-analyzeduration", "0",
-            "-f", "sdp", "-i", "pipe:0",
-            "-map", "0:a:0", "-codec:a", "aac_at", "-ar", rate.as_str(), "-ac", "1", "-b:a", "32k",
-            "-flush_packets", "1", "-f", "adts", "pipe:1",
-        ];
+        let mut args = vec!["-hide_banner", "-loglevel", "error", "-protocol_whitelist", "pipe,udp,rtp,file,crypto"];
+        args.extend(["-probesize", "32", "-analyzeduration", "0"]);
+        if audio.codec != camera::OPUS {
+            // Apple devices send AAC-ELD in a form ffmpeg's own decoder
+            // does not handle; the system's decoder does.
+            args.extend(["-codec:a", "aac_at"]);
+        }
+        args.extend(["-f", "sdp", "-i", "pipe:0"]);
+        args.extend(["-map", "0:a:0", "-codec:a", "aac_at", "-ar", rate.as_str(), "-ac", "1", "-b:a", "32k"]);
+        args.extend(["-flush_packets", "1", "-f", "adts", "pipe:1"]);
         let mut child = tokio::process::Command::new(&ffmpeg)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .ok()?;
@@ -589,6 +591,21 @@ async fn talk_back(
         stdin.write_all(talk_sdp(&request, &audio, port).as_bytes()).await.ok()?;
         drop(stdin);
         let stdout = child.stdout.take()?;
+        if let Some(stderr) = child.stderr.take() {
+            let name = name.clone();
+            tokio::spawn(async move {
+                let mut seen = Repeats::default();
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if seen.first(&line) {
+                        tracing::warn!("{name}: talkback ffmpeg: {line}");
+                    }
+                }
+                for (line, extra) in seen.repeated() {
+                    tracing::warn!("{name}: talkback ffmpeg: {line} ({extra} more like this)");
+                }
+            });
+        }
         // The reserved port may be an IPv6 one, which reaches the local
         // IPv4 address only in its mapped form.
         let local = if incoming.local_addr().ok()?.is_ipv6() { "::ffff:127.0.0.1" } else { "127.0.0.1" };
