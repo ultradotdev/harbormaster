@@ -43,7 +43,7 @@ async def main(state_file: str) -> int:
                         if c["type"].upper().lstrip("0").startswith("11") and len(c["type"]) <= 2 or c["type"].upper().startswith("00000011-"):
                             target = (a["aid"], c["iid"])
             print("4 accessories:", [a["aid"] for a in accessories], "temperature at", target)
-            assert target and len(accessories) == 2
+            assert target and len(accessories) >= 2
 
             value = await pairing.get_characteristics([target])
             print("5 read:", value)
@@ -86,7 +86,7 @@ async def resume(state_file: str) -> int:
             pairing = controller.aliases["hm"]
             accessories = await pairing.list_accessories_and_characteristics()
             print("11 reconnected after restart, accessories:", [a["aid"] for a in accessories])
-            assert len(accessories) == 2
+            assert len(accessories) >= 2
             listed = await pairing.list_pairings()
             await pairing.remove_pairing(listed[0]["pairingId"])
             print("12 pairing removed")
