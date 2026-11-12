@@ -13,4 +13,4 @@ scp -q target/release/harbormaster "$host:harbormaster.new"
 ssh "$host" 'mv -f ~/harbormaster.new ~/harbormaster && ~/harbormaster service install'
 echo
 echo "Now give it the Protect password:"
-echo "  ssh -t $host '\"\$HOME/Library/Application Support/harbormaster/bin/harbormaster\" unlock'"
+echo "  ssh -t $host /usr/local/bin/harbormaster unlock"
