@@ -7,10 +7,10 @@
 //! narrows itself to the selected device.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -26,7 +26,10 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::clock;
-use crate::control::{self, Device, LogLine, Message, State};
+use crate::control::{self, Command, Device, LogLine, Message, State};
+
+/// Longest device name that can be typed, matching what the daemon accepts.
+const MAX_NAME: usize = crate::overrides::MAX_NAME;
 
 /// Log lines kept in the TUI for scrolling back.
 const MAX_LOG_LINES: usize = 2000;
@@ -40,6 +43,25 @@ enum Incoming {
     Attached,
     Detached,
     Message(Box<Message>),
+}
+
+/// A box drawn over the dashboard that takes the next keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Modal {
+    None,
+    /// The pairing code.
+    Setup,
+    /// Asking before a device is taken away from HomeKit.
+    ConfirmUnshare { key: String, name: String },
+    /// Typing a device's new name.
+    Rename { key: String, input: String },
+}
+
+/// Something a line of the device pane does when clicked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    ToggleShared,
+    Rename,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,7 +86,13 @@ struct App {
     /// Lines scrolled up from the newest log line; zero follows the tail.
     log_scroll: usize,
     focus: Focus,
-    show_setup: bool,
+    modal: Modal,
+    /// Requests waiting to be sent to the daemon.
+    outbox: Vec<Command>,
+    /// Which lines of the device pane can be clicked, by line number.
+    actions: Vec<(usize, Action)>,
+    /// Where the confirmation's Yes was last drawn.
+    yes_area: Rect,
     warnings_only: bool,
     /// Whether the log narrows to the selected device.
     device_log: bool,
@@ -90,7 +118,10 @@ impl App {
             detail_scroll: 0,
             log_scroll: 0,
             focus: Focus::Devices,
-            show_setup: false,
+            modal: Modal::None,
+            outbox: Vec::new(),
+            actions: Vec::new(),
+            yes_area: Rect::default(),
             warnings_only: false,
             device_log: true,
             zone: clock::local_offset,
@@ -204,12 +235,69 @@ impl App {
         area.height.saturating_sub(2).max(1) as isize
     }
 
+    /// Shares the selected device, or asks before taking it away.
+    fn toggle_shared(&mut self) {
+        let Some((key, name, hidden)) =
+            self.selected_device().and_then(|d| Some((d.key.clone()?, d.name.clone(), d.hidden)))
+        else {
+            return;
+        };
+        if hidden {
+            self.outbox.push(Command::SetShared { key, shared: true });
+        } else {
+            self.modal = Modal::ConfirmUnshare { key, name };
+        }
+    }
+
+    fn start_rename(&mut self) {
+        if let Some((key, name)) = self.selected_device().and_then(|d| Some((d.key.clone()?, d.name.clone()))) {
+            self.modal = Modal::Rename { key, input: name };
+        }
+    }
+
+    fn run(&mut self, action: Action) {
+        match action {
+            Action::ToggleShared => self.toggle_shared(),
+            Action::Rename => self.start_rename(),
+        }
+    }
+
+    /// Handles a key while a box is open. Returns `false` if none is.
+    fn modal_key(&mut self, code: KeyCode) -> bool {
+        match std::mem::replace(&mut self.modal, Modal::None) {
+            Modal::None => return false,
+            // Any key closes the pairing code.
+            Modal::Setup => {}
+            Modal::ConfirmUnshare { key, .. } => {
+                if matches!(code, KeyCode::Char('y' | 'Y') | KeyCode::Enter) {
+                    self.outbox.push(Command::SetShared { key, shared: false });
+                }
+            }
+            Modal::Rename { key, mut input } => match code {
+                KeyCode::Enter => {
+                    let name = Some(input.trim().to_owned()).filter(|n| !n.is_empty());
+                    self.outbox.push(Command::Rename { key, name });
+                }
+                KeyCode::Esc => {}
+                other => {
+                    match other {
+                        KeyCode::Char(c) if input.chars().count() < MAX_NAME => input.push(c),
+                        KeyCode::Backspace => drop(input.pop()),
+                        _ => {}
+                    }
+                    self.modal = Modal::Rename { key, input };
+                }
+            },
+        }
+        true
+    }
+
     /// Returns `false` when the user asked to quit.
     fn handle(&mut self, event: Event) -> bool {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if self.show_setup {
-                    self.show_setup = false;
+                let quit = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+                if !quit && self.modal_key(key.code) {
                     return true;
                 }
                 match key.code {
@@ -238,7 +326,9 @@ impl App {
                         self.focus = Focus::Detail;
                     }
                     KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Devices,
-                    KeyCode::Char('p') => self.show_setup = true,
+                    KeyCode::Char('p') => self.modal = Modal::Setup,
+                    KeyCode::Char('s') => self.toggle_shared(),
+                    KeyCode::Char('r') => self.start_rename(),
                     KeyCode::Char('w') => {
                         self.warnings_only = !self.warnings_only;
                         self.log_scroll = 0;
@@ -268,9 +358,23 @@ impl App {
                     None
                 };
                 match (mouse.kind, over) {
-                    (MouseEventKind::Down(MouseButton::Left), _) if self.show_setup => self.show_setup = false,
+                    (MouseEventKind::Down(MouseButton::Left), _) if self.modal != Modal::None => {
+                        // Yes confirms; a click anywhere else backs out.
+                        let confirm = if self.yes_area.contains(at) { KeyCode::Enter } else { KeyCode::Esc };
+                        match self.modal {
+                            Modal::ConfirmUnshare { .. } => drop(self.modal_key(confirm)),
+                            _ => self.modal = Modal::None,
+                        }
+                    }
+                    _ if self.modal != Modal::None => {}
                     (MouseEventKind::Down(MouseButton::Left), Some(pane)) => {
                         self.focus = pane;
+                        if pane == Focus::Detail && mouse.row > self.detail_area.y {
+                            let line = self.detail_scroll + (mouse.row - self.detail_area.y - 1) as usize;
+                            if let Some((_, action)) = self.actions.iter().find(|(at, _)| *at == line).copied() {
+                                self.run(action);
+                            }
+                        }
                         // Rows start one line below the pane's top border.
                         let inside = mouse.row > self.list_area.y && mouse.row + 1 < self.list_area.bottom();
                         if pane == Focus::Devices && inside {
@@ -365,6 +469,9 @@ impl App {
     /// The few words that say what a device is doing, most pressing first.
     fn summary(&self, d: &Device) -> Vec<Span<'static>> {
         let mut parts: Vec<Span> = Vec::new();
+        if d.hidden {
+            return vec![Span::styled("not shared", DIM)];
+        }
         if d.online == Some(false) {
             // Whatever an unreachable device last said is stale.
             return vec![Span::styled("offline", BAD)];
@@ -440,10 +547,38 @@ fn draw(frame: &mut Frame, app: &mut App) {
     draw_devices(frame, app, list);
     draw_detail(frame, app, detail);
     draw_log(frame, app, log);
-    let hints = " ↑↓ select  Tab pane  Enter open  w warnings  f device log  p pairing  q quit";
+    let hints = if app.selected_device().is_some_and(|d| d.key.is_some()) {
+        " ↑↓ select  Tab pane  s share  r rename  w warnings  f device log  q quit"
+    } else {
+        " ↑↓ select  Tab pane  Enter open  w warnings  f device log  p pairing  q quit"
+    };
     frame.render_widget(Paragraph::new(hints).style(DIM), footer);
-    if app.show_setup {
-        draw_setup(frame, app);
+    match &app.modal {
+        Modal::None => {}
+        Modal::Setup => draw_setup(frame, app),
+        Modal::ConfirmUnshare { name, .. } => {
+            let lines = vec![
+                Line::raw(format!(" Stop sharing {name} with HomeKit?")),
+                Line::raw(""),
+                Line::styled(" HomeKit will forget its room, automations", DIM),
+                Line::styled(" and recordings. Sharing it again later", DIM),
+                Line::styled(" adds it as a new accessory.", DIM),
+                Line::raw(""),
+                Line::from(vec![Span::raw(" "), Span::styled("[ y  Yes, stop sharing ]", BAD), Span::raw("   [ n  Keep ]")]),
+            ];
+            let area = draw_box(frame, "Stop sharing", lines);
+            // The Yes button is the start of the last line.
+            app.yes_area = Rect { x: area.x + 2, y: area.bottom().saturating_sub(2), width: 24.min(area.width), height: 1 };
+        }
+        Modal::Rename { input, .. } => {
+            let lines = vec![
+                Line::from(vec![Span::raw(format!(" {input}")), Span::styled("▏", Style::new().fg(Color::Cyan))]),
+                Line::raw(""),
+                Line::styled(" Enter saves · Esc cancels", DIM),
+                Line::styled(" Leave it empty to use Protect's own name.", DIM),
+            ];
+            draw_box(frame, "Name to publish", lines);
+        }
     }
 }
 
@@ -476,9 +611,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Some(c) => row(dot(Some(false)), "Console", vec![Span::styled(format!("{} down", c.host), BAD)]),
         None => row(dot(None), "Console", vec![Span::styled("not configured", DIM)]),
     };
-    let known = app.devices.iter().filter(|d| d.online.is_some()).count();
-    let offline = app.devices.iter().filter(|d| d.online == Some(false)).count();
-    let devices = match (app.devices.len(), offline) {
+    let shared = app.devices.iter().filter(|d| !d.hidden);
+    let known = shared.clone().filter(|d| d.online.is_some()).count();
+    let offline = shared.clone().filter(|d| d.online == Some(false)).count();
+    let devices = match (shared.count(), offline) {
         (0, _) => row(dot(None), "Devices", vec![Span::styled("none", DIM)]),
         // Devices that do not report whether they are reachable are only counted.
         (all, 0) if known == 0 => row(dot(None), "Devices", vec![Span::raw(format!("{all} published"))]),
@@ -622,8 +758,37 @@ fn overview_lines(app: &App, s: &State, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn device_lines(app: &App, d: &Device) -> Vec<Line<'static>> {
+/// The lines of a device's pane, and which of them can be clicked.
+fn device_lines(app: &App, d: &Device) -> (Vec<Line<'static>>, Vec<(usize, Action)>) {
+    let mut lines = device_facts(app, d);
+    let mut actions = Vec::new();
+    if d.key.is_some() {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(heading("Settings"));
+        let key = |k: &str| Span::styled(format!("  {k}  "), Style::new().fg(Color::Cyan));
+        actions.push((lines.len(), Action::ToggleShared));
+        lines.push(Line::from(vec![
+            key("s"),
+            Span::raw(if d.hidden { "[ ] Share with HomeKit" } else { "[x] Share with HomeKit" }),
+        ]));
+        actions.push((lines.len(), Action::Rename));
+        let mut name = vec![key("r"), Span::raw(format!("Name: {}", d.name))];
+        if let Some(own) = &d.protect_name {
+            name.push(Span::styled(format!("  (Protect: {own})"), DIM));
+        }
+        lines.push(Line::from(name));
+    }
+    (lines, actions)
+}
+
+fn device_facts(app: &App, d: &Device) -> Vec<Line<'static>> {
+    if d.hidden && d.aid == 0 {
+        return vec![field("Status", Span::styled("not shared with HomeKit", DIM))];
+    }
     let status = match d.online {
+        _ if d.hidden => Span::styled("being removed from HomeKit", WARN),
         Some(true) => Span::styled("online", GOOD),
         Some(false) => Span::styled("offline", BAD),
         None => Span::styled("not reported", DIM),
@@ -682,11 +847,15 @@ fn device_lines(app: &App, d: &Device) -> Vec<Line<'static>> {
 
 fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let width = area.width.saturating_sub(2) as usize;
-    let (title, lines) = match (&app.state, app.selected_device()) {
-        (Some(_), Some(d)) => (format!("{} · {}", d.name, d.kind), device_lines(app, d)),
-        (Some(s), None) => ("Overview".to_owned(), overview_lines(app, s, width)),
-        (None, _) => ("Overview".to_owned(), vec![Line::styled("waiting for the daemon", DIM)]),
+    let (title, lines, actions) = match (&app.state, app.selected_device()) {
+        (Some(_), Some(d)) => {
+            let (lines, actions) = device_lines(app, d);
+            (format!("{} · {}", d.name, d.kind), lines, actions)
+        }
+        (Some(s), None) => ("Overview".to_owned(), overview_lines(app, s, width), Vec::new()),
+        (None, _) => ("Overview".to_owned(), vec![Line::styled("waiting for the daemon", DIM)], Vec::new()),
     };
+    app.actions = actions;
     app.detail_max = lines.len().saturating_sub(area.height.saturating_sub(2) as usize);
     app.detail_scroll = app.detail_scroll.min(app.detail_max);
     let more = if app.detail_max > app.detail_scroll { " ↓" } else { "" };
@@ -753,7 +922,14 @@ fn draw_setup(frame: &mut Frame, app: &App) {
     lines.push(Line::raw(""));
     lines.push(Line::styled("press any key to close", DIM).centered());
 
-    let width = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0) + 4;
+    draw_box(frame, "Pair with the Home app", lines);
+}
+
+/// Draws a titled box in the middle of the screen, sized to its lines, and
+/// returns where it went.
+fn draw_box(frame: &mut Frame, title: &str, lines: Vec<Line>) -> Rect {
+    let widest = lines.iter().map(|l| l.width()).max().unwrap_or(0).max(title.chars().count() + 2);
+    let width = widest.min(u16::MAX as usize - 4) as u16 + 4;
     let height = lines.len() as u16 + 2;
     let screen = frame.area();
     let area = Rect {
@@ -763,16 +939,29 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         height: height.min(screen.height),
     };
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" Pair with the Home app ")),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).block(Block::bordered().title(format!(" {title} "))), area);
+    area
+}
+
+/// The way back to the daemon, present while attached.
+type Requests = Arc<Mutex<Option<UnixStream>>>;
+
+/// Sends the daemon a request. One that cannot be sent is dropped: the
+/// dashboard goes on showing what is true, which is that nothing changed.
+fn send_request(requests: &Requests, command: &Command) {
+    let Ok(mut line) = serde_json::to_vec(command) else { return };
+    line.push(b'\n');
+    if let Some(stream) = requests.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_mut() {
+        let _ = stream.write_all(&line);
+    }
 }
 
 /// Connects to the daemon and forwards its messages, reconnecting forever.
-fn read_daemon(socket: PathBuf, tx: mpsc::Sender<Incoming>) {
+fn read_daemon(socket: PathBuf, tx: mpsc::Sender<Incoming>, requests: Requests) {
+    let set = |stream: Option<UnixStream>| *requests.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = stream;
     loop {
         if let Ok(stream) = UnixStream::connect(&socket) {
+            set(stream.try_clone().ok());
             if tx.send(Incoming::Attached).is_err() {
                 return;
             }
@@ -785,6 +974,7 @@ fn read_daemon(socket: PathBuf, tx: mpsc::Sender<Incoming>) {
                     }
                 }
             }
+            set(None);
             if tx.send(Incoming::Detached).is_err() {
                 return;
             }
@@ -796,7 +986,9 @@ fn read_daemon(socket: PathBuf, tx: mpsc::Sender<Incoming>) {
 pub fn run(state_dir: &Path) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let socket = state_dir.join(control::SOCKET_NAME);
-    std::thread::spawn(move || read_daemon(socket, tx));
+    let requests = Requests::default();
+    let for_reader = requests.clone();
+    std::thread::spawn(move || read_daemon(socket, tx, for_reader));
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
@@ -805,6 +997,9 @@ pub fn run(state_dir: &Path) -> Result<()> {
         loop {
             while let Ok(incoming) = rx.try_recv() {
                 app.receive(incoming);
+            }
+            for command in app.outbox.drain(..) {
+                send_request(&requests, &command);
             }
             terminal.draw(|frame| draw(frame, &mut app))?;
             if event::poll(Duration::from_millis(150))? && !app.handle(event::read()?) {
@@ -1203,11 +1398,124 @@ mod tests {
         // Too short for the code's picture: the digits alone still fit.
         assert!(render(&mut app).contains("Setup code: 420-21-195"));
         app.handle(key(KeyCode::Char('x')));
-        assert!(!app.show_setup);
+        assert_eq!(app.modal, Modal::None);
 
         let mut app = app_with(sample_state(true));
         app.handle(key(KeyCode::Char('p')));
         assert!(render(&mut app).contains("Already paired"));
+    }
+
+    fn editable(mut state: State) -> State {
+        for device in &mut state.devices {
+            device.key = Some(format!("protect:{}:{}", device.kind, device.aid));
+        }
+        state.devices[1].protect_name = Some("Garage Cam".into());
+        state.devices.push(Device {
+            key: Some("protect:camera:9".into()),
+            kind: "camera".into(),
+            name: "Side Gate".into(),
+            hidden: true,
+            ..Device::default()
+        });
+        state
+    }
+
+    #[test]
+    fn unsharing_asks_first_and_sharing_does_not() {
+        let mut app = app_with(editable(sample_state(true)));
+        app.handle(key(KeyCode::Down));
+        let screen = render(&mut app);
+        assert_shows(&screen, &["Settings", "s  [x] Share with HomeKit", "r  Name: Front Door", "s share  r rename"]);
+
+        app.handle(key(KeyCode::Char('s')));
+        let screen = render(&mut app);
+        assert_shows(&screen, &["Stop sharing Front Door with HomeKit?", "forget its room", "[ y  Yes, stop sharing ]"]);
+        // Anything but yes backs out, including q, which must not quit here.
+        assert!(app.handle(key(KeyCode::Char('q'))));
+        assert!(app.outbox.is_empty() && app.modal == Modal::None);
+
+        app.handle(key(KeyCode::Char('s')));
+        app.handle(key(KeyCode::Char('y')));
+        assert_eq!(app.outbox, [Command::SetShared { key: "protect:doorbell:2".into(), shared: false }]);
+        app.outbox.clear();
+
+        // A device that is not shared is listed last, and shares at once.
+        app.handle(key(KeyCode::End));
+        let screen = render(&mut app);
+        assert_shows(&screen, &["Side Gate", "not shared", "Status       not shared with HomeKit", "[ ] Share with HomeKit"]);
+        assert!(screen.contains("1 of 5 offline"), "a device that is not shared is not counted: {screen}");
+        app.handle(key(KeyCode::Char('s')));
+        assert_eq!(app.outbox, [Command::SetShared { key: "protect:camera:9".into(), shared: true }]);
+
+        // The overview and the demo sensor have nothing to edit.
+        app.outbox.clear();
+        app.handle(key(KeyCode::Home));
+        app.handle(key(KeyCode::Char('s')));
+        app.handle(key(KeyCode::Char('r')));
+        assert!(app.outbox.is_empty() && app.modal == Modal::None);
+    }
+
+    #[test]
+    fn renaming_edits_the_name_in_a_box() {
+        let mut app = app_with(editable(sample_state(true)));
+        app.select(2);
+        assert_shows(&render(&mut app), &["r  Name: Garage  (Protect: Garage Cam)"]);
+        app.handle(key(KeyCode::Char('r')));
+        assert_shows(&render(&mut app), &["Name to publish", " Garage▏", "Enter saves"]);
+        for _ in 0..6 {
+            app.handle(key(KeyCode::Backspace));
+        }
+        for c in "Car port q".chars() {
+            app.handle(key(KeyCode::Char(c)));
+        }
+        assert!(render(&mut app).contains(" Car port q▏"));
+        app.handle(key(KeyCode::Enter));
+        assert_eq!(app.outbox, [Command::Rename { key: "protect:camera:3".into(), name: Some("Car port q".into()) }]);
+
+        // Esc cancels; an emptied name asks for Protect's own.
+        app.outbox.clear();
+        app.handle(key(KeyCode::Char('r')));
+        app.handle(key(KeyCode::Esc));
+        assert!(app.outbox.is_empty() && app.modal == Modal::None);
+        app.handle(key(KeyCode::Char('r')));
+        for _ in 0..10 {
+            app.handle(key(KeyCode::Backspace));
+        }
+        app.handle(key(KeyCode::Enter));
+        assert_eq!(app.outbox, [Command::Rename { key: "protect:camera:3".into(), name: None }]);
+        // Names stop growing at the limit.
+        app.handle(key(KeyCode::Char('r')));
+        for _ in 0..100 {
+            app.handle(key(KeyCode::Char('x')));
+        }
+        assert!(matches!(&app.modal, Modal::Rename { input, .. } if input.chars().count() == MAX_NAME));
+    }
+
+    #[test]
+    fn settings_can_be_clicked() {
+        let mut app = app_with(editable(sample_state(true)));
+        app.select(4);
+        let screen = render(&mut app);
+        let row = |text: &str| screen.lines().position(|l| l.contains(text)).unwrap() as u16;
+        let x = app.detail_area.x + 8;
+        app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, row("Name: Yard")));
+        assert!(matches!(app.modal, Modal::Rename { .. }));
+        // A click outside the box closes it.
+        app.handle(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        assert_eq!(app.modal, Modal::None);
+
+        app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, row("Share with HomeKit")));
+        assert!(matches!(app.modal, Modal::ConfirmUnshare { .. }));
+        let screen = render(&mut app);
+        let yes = screen.lines().position(|l| l.contains("Yes, stop sharing")).unwrap() as u16;
+        assert_eq!(app.yes_area.y, yes);
+        // Clicking Keep, beside Yes, changes nothing.
+        app.handle(mouse(MouseEventKind::Down(MouseButton::Left), app.yes_area.right() + 5, yes));
+        assert!(app.outbox.is_empty() && app.modal == Modal::None);
+        app.handle(key(KeyCode::Char('s')));
+        render(&mut app);
+        app.handle(mouse(MouseEventKind::Down(MouseButton::Left), app.yes_area.x + 3, yes));
+        assert_eq!(app.outbox, [Command::SetShared { key: "protect:sensor:5".into(), shared: false }]);
     }
 
     #[test]
