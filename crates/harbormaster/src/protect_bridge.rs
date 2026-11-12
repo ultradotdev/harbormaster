@@ -38,7 +38,6 @@ const UPDATE_SILENCE: Duration = Duration::from_secs(90);
 /// Reserved instance ids, one block per optional service, so that enabling
 /// or disabling a feature in Protect never renumbers the others.
 mod iid {
-    pub const CONFIGURED_NAME: u64 = 8;
     pub const MOTION: u64 = 100;
     pub const DOORBELL: u64 = 110;
     pub const CONTACT: u64 = 120;
@@ -509,10 +508,6 @@ fn build_accessory(aid: u64, def: &DeviceDef, with_video: bool) -> (Accessory, H
             firmware_revision: firmware,
         },
     );
-    // A name HomeKit follows when it changes here, so a name chosen in
-    // Harbormaster replaces one typed into the Home app. Every other id in
-    // these accessories is 100 or above, which leaves this one free.
-    accessory.set_configured_name(iid::CONFIGURED_NAME, &def.name);
     let mut handles = Handles { aid, name: def.name.clone(), ..Handles::default() };
     let f = &def.features;
     // The first service present is the primary one.
@@ -704,24 +699,6 @@ impl Devices {
             handles.name = def.name.clone();
             db.replace(accessory);
             crate::status::global().device_kind(aid, def.kind.model_key(), &def.store_key());
-            // Tell controllers that are connected right now about the name,
-            // since a rebuilt accessory does not announce its values, and
-            // note when the Home app writes a name of its own: that shows
-            // whether it uses this field at all.
-            db.emit(aid, iid::CONFIGURED_NAME, json!(shown.name));
-            let plain = def.name.clone();
-            db.on_write(
-                aid,
-                iid::CONFIGURED_NAME,
-                Arc::new(move |value, context| {
-                    tracing::info!(
-                        "{plain}: {} set its HomeKit name to {}",
-                        context.peer_ip,
-                        value.as_str().unwrap_or("something unreadable")
-                    );
-                    Ok(None)
-                }),
-            );
             if let Some(live) = &self.live {
                 install_light_control(db, live, aid, &handles, &def.id);
             }
@@ -1599,16 +1576,6 @@ mod tests {
         let handles = &devices.handles[&("camera", "cam1".to_owned())];
         // The name characteristic of the accessory information service.
         assert_eq!(db.read(handles.aid, 5), Ok(json!("UP Front Door HM")));
-        assert_eq!(db.read(handles.aid, iid::CONFIGURED_NAME), Ok(json!("UP Front Door HM")));
-        // The Home app may write its own name; rebuilding puts ours back.
-        let context = harbormaster_hap::model::WriteContext {
-            connection: 1,
-            local_ip: "127.0.0.1".parse().unwrap(),
-            peer_ip: "127.0.0.1".parse().unwrap(),
-            shared_secret: None,
-        };
-        db.write(handles.aid, iid::CONFIGURED_NAME, &json!("Typed in Home"), &context).unwrap();
-        assert_eq!(db.read(handles.aid, iid::CONFIGURED_NAME), Ok(json!("Typed in Home")));
         assert_eq!(handles.name, "Front Door", "logs and the device list keep the plain name");
         assert_eq!(devices.defs[0].name, "Front Door");
         let _ = std::fs::remove_dir_all(&dir);
