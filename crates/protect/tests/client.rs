@@ -75,6 +75,9 @@ fn answer(request: &str, behaviour: Behaviour) -> String {
             }
         }
         ("PATCH /proxy/protect/api/lights/readonly HTTP/1.1", _) if signed_in => reply("403 Forbidden", "", "{}"),
+        (line, _) if line.starts_with("GET /proxy/protect/api/cameras/c1/package-snapshot?") && signed_in => {
+            reply("200 OK", "Content-Type: image/jpeg\r\n", "PACKAGE")
+        }
         _ => reply("404 Not Found", "", "{}"),
     }
 }
@@ -199,6 +202,8 @@ async fn fetches_snapshots_and_refuses_odd_camera_ids() {
     assert!(matches!(client.snapshot("c1", 640, 480).await, Err(Error::NotSignedIn)));
     client.login("harbormaster", "correct horse").await.unwrap();
     assert_eq!(&client.snapshot("c1", 640, 480).await.unwrap()[..], b"JPEG-640");
+    assert_eq!(&client.package_snapshot("c1", 640, 480).await.unwrap()[..], b"PACKAGE");
+    assert!(matches!(client.package_snapshot("../x", 1, 1).await, Err(Error::Protocol(_))));
     let before = console.requests.load(Ordering::SeqCst);
     assert!(matches!(client.snapshot("../users", 1, 1).await, Err(Error::Protocol(_))));
     assert!(matches!(client.snapshot("", 1, 1).await, Err(Error::Protocol(_))));

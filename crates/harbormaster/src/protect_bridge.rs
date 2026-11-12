@@ -106,12 +106,29 @@ pub struct DeviceDef {
     /// Size of the camera's best stream, if it has video to offer.
     #[serde(default)]
     pub video: Option<(u16, u16)>,
+    /// Which lens of the camera this accessory shows. 0 is the main one;
+    /// a doorbell's package camera is published separately under its own.
+    #[serde(default)]
+    pub lens: u8,
 }
 
 impl DeviceDef {
     /// Key under which the store keeps this device's stable accessory id.
     fn store_key(&self) -> String {
-        format!("protect:{}:{}", self.kind.model_key(), self.id)
+        match self.lens {
+            0 => format!("protect:{}:{}", self.kind.model_key(), self.id),
+            lens => format!("protect:{}:{}:lens{lens}", self.kind.model_key(), self.id),
+        }
+    }
+
+    /// Identifies this accessory among the published ones. Updates from
+    /// the console are addressed to the plain id, so they reach the main
+    /// accessory and not a second lens.
+    fn handle_id(&self) -> String {
+        match self.lens {
+            0 => self.id.clone(),
+            lens => format!("{}#lens{lens}", self.id),
+        }
     }
 }
 
@@ -162,7 +179,26 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
                 mac: text("mac"),
                 firmware: text("firmwareVersion"),
                 features,
+                lens: 0,
             });
+            // A doorbell's second lens looks down at the doorstep. It gets
+            // an accessory of its own, since HomeKit shows one picture each.
+            let package = device["channels"].as_array().into_iter().flatten().find(|c| c["name"] == "Package Camera");
+            if let (Kind::Camera, true, Some(channel)) =
+                (kind, device["featureFlags"]["hasPackageCamera"] == true, package)
+            {
+                let size = |key: &str| channel[key].as_u64().and_then(|n| u16::try_from(n).ok());
+                let main = out.last().expect("just pushed").clone();
+                out.push(DeviceDef {
+                    name: format!("{} Package Camera", main.name),
+                    // Serial numbers must differ between accessories.
+                    mac: format!("{}P", main.mac),
+                    features: Features::default(),
+                    video: size("width").zip(size("height")),
+                    lens: device["lenses"][1]["id"].as_u64().and_then(|n| u8::try_from(n).ok()).unwrap_or(2),
+                    ..main
+                });
+            }
         }
     }
     out
@@ -210,19 +246,25 @@ struct LiveInner {
     /// Present while signed in.
     client: Option<Arc<Client>>,
     channels: HashMap<String, Vec<Channel>>,
-    /// Which camera each accessory is.
-    cameras: HashMap<u64, String>,
+    /// Which camera, and which of its lenses, each accessory is.
+    cameras: HashMap<u64, (String, u8)>,
+    /// Cameras the console cannot reach, which have no picture to give.
+    offline: std::collections::HashSet<String>,
+    names: HashMap<String, String>,
 }
 
 impl Live {
     fn update(&self, client: Arc<Client>, bootstrap: &Value) {
         let mut inner = self.inner.write().unwrap();
         inner.client = Some(client);
-        inner.channels = bootstrap["cameras"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|c| Some((c["id"].as_str()?.to_owned(), channels(c))))
+        let cameras = || bootstrap["cameras"].as_array().into_iter().flatten();
+        inner.channels = cameras().filter_map(|c| Some((c["id"].as_str()?.to_owned(), channels(c)))).collect();
+        inner.offline = cameras()
+            .filter(|c| c["state"] != "CONNECTED")
+            .filter_map(|c| c["id"].as_str().map(str::to_owned))
+            .collect();
+        inner.names = cameras()
+            .filter_map(|c| Some((c["id"].as_str()?.to_owned(), c["name"].as_str()?.to_owned())))
             .collect();
     }
 
@@ -242,14 +284,25 @@ impl SnapshotSource for Live {
         _reason: SnapshotReason,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
         Box::pin(async move {
-            let (client, camera) = {
+            let (client, camera, lens, name) = {
                 let inner = self.inner.read().unwrap();
-                (inner.client.clone()?, inner.cameras.get(&aid)?.clone())
+                let (camera, lens) = inner.cameras.get(&aid)?.clone();
+                // An unreachable camera has no picture, and asking only
+                // earns an error from the console.
+                if inner.offline.contains(&camera) {
+                    return None;
+                }
+                let name = inner.names.get(&camera).cloned().unwrap_or_else(|| "a camera".to_owned());
+                (inner.client.clone()?, camera, lens, name)
             };
-            match client.snapshot(&camera, width, height).await {
+            let result = match lens {
+                0 => client.snapshot(&camera, width, height).await,
+                _ => client.package_snapshot(&camera, width, height).await,
+            };
+            match result {
                 Ok(jpeg) => Some(jpeg.to_vec()),
                 Err(e) => {
-                    tracing::warn!("snapshot failed: {e}");
+                    tracing::warn!("{name}: snapshot failed: {e}");
                     None
                 }
             }
@@ -285,6 +338,8 @@ impl SnapshotSource for Snapshots {
 struct ProtectVideo {
     live: Arc<Live>,
     camera: String,
+    /// 0 for the main lens.
+    lens: u8,
 }
 
 impl ProtectVideo {
@@ -293,6 +348,12 @@ impl ProtectVideo {
     /// the largest.
     fn choose(&self, width: u16) -> Option<(Arc<Client>, u8)> {
         let inner = self.live.inner.read().unwrap();
+        // A second lens has a single stream, which the console files
+        // under the first quality level.
+        if self.lens != 0 {
+            inner.channels.get(&self.camera)?;
+            return Some((inner.client.clone()?, 0));
+        }
         let mut available: Vec<&Channel> = inner.channels.get(&self.camera)?.iter().collect();
         available.sort_by_key(|c| c.width);
         let channel = available.iter().find(|c| c.width >= width).or(available.last())?;
@@ -307,12 +368,12 @@ impl VideoSource for ProtectVideo {
 
     fn open(&self, width: u16) -> Option<mpsc::Receiver<Bytes>> {
         let (client, channel) = self.choose(width)?;
-        let camera = self.camera.clone();
+        let (camera, lens) = (self.camera.clone(), self.lens);
         // A little slack so a brief stall in ffmpeg does not stall the
         // connection to the console; fragments are a tenth of a second.
         let (sender, receiver) = mpsc::channel(32);
         tokio::spawn(async move {
-            let options = FeedOptions { channel, ..FeedOptions::default() };
+            let options = FeedOptions { channel, lens, ..FeedOptions::default() };
             let mut feed = match client.livestream(&camera, options).await {
                 Ok(feed) => feed,
                 Err(e) => {
@@ -476,10 +537,13 @@ fn build_accessory(aid: u64, def: &DeviceDef, with_video: bool) -> (Accessory, H
     if let (true, Some((width, height))) = (with_video, def.video) {
         let offered = video::resolutions(width, height);
         handles.streams = iid::STREAMS.iter().map(|iid| video::add_stream_service(&mut accessory, *iid, &offered)).collect();
-        let triggers = TRIGGER_MOTION | if f.doorbell { TRIGGER_DOORBELL } else { 0 };
-        let motion_service = handles.motion.is_some().then_some(iid::MOTION);
-        handles.recording =
-            Some(recording::add_services(&mut accessory, iid::RECORDING, &offered, triggers, motion_service));
+        // A second lens has no sensor of its own to start a recording.
+        if def.lens == 0 {
+            let triggers = TRIGGER_MOTION | if f.doorbell { TRIGGER_DOORBELL } else { 0 };
+            let motion_service = handles.motion.is_some().then_some(iid::MOTION);
+            handles.recording =
+                Some(recording::add_services(&mut accessory, iid::RECORDING, &offered, triggers, motion_service));
+        }
     }
     if f.battery {
         let ids = accessory.add_service_at(
@@ -568,8 +632,8 @@ impl Devices {
     fn add(&mut self, defs: &[DeviceDef], store: &Store, db: &Arc<Database>) -> Result<usize> {
         let mut changed = 0;
         for def in defs {
-            let key = (def.kind.model_key(), def.id.clone());
-            let existing = self.defs.iter().position(|d| d.kind == def.kind && d.id == def.id);
+            let key = (def.kind.model_key(), def.handle_id());
+            let existing = self.defs.iter().position(|d| d.kind == def.kind && d.id == def.id && d.lens == def.lens);
             if existing.is_some_and(|i| self.defs[i] == *def) {
                 continue;
             }
@@ -581,19 +645,19 @@ impl Devices {
             }
             if let Some((live, ffmpeg)) = &self.video {
                 for ids in &handles.streams {
-                    let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone() });
+                    let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone(), lens: def.lens });
                     let gate = self.recorder.clone().map(|recorder| -> video::Gate {
                         Arc::new(move || recorder.live_view_refusal(aid))
                     });
                     video::install(db, aid, *ids, &def.name, source, ffmpeg, gate);
                 }
                 if let (Some(ids), Some(recorder)) = (handles.recording, &self.recorder) {
-                    let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone() });
+                    let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone(), lens: def.lens });
                     let switches: Vec<u64> = handles.streams.iter().map(StreamIds::active).collect();
                     recorder.install(db, aid, ids, &def.name, &def.id, source, &switches);
                 }
                 if def.kind == Kind::Camera {
-                    live.inner.write().unwrap().cameras.insert(aid, def.id.clone());
+                    live.inner.write().unwrap().cameras.insert(aid, (def.id.clone(), def.lens));
                 }
             }
             self.handles.insert(key, handles);
@@ -619,6 +683,14 @@ impl Devices {
         };
         if let Some(state) = data["state"].as_str() {
             let online = state == "CONNECTED";
+            if let (true, Some(live)) = (model_key == "camera", &self.live) {
+                let mut inner = live.inner.write().unwrap();
+                if online {
+                    inner.offline.remove(id);
+                } else {
+                    inner.offline.insert(id.to_owned());
+                }
+            }
             for iid in &h.active {
                 if db.set(h.aid, *iid, json!(online)) && live {
                     tracing::info!("{} is {}", h.name, if online { "online" } else { "offline" });
@@ -958,7 +1030,8 @@ mod tests {
         json!({
             "cameras": [{
                 "id": "cam1", "mac": "AA01", "name": "Front Door", "type": "UVC G4 Doorbell Pro", "state": "CONNECTED",
-                "featureFlags": {"isDoorbell": true},
+                "featureFlags": {"isDoorbell": true, "hasPackageCamera": true},
+                "lenses": [{"id": 1}, {"id": 2}],
                 "channels": [
                     {"id": 0, "name": "High", "enabled": true, "width": 1600, "height": 1200},
                     {"id": 1, "name": "Medium", "enabled": true, "width": 960, "height": 720},
@@ -978,7 +1051,7 @@ mod tests {
         assert_eq!(definitions(&super::tests::bootstrap())[0].video, None);
 
         let live = Arc::new(Live::default());
-        let source = ProtectVideo { live: live.clone(), camera: "cam1".into() };
+        let source = ProtectVideo { live: live.clone(), camera: "cam1".into(), lens: 0 };
         assert!(!source.available(), "nothing is available before the console is reached");
 
         let pin: Fingerprint = "00".repeat(32).parse().unwrap();
@@ -992,8 +1065,23 @@ mod tests {
         // Never the switched-off stream (2) or the package camera (3).
         assert!((0..=2000).step_by(40).all(|width| channel(width) < 2));
 
+        // The package camera is a second accessory reading the second lens.
+        let package = defs.iter().find(|d| d.lens != 0).expect("a doorbell with a package camera has two accessories");
+        assert_eq!((package.name.as_str(), package.lens, package.video), ("Front Door Package Camera", 2, Some((1600, 1200))));
+        assert_ne!(package.mac, defs[0].mac, "serial numbers must differ");
+        assert_ne!(package.store_key(), defs[0].store_key());
+        assert_ne!(package.handle_id(), defs[0].handle_id());
+        assert!(!package.features.motion && !package.features.doorbell);
+        let (accessory, handles) = build_accessory(9, package, true);
+        assert_eq!(handles.streams.len(), 2);
+        assert!(handles.recording.is_none() && handles.motion.is_none() && handles.ring.is_none());
+        drop(accessory);
+        let lens = ProtectVideo { live: live.clone(), camera: "cam1".into(), lens: 2 };
+        assert_eq!(lens.choose(640).map(|(_, channel)| channel), Some(0));
+
         live.disconnected();
         assert!(!source.available());
+        assert!(!lens.available());
     }
 
     #[tokio::test]
@@ -1008,19 +1096,22 @@ mod tests {
 
         // From the cache of an older run: the camera is known, but not its video.
         let mut cached = definitions(&doorbell_with_channels());
+        cached.truncate(1);
         cached[0].video = None;
         assert_eq!(devices.add(&cached, &store, &db).unwrap(), 1);
         let aid = devices.handles[&("camera", "cam1".to_owned())].aid;
         let before = db.layout();
         assert_eq!(db.read(aid, iid::STREAMS[0] + 3), Err(harbormaster_hap::model::status::NOT_FOUND));
 
-        // The console is reached and reports the camera's streams.
-        assert_eq!(devices.add(&definitions(&doorbell_with_channels()), &store, &db).unwrap(), 1);
+        // The console is reached and reports the camera's streams, and
+        // with them its package camera.
+        assert_eq!(devices.add(&definitions(&doorbell_with_channels()), &store, &db).unwrap(), 2);
+        assert_ne!(devices.handles[&("camera", "cam1#lens2".to_owned())].aid, aid, "the second lens is its own accessory");
         assert_eq!(devices.handles[&("camera", "cam1".to_owned())].aid, aid, "same accessory id");
         assert_ne!(db.layout(), before, "controllers must be told the accessory changed");
         assert_eq!(devices.handles[&("camera", "cam1".to_owned())].streams.len(), 2);
         assert!(db.read(aid, iid::STREAMS[0] + 3).is_ok() && db.read(aid, iid::STREAMS[1] + 3).is_ok());
-        assert_eq!(live.inner.read().unwrap().cameras.get(&aid).map(String::as_str), Some("cam1"));
+        assert_eq!(live.inner.read().unwrap().cameras.get(&aid), Some(&("cam1".to_owned(), 0)));
         // Unchanged definitions are left alone.
         assert_eq!(devices.add(&definitions(&doorbell_with_channels()), &store, &db).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);

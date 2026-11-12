@@ -175,6 +175,15 @@ impl Client {
     /// A current still image from a camera, as JPEG. The console scales it
     /// to about the requested size.
     pub async fn snapshot(&self, camera_id: &str, width: u32, height: u32) -> Result<Bytes, Error> {
+        self.still(camera_id, "snapshot", width, height).await
+    }
+
+    /// A current still from a doorbell's downward-facing package camera.
+    pub async fn package_snapshot(&self, camera_id: &str, width: u32, height: u32) -> Result<Bytes, Error> {
+        self.still(camera_id, "package-snapshot", width, height).await
+    }
+
+    async fn still(&self, camera_id: &str, which: &str, width: u32, height: u32) -> Result<Bytes, Error> {
         if self.session.is_none() {
             return Err(Error::NotSignedIn);
         }
@@ -186,7 +195,7 @@ impl Client {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
         let path = format!(
-            "/proxy/protect/api/cameras/{camera_id}/snapshot?ts={now}&force=true&w={width}&h={height}"
+            "/proxy/protect/api/cameras/{camera_id}/{which}?ts={now}&force=true&w={width}&h={height}"
         );
         let response = self.send(self.request(Method::GET, &path, Bytes::new())).await?;
         match response.status() {
