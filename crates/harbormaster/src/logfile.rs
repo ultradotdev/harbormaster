@@ -126,7 +126,10 @@ pub fn show(state_dir: &Path, count: usize, follow: bool) -> Result<()> {
             return Ok(());
         }
     }
-    while follow {
+    if !follow {
+        return Ok(());
+    }
+    loop {
         std::thread::sleep(std::time::Duration::from_millis(250));
         let Ok(length) = std::fs::metadata(&path).map(|m| m.len()) else { continue };
         // A shorter file is a new one: the old was rotated away.
@@ -148,7 +151,6 @@ pub fn show(state_dir: &Path, count: usize, follow: bool) -> Result<()> {
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
