@@ -43,9 +43,11 @@ Commands:
   daemon   run the HomeKit bridge
   unlock   give the running daemon the UniFi Protect password. It is read
            from the Keychain (unlocking it if need be) or asked for here
-  service install | uninstall | status
+  service install | uninstall | status | restart | stop | start
            run the daemon as a service that starts at boot and is restarted
-           if it stops, remove that service, or say what is running
+           if it stops, remove that service, say what is running, restart
+           it, or stop it until it is started again
+  logs     print the end of the daemon's log; --follow keeps printing
   protect-check
            test the UniFi Protect connection and list its cameras
   protect-capture
@@ -66,6 +68,8 @@ Options:
                     runs while you are logged in at the screen. The default
                     is a system service that runs as you from boot
   --stdin           unlock: read the password from standard input instead
+  --follow, -f      logs: keep printing new lines until interrupted
+  --lines N, -n N   logs: how many lines to print first (default 40)
   --seconds N       protect-capture, protect-feed: how long to record (default 120)
   --camera NAME     protect-feed: which camera (default: the first in `devices`)
   --channel N       protect-feed: which quality, 0 being the best (default 0)
@@ -78,6 +82,10 @@ enum Command {
     ServiceInstall,
     ServiceUninstall,
     ServiceStatus,
+    ServiceRestart,
+    ServiceStop,
+    ServiceStart,
+    Logs,
     ProtectCheck,
     ProtectCapture,
     ProtectFeed,
@@ -94,6 +102,8 @@ struct Args {
     /// Whether --listen was given, rather than left at its default.
     listen_given: bool,
     stdin: bool,
+    follow: bool,
+    lines: usize,
     seconds: u64,
     camera: Option<String>,
     channel: u8,
@@ -116,6 +126,8 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
         user_agent: false,
         listen_given: false,
         stdin: false,
+        follow: false,
+        lines: 40,
         seconds: 120,
         camera: None,
         channel: 0,
@@ -133,9 +145,15 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
                     Some("install") => Command::ServiceInstall,
                     Some("uninstall") => Command::ServiceUninstall,
                     Some("status") => Command::ServiceStatus,
-                    _ => bail!("service needs one of: install, uninstall, status"),
+                    Some("restart") => Command::ServiceRestart,
+                    Some("stop") => Command::ServiceStop,
+                    Some("start") => Command::ServiceStart,
+                    _ => bail!("service needs one of: install, uninstall, status, restart, stop, start"),
                 }
             }
+            "logs" => args.command = Command::Logs,
+            "--follow" | "-f" => args.follow = true,
+            "--lines" | "-n" => args.lines = value()?.parse().context("--lines expects a number")?,
             "--user-agent" => args.user_agent = true,
             "protect-check" => args.command = Command::ProtectCheck,
             "protect-capture" => args.command = Command::ProtectCapture,
@@ -171,6 +189,10 @@ fn main() -> Result<()> {
     match args.command {
         Command::Tui => tui::run(&args.state_dir),
         Command::Unlock => unlock::run(&args.state_dir, args.stdin),
+        Command::Logs => logfile::show(&args.state_dir, args.lines, args.follow),
+        Command::ServiceRestart => service::restart(&args.state_dir),
+        Command::ServiceStop => service::stop(&args.state_dir),
+        Command::ServiceStart => service::start(&args.state_dir),
         Command::ServiceInstall | Command::ServiceUninstall | Command::ServiceStatus => {
             let options = service::Options {
                 scope: if args.user_agent { service::Scope::User } else { service::Scope::System },
@@ -246,7 +268,13 @@ mod tests {
         let install = parse(&["service", "install", "--user-agent", "--demo"]).unwrap();
         assert!(matches!(install.command, Command::ServiceInstall) && install.user_agent && !install.listen_given);
         assert!(matches!(parse(&["service", "status"]).unwrap().command, Command::ServiceStatus));
-        assert!(parse(&["service"]).is_err() && parse(&["service", "restart"]).is_err());
+        assert!(matches!(parse(&["service", "restart"]).unwrap().command, Command::ServiceRestart));
+        assert!(matches!(parse(&["service", "stop"]).unwrap().command, Command::ServiceStop));
+        assert!(matches!(parse(&["service", "start"]).unwrap().command, Command::ServiceStart));
+        assert!(parse(&["service"]).is_err() && parse(&["service", "bounce"]).is_err());
+        let logs = parse(&["logs", "-f", "-n", "5"]).unwrap();
+        assert!(matches!(logs.command, Command::Logs) && logs.follow && logs.lines == 5);
+        assert!(!parse(&["logs"]).unwrap().follow && parse(&["logs", "--lines", "x"]).is_err());
         let detached = parse(&["daemon", "--detached", "--listen", "127.0.0.1:1"]).unwrap();
         assert!(detached.detached && detached.listen_given);
         assert!(matches!(parse(&["unlock", "--stdin"]).unwrap(), Args { command: Command::Unlock, stdin: true, .. }));

@@ -142,6 +142,11 @@ pub trait Manager {
     fn load_steps(&self, spec: &Spec, staged: &Path, loaded: bool) -> Vec<Step>;
     /// The commands that stop the service and remove its file.
     fn unload_steps(&self, spec: &Spec, loaded: bool) -> Vec<Step>;
+    /// The commands that stop the service until it is started again or
+    /// the machine restarts, leaving its file in place.
+    fn stop_steps(&self, spec: &Spec) -> Vec<Step>;
+    /// The commands that start a stopped service from its file.
+    fn start_steps(&self, spec: &Spec) -> Vec<Step>;
     /// What the system says about the service, if it knows of it.
     fn loaded(&self, spec: &Spec) -> Option<String>;
 }
@@ -295,6 +300,54 @@ fn wait_for_daemon(state_dir: &Path, old_pid: Option<u32>) -> Option<control::St
     }
 }
 
+/// Where a link to the installed binary goes, so that it can be run as
+/// plain `harbormaster`. The directory is on the command path of every
+/// login shell on macOS and most other systems.
+const LINK: &str = "/usr/local/bin/harbormaster";
+
+/// Whether `link` is a link to `program`.
+fn linked(program: &Path, link: &Path) -> bool {
+    std::fs::read_link(link).is_ok_and(|target| target == program)
+}
+
+/// Links `link` to `program`, replacing a link that points elsewhere but
+/// never a real file. Returns whether the link is now in place.
+fn link_binary(program: &Path, link: &Path) -> bool {
+    if linked(program, link) {
+        return true;
+    }
+    match std::fs::symlink_metadata(link) {
+        Ok(present) if !present.file_type().is_symlink() => return false,
+        Ok(_) => drop(std::fs::remove_file(link)),
+        Err(_) => {}
+    }
+    if let Some(directory) = link.parent() {
+        let _ = std::fs::create_dir_all(directory);
+    }
+    std::os::unix::fs::symlink(program, link).is_ok()
+}
+
+/// Makes the installed binary runnable as plain `harbormaster`, or says
+/// how, since the directory usually belongs to the administrator.
+fn offer_link(spec: &Spec) {
+    let link = Path::new(LINK);
+    if linked(&spec.program, link) {
+        return;
+    }
+    if link_binary(&spec.program, link) {
+        println!("Linked {LINK}, so it can be run as plain `harbormaster`.");
+    } else if std::fs::symlink_metadata(link).is_ok_and(|present| !present.file_type().is_symlink()) {
+        println!("{LINK} is some other program, so no link was made there.");
+    } else {
+        println!(
+            "To run it as plain `harbormaster`, link it onto the command path. That takes\n\
+             administrator rights, so run these yourself:\n\n    sudo /bin/mkdir -p {}\n    sudo /bin/ln -sfn {} {LINK}\n",
+            link.parent().unwrap_or(Path::new("/")).display(),
+            quote(&spec.program.to_string_lossy()),
+        );
+    }
+}
+
 /// `harbormaster ARGS`, as the owner would type it for this installation.
 fn invocation(spec: &Spec, arguments: &str) -> String {
     let default = crate::default_state_dir().ok().and_then(|dir| std::fs::canonicalize(dir).ok());
@@ -303,7 +356,9 @@ fn invocation(spec: &Spec, arguments: &str) -> String {
     } else {
         format!(" --state-dir {}", quote(&spec.state_dir.to_string_lossy()))
     };
-    format!("{} {arguments}{state_dir}", quote(&spec.program.to_string_lossy()))
+    let program =
+        if linked(&spec.program, Path::new(LINK)) { "harbormaster".to_owned() } else { quote(&spec.program.to_string_lossy()) };
+    format!("{program} {arguments}{state_dir}")
 }
 
 /// One line on what the daemon is doing, for the end of a command.
@@ -352,6 +407,7 @@ pub fn install(state_dir: &Path, options: &Options) -> Result<()> {
         println!("Installed the binary at {}.", spec.program.display());
     }
     prepare_output(&spec)?;
+    offer_link(&spec);
 
     let other = Spec { scope: if spec.scope == Scope::System { Scope::User } else { Scope::System }, ..spec.clone() };
     if manager.unit_path(&other).exists() {
@@ -435,6 +491,11 @@ pub fn uninstall(state_dir: &Path, options: &Options) -> Result<()> {
         return Ok(());
     }
     let steps = manager.unload_steps(&spec, loaded);
+    // The link onto the command path goes too, if it is this installation's.
+    let link = Path::new(LINK);
+    if linked(&spec.program, link) && std::fs::remove_file(link).is_err() {
+        println!("The link at {LINK} is the administrator's to remove:\n\n    sudo /bin/rm {LINK}\n");
+    }
     if manager.needs_root(&spec) {
         println!("Removing the service takes administrator rights, so run these yourself:\n");
         for step in steps {
@@ -447,6 +508,85 @@ pub fn uninstall(state_dir: &Path, options: &Options) -> Result<()> {
         step.run()?;
     }
     println!("Removed the service. The state directory, with the pairing and the binary, is left as it is.");
+    Ok(())
+}
+
+/// The installed service, whichever way it was installed.
+fn installed(manager: &dyn Manager, state_dir: &Path) -> Result<Spec> {
+    let system = spec(state_dir, &Options { scope: Scope::System, listen: None, demo: false })?;
+    let user = Spec { scope: Scope::User, ..system.clone() };
+    [system.clone(), user]
+        .into_iter()
+        .find(|spec| manager.unit_path(spec).exists() || manager.loaded(spec).is_some())
+        .with_context(|| format!("no service is installed. Install it with:\n\n    {}\n", invocation(&system, "service install")))
+}
+
+/// Runs steps here, or prints them when they take administrator rights.
+/// Returns whether they were run.
+fn carry_out(manager: &dyn Manager, spec: &Spec, steps: Vec<Step>, what: &str) -> Result<bool> {
+    if manager.needs_root(spec) {
+        println!("{what} takes administrator rights, so run this yourself:\n");
+        for step in steps {
+            println!("    sudo {}", step.shell());
+        }
+        println!();
+        return Ok(false);
+    }
+    for step in steps {
+        step.run()?;
+    }
+    Ok(true)
+}
+
+/// Restarts the daemon. It runs as the owner, so the owner can tell it to
+/// stop, and the service manager starts it again.
+pub fn restart(state_dir: &Path) -> Result<()> {
+    let manager = manager()?;
+    let spec = installed(manager.as_ref(), state_dir)?;
+    if manager.loaded(&spec).is_none() {
+        bail!("the service is stopped. Start it with:\n\n    {}\n", invocation(&spec, "service start"));
+    }
+    let old_pid = client::state(&spec.state_dir).ok().map(|state| state.pid);
+    match old_pid {
+        Some(pid) => {
+            println!("Restarting the daemon (pid {pid})...");
+            stop_daemon(&spec.state_dir, pid);
+        }
+        None => println!("No daemon is answering; waiting for the service to start one..."),
+    }
+    report_started(&spec, old_pid)
+}
+
+/// Stops the service until `service start` or the next reboot.
+pub fn stop(state_dir: &Path) -> Result<()> {
+    let manager = manager()?;
+    let spec = installed(manager.as_ref(), state_dir)?;
+    if manager.loaded(&spec).is_none() {
+        println!("The service is already stopped.");
+        return Ok(());
+    }
+    if carry_out(manager.as_ref(), &spec, manager.stop_steps(&spec), "Stopping the service")? {
+        println!("Stopped.");
+    }
+    println!(
+        "It stays stopped until the machine restarts or you run:\n\n    {}\n",
+        invocation(&spec, "service start")
+    );
+    Ok(())
+}
+
+/// Starts a service stopped with `service stop`.
+pub fn start(state_dir: &Path) -> Result<()> {
+    let manager = manager()?;
+    let spec = installed(manager.as_ref(), state_dir)?;
+    if manager.loaded(&spec).is_some() {
+        println!("The service is already started.");
+        return report_started(&spec, None);
+    }
+    if carry_out(manager.as_ref(), &spec, manager.start_steps(&spec), "Starting the service")? {
+        return report_started(&spec, None);
+    }
+    println!("Then give it the Protect password:\n\n    {}\n", invocation(&spec, "unlock"));
     Ok(())
 }
 
@@ -485,6 +625,25 @@ pub fn status(state_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_command_path_link_replaces_a_stale_link_but_never_a_file() {
+        let dir = temp_dir("link");
+        let (program, link) = (dir.join("bin/harbormaster"), dir.join("path/harbormaster"));
+        assert!(!linked(&program, &link));
+        assert!(link_binary(&program, &link), "the directory is made if need be");
+        assert!(linked(&program, &link) && link_binary(&program, &link), "and once is enough");
+        // A link left by an installation elsewhere is pointed here.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere"), &link).unwrap();
+        assert!(link_binary(&program, &link) && linked(&program, &link));
+        // Some other program of the same name is left alone.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, "not ours").unwrap();
+        assert!(!link_binary(&program, &link));
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "not ours");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_dir(name: &str) -> PathBuf {

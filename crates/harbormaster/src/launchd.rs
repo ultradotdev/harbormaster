@@ -143,6 +143,15 @@ impl Manager for Launchd {
         steps
     }
 
+    fn stop_steps(&self, spec: &Spec) -> Vec<Step> {
+        // Unloading is the only way to stop a job that launchd keeps alive.
+        vec![Step::new([LAUNCHCTL, "bootout", &format!("{}/{}", domain(spec), spec.label)])]
+    }
+
+    fn start_steps(&self, spec: &Spec) -> Vec<Step> {
+        vec![Step::new([LAUNCHCTL, "bootstrap", &domain(spec)]).path(&self.unit_path(spec)).retried()]
+    }
+
     fn loaded(&self, spec: &Spec) -> Option<String> {
         let output = Command::new(LAUNCHCTL)
             .args(["print", &format!("{}/{}", domain(spec), spec.label)])
@@ -264,6 +273,11 @@ mod tests {
                 "/bin/rm -f /Library/LaunchDaemons/dev.ultra.harbormaster.plist",
             ]
         );
+        // Stopping leaves the file where it is, for starting again.
+        let stop: Vec<String> = Launchd.stop_steps(&system).iter().map(Step::shell).collect();
+        assert_eq!(stop, ["/bin/launchctl bootout system/dev.ultra.harbormaster"]);
+        let start: Vec<String> = Launchd.start_steps(&system).iter().map(Step::shell).collect();
+        assert_eq!(start, ["/bin/launchctl bootstrap system /Library/LaunchDaemons/dev.ultra.harbormaster.plist"]);
     }
 
     #[test]

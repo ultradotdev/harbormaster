@@ -93,6 +93,64 @@ impl<S: Subscriber> Layer<S> for LogFile {
     }
 }
 
+/// The last `count` lines of the log, reaching back into the older file
+/// if the current one is short.
+fn tail(state_dir: &Path, count: usize) -> Vec<String> {
+    let read = |name: &str| std::fs::read(state_dir.join(name)).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let current = read(FILE_NAME).unwrap_or_default();
+    let mut lines: Vec<String> = current.lines().map(str::to_owned).collect();
+    if lines.len() < count {
+        let older = read(ROTATED_NAME).unwrap_or_default();
+        let mut all: Vec<String> = older.lines().map(str::to_owned).collect();
+        all.append(&mut lines);
+        lines = all;
+    }
+    lines.split_off(lines.len().saturating_sub(count))
+}
+
+/// `harbormaster logs`: prints the end of the log and, with `follow`,
+/// every line written from then on until interrupted.
+pub fn show(state_dir: &Path, count: usize, follow: bool) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = state_dir.join(FILE_NAME);
+    if !path.exists() {
+        anyhow::bail!("there is no log yet at {}", path.display());
+    }
+    let mut out = std::io::stdout().lock();
+    // Whoever reads the output may stop early (`| head`); that is no error.
+    let mut print = |text: &str| out.write_all(text.as_bytes()).and_then(|()| out.flush()).is_ok();
+    // Where the file ends now, so that following starts after what is shown.
+    let mut position = std::fs::metadata(&path).map_or(0, |m| m.len());
+    for line in tail(state_dir, count) {
+        if !print(&format!("{line}\n")) {
+            return Ok(());
+        }
+    }
+    while follow {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let Ok(length) = std::fs::metadata(&path).map(|m| m.len()) else { continue };
+        // A shorter file is a new one: the old was rotated away.
+        if length < position {
+            position = 0;
+        }
+        if length == position {
+            continue;
+        }
+        let mut fresh = Vec::new();
+        let read = File::open(&path).and_then(|mut file| {
+            file.seek(SeekFrom::Start(position))?;
+            file.take(length - position).read_to_end(&mut fresh)
+        });
+        if read.is_ok() {
+            position += fresh.len() as u64;
+            if !print(&String::from_utf8_lossy(&fresh)) {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +196,20 @@ mod tests {
         let hour = |at: u64| clock::date_time(at, -8 * 3600)[..13].to_owned();
         assert!(lines[1].starts_with(&hour(now)) || lines[1].starts_with(&hour(now - 5)), "not Pacific time: {text}");
         assert_eq!(mode(&dir.join(FILE_NAME)), 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_end_of_the_log_reaches_into_the_older_file() {
+        let dir = temp_dir("tail");
+        assert!(tail(&dir, 5).is_empty() && show(&dir, 5, false).is_err(), "no log yet");
+        std::fs::write(dir.join(ROTATED_NAME), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(dir.join(FILE_NAME), "four\nfive\n").unwrap();
+        assert_eq!(tail(&dir, 1), ["five"]);
+        assert_eq!(tail(&dir, 2), ["four", "five"]);
+        assert_eq!(tail(&dir, 4), ["two", "three", "four", "five"]);
+        assert_eq!(tail(&dir, 50).len(), 5);
+        assert!(show(&dir, 2, false).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
