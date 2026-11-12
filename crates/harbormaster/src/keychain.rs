@@ -78,6 +78,51 @@ pub fn lookup(service: &str, account: &str, patience: Option<Duration>) -> Resul
     Ok(password)
 }
 
+/// Stores a password in the user's Keychain, replacing one already there.
+/// It is handed to `security` on its input, never on a command line, where
+/// other programs could read it.
+pub fn store(service: &str, account: &str, password: &Secret) -> Result<(), Failure> {
+    use std::io::Write;
+    let quoted = |text: &str| format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""));
+    if [service, account, password.expose()].iter().any(|text| text.contains(['\n', '\r'])) {
+        return Err(Failure::Other("a password with a line break in it cannot be stored".into()));
+    }
+    let mut child = Command::new("/usr/bin/security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Failure::Other(format!("running /usr/bin/security: {e}")))?;
+    let mut line = format!(
+        "add-generic-password -U -s {} -a {} -w {}\n",
+        quoted(service),
+        quoted(account),
+        quoted(password.expose())
+    );
+    let sent = child.stdin.take().map(|mut input| input.write_all(line.as_bytes()));
+    zeroize::Zeroize::zeroize(&mut line);
+    let output = child.wait_with_output().map_err(|e| Failure::Other(format!("running /usr/bin/security: {e}")))?;
+    if !matches!(sent, Some(Ok(()))) {
+        return Err(Failure::Other("could not hand the password to /usr/bin/security".into()));
+    }
+    // `security -i` reports success whatever its commands did, so the
+    // proof is reading the password back.
+    match lookup(service, account, Some(Duration::from_secs(5))) {
+        Ok(stored) if stored.expose() == password.expose() => Ok(()),
+        Ok(_) => Err(Failure::Other("the Keychain holds a different password than the one given".into())),
+        Err(Failure::Missing(_)) => {
+            let said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            if said.contains("User interaction is not allowed") {
+                Err(Failure::Locked("the Keychain is locked".into()))
+            } else {
+                Err(Failure::Other(format!("the Keychain did not take the password{}", if said.is_empty() { String::new() } else { format!(": {said}") })))
+            }
+        }
+        Err(failure) => Err(failure),
+    }
+}
+
 /// Unlocks the login Keychain. `security` asks for the Mac login password
 /// on the terminal this runs in; Harbormaster never sees it.
 pub fn unlock_interactively() -> Result<()> {

@@ -327,11 +327,27 @@ fn link_binary(program: &Path, link: &Path) -> bool {
     std::os::unix::fs::symlink(program, link).is_ok()
 }
 
+/// Whether a `harbormaster` is already on the command path somewhere
+/// other than `link`, as it is when a package manager installed it.
+fn on_path_elsewhere(path: Option<&std::ffi::OsStr>, link: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let runnable = |candidate: &Path| {
+        candidate != link && std::fs::metadata(candidate).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    path.is_some_and(|path| std::env::split_paths(path).any(|directory| runnable(&directory.join("harbormaster"))))
+}
+
+/// Whether typing plain `harbormaster` runs this program.
+fn runs_by_name(spec: &Spec) -> bool {
+    let link = Path::new(LINK);
+    linked(&spec.program, link) || on_path_elsewhere(std::env::var_os("PATH").as_deref(), link)
+}
+
 /// Makes the installed binary runnable as plain `harbormaster`, or says
 /// how, since the directory usually belongs to the administrator.
 fn offer_link(spec: &Spec) {
     let link = Path::new(LINK);
-    if linked(&spec.program, link) {
+    if runs_by_name(spec) {
         return;
     }
     if link_binary(&spec.program, link) {
@@ -356,8 +372,7 @@ fn invocation(spec: &Spec, arguments: &str) -> String {
     } else {
         format!(" --state-dir {}", quote(&spec.state_dir.to_string_lossy()))
     };
-    let program =
-        if linked(&spec.program, Path::new(LINK)) { "harbormaster".to_owned() } else { quote(&spec.program.to_string_lossy()) };
+    let program = if runs_by_name(spec) { "harbormaster".to_owned() } else { quote(&spec.program.to_string_lossy()) };
     format!("{program} {arguments}{state_dir}")
 }
 
@@ -637,6 +652,15 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(dir.join("elsewhere"), &link).unwrap();
         assert!(link_binary(&program, &link) && linked(&program, &link));
+        // A copy a package manager put on the command path needs no link.
+        let brew = dir.join("brew");
+        std::fs::create_dir_all(&brew).unwrap();
+        let path = std::env::join_paths([dir.join("path"), brew.clone()]).unwrap();
+        assert!(!on_path_elsewhere(Some(&path), &link), "the link itself does not count");
+        std::fs::write(brew.join("harbormaster"), "").unwrap();
+        assert!(!on_path_elsewhere(Some(&path), &link), "nor does a file that cannot be run");
+        std::fs::set_permissions(brew.join("harbormaster"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert!(on_path_elsewhere(Some(&path), &link) && !on_path_elsewhere(None, &link));
         // Some other program of the same name is left alone.
         std::fs::remove_file(&link).unwrap();
         std::fs::write(&link, "not ours").unwrap();

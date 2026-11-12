@@ -22,6 +22,7 @@ mod qr;
 mod recording;
 mod secrets;
 mod service;
+mod setup;
 mod status;
 mod tty;
 mod tui;
@@ -39,6 +40,8 @@ const HELP: &str = "\
 Usage: harbormaster [COMMAND] [OPTIONS]
 
 Commands:
+  setup    first run: find the UniFi Protect console, sign in, write the
+           configuration and install the service, asking as it goes
   tui      attach the terminal interface to a running daemon (default)
   daemon   run the HomeKit bridge
   unlock   give the running daemon the UniFi Protect password. It is read
@@ -64,7 +67,8 @@ Options:
   --verbose         daemon: also log each event sent to a controller
   --detached        daemon: log to the file in the state directory only, not
                     to the terminal as well (the installed service uses this)
-  --user-agent      service: a per-user agent, which needs no sudo but only
+  --version         print the version
+  --user-agent      service, setup: a per-user agent, which needs no sudo but only
                     runs while you are logged in at the screen. The default
                     is a system service that runs as you from boot
   --stdin           unlock: read the password from standard input instead
@@ -76,6 +80,7 @@ Options:
   --lens N          protect-feed: which lens of a multi-lens camera (default 0)";
 
 enum Command {
+    Setup,
     Tui,
     Daemon,
     Unlock,
@@ -137,6 +142,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
     while let Some(arg) = input.next() {
         let mut value = || input.next().with_context(|| format!("{arg} needs a value"));
         match arg.as_str() {
+            "setup" => args.command = Command::Setup,
             "tui" => args.command = Command::Tui,
             "daemon" => args.command = Command::Daemon,
             "unlock" => args.command = Command::Unlock,
@@ -171,6 +177,10 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
             "--verbose" => args.verbose = true,
             "--stdin" => args.stdin = true,
             "--detached" => args.detached = true,
+            "--version" | "-V" => {
+                println!("harbormaster {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--help" | "-h" => {
                 println!("harbormaster {}\n\n{HELP}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -187,6 +197,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
 fn main() -> Result<()> {
     let args = parse_args(std::env::args().skip(1))?;
     match args.command {
+        Command::Setup => setup::run(&args.state_dir, args.user_agent),
         Command::Tui => tui::run(&args.state_dir),
         Command::Unlock => unlock::run(&args.state_dir, args.stdin),
         Command::Logs => logfile::show(&args.state_dir, args.lines, args.follow),

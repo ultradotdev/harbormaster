@@ -74,7 +74,7 @@ pub fn load(state_dir: &Path) -> Result<Config> {
     }
 }
 
-fn parse(text: &str) -> Result<Config> {
+pub(crate) fn parse(text: &str) -> Result<Config> {
     let config: Config = toml::from_str(text)?;
     if let Some(protect) = &config.protect {
         protect.check()?;
