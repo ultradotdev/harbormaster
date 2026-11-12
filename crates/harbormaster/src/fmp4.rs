@@ -49,6 +49,15 @@ pub fn video_track(init: &[u8]) -> Option<u32> {
     })
 }
 
+/// Whether an MP4 header describes a track of the given kind: `vide` for
+/// video, `soun` for sound.
+pub fn has_track(init: &[u8], handler: &[u8; 4]) -> bool {
+    let Some(moov) = child(init, b"moov") else { return false };
+    boxes(moov).filter(|(kind, _)| kind == b"trak").any(|(_, trak)| {
+        child(trak, b"mdia").and_then(|mdia| child(mdia, b"hdlr")).and_then(|h| h.get(8..12)) == Some(&handler[..])
+    })
+}
+
 /// Whether a fragment contains a keyframe of the given track, which makes
 /// it a place a decoder can start from.
 pub fn has_keyframe(fragment: &[u8], track: u32) -> bool {
@@ -186,6 +195,9 @@ mod tests {
         assert_eq!(video_track(&init), Some(2));
         assert_eq!(video_track(&boxed(b"moov", &track(1, b"soun"))), None);
         assert_eq!(video_track(b"garbage"), None);
+        assert!(has_track(&init, b"soun") && has_track(&init, b"vide"));
+        assert!(!has_track(&boxed(b"moov", &track(2, b"vide")), b"soun"), "a camera with its microphone off");
+        assert!(!has_track(b"garbage", b"soun"));
 
         assert!(has_keyframe(&fragment(2, &[KEY, DELTA]), 2));
         assert!(has_keyframe(&fragment(2, &[DELTA, KEY]), 2), "a keyframe anywhere in the fragment counts");

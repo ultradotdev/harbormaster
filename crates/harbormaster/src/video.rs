@@ -126,7 +126,7 @@ struct Pending {
     audio_ssrc: u32,
     connection: u64,
     /// Held so the port reported to the controller stays reserved.
-    socket: UdpSocket,
+    _socket: UdpSocket,
 }
 
 struct Running {
@@ -260,7 +260,7 @@ impl Stream {
             audio_ssrc,
         }
         .encode();
-        self.state.lock().unwrap().pending = Some(Pending { request, ssrc, audio_ssrc, connection, socket });
+        self.state.lock().unwrap().pending = Some(Pending { request, ssrc, audio_ssrc, connection, _socket: socket });
         Ok(Some(response))
     }
 
@@ -323,12 +323,73 @@ impl Stream {
     }
 
     fn start(self: &Arc<Self>, pending: Pending, video: SelectedVideo, audio: Option<SelectedAudio>) {
-        let Some(mut feed) = self.source.open(video.width) else {
+        let Some(feed) = self.source.open(video.width) else {
             tracing::warn!("{}: the camera became unreachable before the stream started", self.name);
             return;
         };
-        let args =
-            ffmpeg_args(&input_args(), &pending.request, &video, pending.ssrc, audio.as_ref().map(|a| (a, pending.audio_ssrc)));
+        let (stop, mut stopped) = oneshot::channel::<()>();
+        let session_id = pending.request.session_id;
+        {
+            let mut state = self.state.lock().unwrap();
+            // Replacing a previous stream drops its sender, which stops it.
+            state.running = Some(Running { session_id, connection: pending.connection, _stop: stop });
+        }
+        self.set_status(camera::STATUS_IN_USE);
+
+        let stream = self.clone();
+        tokio::spawn(async move {
+            // The reserved port is kept for as long as the stream lives.
+            let viewer = pending.request.controller_ip;
+            let began = std::time::Instant::now();
+            let progress = Arc::new(Progress::default());
+            stream.run(&pending, &video, audio, feed, &mut stopped, &progress).await;
+            // Whether video actually flowed, which other lines cannot say.
+            tracing::info!(
+                "{}: stream to {viewer} stopped after {:.0} s: the camera supplied {} kB; ffmpeg sent {} frames, {} kB",
+                stream.name,
+                began.elapsed().as_secs_f64(),
+                progress.received.load(Ordering::Relaxed) / 1000,
+                progress.frames.load(Ordering::Relaxed),
+                progress.sent.load(Ordering::Relaxed) / 1000
+            );
+            let mut state = stream.state.lock().unwrap();
+            if state.running.as_ref().is_some_and(|r| r.session_id == session_id) {
+                state.running = None;
+            }
+            if state.running.is_none() {
+                drop(state);
+                stream.set_status(camera::STATUS_AVAILABLE);
+            }
+        });
+    }
+
+    /// Runs one viewer's ffmpeg from the camera's first bytes until the
+    /// viewer leaves or the video ends.
+    async fn run(
+        &self,
+        pending: &Pending,
+        video: &SelectedVideo,
+        audio: Option<SelectedAudio>,
+        mut feed: mpsc::Receiver<Bytes>,
+        stopped: &mut oneshot::Receiver<()>,
+        progress: &Arc<Progress>,
+    ) {
+        let viewer = pending.request.controller_ip;
+        // The feed opens with a header naming its tracks.
+        let header = tokio::select! {
+            first = tokio::time::timeout(std::time::Duration::from_secs(10), feed.recv()) => match first {
+                Ok(Some(header)) => header,
+                _ => {
+                    tracing::warn!("{}: the camera sent no video for {viewer}", self.name);
+                    return;
+                }
+            },
+            _ = &mut *stopped => return,
+        };
+        // A camera whose microphone is off sends no sound track, and an
+        // ffmpeg told to send sound that is not there refuses to start.
+        let audio = audio.filter(|_| crate::fmp4::has_track(&header, b"soun"));
+        let args = ffmpeg_args(&input_args(), &pending.request, video, pending.ssrc, audio.as_ref().map(|a| (a, pending.audio_ssrc)));
         let mut command = tokio::process::Command::new(&self.ffmpeg);
         command.args(&args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut child = match command.spawn() {
@@ -339,7 +400,7 @@ impl Stream {
             }
         };
         tracing::info!(
-            "{}: streaming {}x{} at {} fps, {} kbps, {} to {}",
+            "{}: streaming {}x{} at {} fps, {} kbps, {} to {viewer}",
             self.name,
             video.width,
             video.height,
@@ -353,93 +414,57 @@ impl Stream {
                     a.max_bitrate_kbps
                 ),
                 None => "no sound".to_owned(),
-            },
-            pending.request.controller_ip
+            }
         );
-
-        let (stop, mut stopped) = oneshot::channel::<()>();
-        let session_id = pending.request.session_id;
-        {
-            let mut state = self.state.lock().unwrap();
-            // Replacing a previous stream drops its sender, which stops it.
-            state.running = Some(Running { session_id, connection: pending.connection, _stop: stop });
-        }
-        self.set_status(camera::STATUS_IN_USE);
 
         // Hand the camera's video to ffmpeg as it arrives. Closing ffmpeg's
         // input when the feed ends lets it finish cleanly.
         let stdin = child.stdin.take();
-        let progress = Arc::new(Progress::default());
         let counting = progress.clone();
         let writer = tokio::spawn(async move {
             let Some(mut stdin) = stdin else { return };
-            while let Some(data) = feed.recv().await {
+            let mut next = Some(header);
+            while let Some(data) = next {
                 counting.received.fetch_add(data.len() as u64, Ordering::Relaxed);
                 if stdin.write_all(&data).await.is_err() {
                     break;
                 }
+                next = feed.recv().await;
             }
         });
-
-        let stream = self.clone();
-        let stderr = child.stderr.take();
-        let viewer = pending.request.controller_ip;
-        let began = std::time::Instant::now();
-        tokio::spawn(async move {
-            // Keep the reserved port for as long as the stream lives.
-            let _socket = pending.socket;
-            if let Some(stderr) = stderr {
-                let name = stream.name.clone();
-                let progress = progress.clone();
-                tokio::spawn(async move {
-                    // ffmpeg repeats a complaint for every frame it cannot
-                    // use, so each distinct one is logged once and counted.
-                    let mut seen = Repeats::default();
-                    let mut lines = BufReader::new(stderr).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        if progress.note(&line) {
-                            continue;
-                        }
-                        if seen.first(&line) {
-                            tracing::warn!("{name}: ffmpeg: {line}");
-                        }
+        if let Some(stderr) = child.stderr.take() {
+            let (name, progress) = (self.name.clone(), progress.clone());
+            tokio::spawn(async move {
+                // ffmpeg repeats a complaint for every frame it cannot
+                // use, so each distinct one is logged once and counted.
+                let mut seen = Repeats::default();
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if progress.note(&line) {
+                        continue;
                     }
-                    for (line, extra) in seen.repeated() {
-                        tracing::warn!("{name}: ffmpeg: {line} ({extra} more like this)");
+                    if seen.first(&line) {
+                        tracing::warn!("{name}: ffmpeg: {line}");
                     }
-                });
-            }
-            tokio::select! {
-                exit = child.wait() => match exit {
-                    Ok(code) if code.success() => tracing::info!("{}: stream to {viewer} ended", stream.name),
-                    Ok(code) => tracing::warn!("{}: ffmpeg stopped unexpectedly ({code})", stream.name),
-                    Err(e) => tracing::warn!("{}: lost track of ffmpeg: {e}", stream.name),
-                },
-                // Fires when the sender is dropped, however the stream was ended.
-                _ = &mut stopped => {
-                    let _ = child.kill().await;
                 }
+                for (line, extra) in seen.repeated() {
+                    tracing::warn!("{name}: ffmpeg: {line} ({extra} more like this)");
+                }
+            });
+        }
+        tokio::select! {
+            exit = child.wait() => match exit {
+                Ok(code) if code.success() => tracing::info!("{}: stream to {viewer} ended", self.name),
+                Ok(code) => tracing::warn!("{}: ffmpeg stopped unexpectedly ({code})", self.name),
+                Err(e) => tracing::warn!("{}: lost track of ffmpeg: {e}", self.name),
+            },
+            // Fires when the sender is dropped, however the stream was ended.
+            _ = &mut *stopped => {
+                let _ = child.kill().await;
             }
-            // Whether video actually flowed, which the lines above cannot say.
-            tracing::info!(
-                "{}: stream to {viewer} stopped after {:.0} s: the camera supplied {} kB; ffmpeg sent {} frames, {} kB",
-                stream.name,
-                began.elapsed().as_secs_f64(),
-                progress.received.load(Ordering::Relaxed) / 1000,
-                progress.frames.load(Ordering::Relaxed),
-                progress.sent.load(Ordering::Relaxed) / 1000
-            );
-            // Dropping the feed is what tells the source to stop reading.
-            writer.abort();
-            let mut state = stream.state.lock().unwrap();
-            if state.running.as_ref().is_some_and(|r| r.session_id == session_id) {
-                state.running = None;
-            }
-            if state.running.is_none() {
-                drop(state);
-                stream.set_status(camera::STATUS_AVAILABLE);
-            }
-        });
+        }
+        // Dropping the feed is what tells the source to stop reading.
+        writer.abort();
     }
 }
 
