@@ -3,6 +3,7 @@
 //! `harbormaster daemon` runs the bridge. `harbormaster` (or `harbormaster
 //! tui`) attaches a terminal interface to a running daemon.
 
+mod client;
 mod clock;
 mod config;
 mod control;
@@ -10,15 +11,21 @@ mod daemon;
 mod demo;
 mod fmp4;
 mod keychain;
+mod launchd;
 mod logbuf;
+mod logfile;
 mod overrides;
+mod password;
 mod protect_bridge;
 mod protect_check;
 mod qr;
 mod recording;
 mod secrets;
+mod service;
 mod status;
+mod tty;
 mod tui;
+mod unlock;
 mod video;
 
 use std::net::SocketAddr;
@@ -34,6 +41,11 @@ Usage: harbormaster [COMMAND] [OPTIONS]
 Commands:
   tui      attach the terminal interface to a running daemon (default)
   daemon   run the HomeKit bridge
+  unlock   give the running daemon the UniFi Protect password. It is read
+           from the Keychain (unlocking it if need be) or asked for here
+  service install | uninstall | status
+           run the daemon as a service that starts at boot and is restarted
+           if it stops, remove that service, or say what is running
   protect-check
            test the UniFi Protect connection and list its cameras
   protect-capture
@@ -48,6 +60,12 @@ Options:
   --demo            daemon: publish simulated devices, to try the dashboard
                     without a UniFi Protect console
   --verbose         daemon: also log each event sent to a controller
+  --detached        daemon: log to the file in the state directory only, not
+                    to the terminal as well (the installed service uses this)
+  --user-agent      service: a per-user agent, which needs no sudo but only
+                    runs while you are logged in at the screen. The default
+                    is a system service that runs as you from boot
+  --stdin           unlock: read the password from standard input instead
   --seconds N       protect-capture, protect-feed: how long to record (default 120)
   --camera NAME     protect-feed: which camera (default: the first in `devices`)
   --channel N       protect-feed: which quality, 0 being the best (default 0)
@@ -56,6 +74,10 @@ Options:
 enum Command {
     Tui,
     Daemon,
+    Unlock,
+    ServiceInstall,
+    ServiceUninstall,
+    ServiceStatus,
     ProtectCheck,
     ProtectCapture,
     ProtectFeed,
@@ -67,6 +89,11 @@ struct Args {
     listen: SocketAddr,
     demo: bool,
     verbose: bool,
+    detached: bool,
+    user_agent: bool,
+    /// Whether --listen was given, rather than left at its default.
+    listen_given: bool,
+    stdin: bool,
     seconds: u64,
     camera: Option<String>,
     channel: u8,
@@ -85,6 +112,10 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
         listen: "0.0.0.0:51826".parse()?,
         demo: false,
         verbose: false,
+        detached: false,
+        user_agent: false,
+        listen_given: false,
+        stdin: false,
         seconds: 120,
         camera: None,
         channel: 0,
@@ -96,6 +127,16 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
         match arg.as_str() {
             "tui" => args.command = Command::Tui,
             "daemon" => args.command = Command::Daemon,
+            "unlock" => args.command = Command::Unlock,
+            "service" => {
+                args.command = match input.next().as_deref() {
+                    Some("install") => Command::ServiceInstall,
+                    Some("uninstall") => Command::ServiceUninstall,
+                    Some("status") => Command::ServiceStatus,
+                    _ => bail!("service needs one of: install, uninstall, status"),
+                }
+            }
+            "--user-agent" => args.user_agent = true,
             "protect-check" => args.command = Command::ProtectCheck,
             "protect-capture" => args.command = Command::ProtectCapture,
             "protect-feed" => args.command = Command::ProtectFeed,
@@ -104,9 +145,14 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
             "--channel" => args.channel = value()?.parse().context("--channel expects a small number")?,
             "--seconds" => args.seconds = value()?.parse().context("--seconds expects a number")?,
             "--state-dir" => args.state_dir = value()?.into(),
-            "--listen" => args.listen = value()?.parse().context("--listen expects ADDRESS:PORT")?,
+            "--listen" => {
+                args.listen = value()?.parse().context("--listen expects ADDRESS:PORT")?;
+                args.listen_given = true;
+            }
             "--demo" => args.demo = true,
             "--verbose" => args.verbose = true,
+            "--stdin" => args.stdin = true,
+            "--detached" => args.detached = true,
             "--help" | "-h" => {
                 println!("harbormaster {}\n\n{HELP}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -124,6 +170,19 @@ fn main() -> Result<()> {
     let args = parse_args(std::env::args().skip(1))?;
     match args.command {
         Command::Tui => tui::run(&args.state_dir),
+        Command::Unlock => unlock::run(&args.state_dir, args.stdin),
+        Command::ServiceInstall | Command::ServiceUninstall | Command::ServiceStatus => {
+            let options = service::Options {
+                scope: if args.user_agent { service::Scope::User } else { service::Scope::System },
+                listen: args.listen_given.then_some(args.listen),
+                demo: args.demo,
+            };
+            match args.command {
+                Command::ServiceInstall => service::install(&args.state_dir, &options),
+                Command::ServiceUninstall => service::uninstall(&args.state_dir, &options),
+                _ => service::status(&args.state_dir),
+            }
+        }
         Command::ProtectCheck => {
             tokio::runtime::Runtime::new()?.block_on(protect_check::run(&args.state_dir))
         }
@@ -139,8 +198,20 @@ fn main() -> Result<()> {
         )),
         Command::Daemon => {
             let logs = logbuf::LogBuffer::new();
+            // The log file lives in the state directory, which holds
+            // pairing keys and is the owner's alone.
+            daemon::create_private_dir(&args.state_dir)?;
+            if args.detached {
+                service::trim_output(&args.state_dir);
+            }
+            // In the foreground the terminal gets every line as well. A
+            // detached daemon's stderr is a file nothing rotates, so only
+            // what cannot go through the log (a panic, a failed start)
+            // ends up there.
+            let stderr = (!args.detached).then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
             tracing_subscriber::registry()
-                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .with(stderr)
+                .with(logfile::LogFile::open(&args.state_dir)?)
                 .with(if args.verbose {
                     tracing_subscriber::filter::LevelFilter::DEBUG
                 } else {
@@ -172,6 +243,13 @@ mod tests {
         let feed = parse(&["protect-feed", "--camera", "Front Door", "--channel", "1", "--seconds", "5"]).unwrap();
         assert!(matches!(feed.command, Command::ProtectFeed));
         assert_eq!((feed.camera.as_deref(), feed.channel, feed.seconds), (Some("Front Door"), 1, 5));
+        let install = parse(&["service", "install", "--user-agent", "--demo"]).unwrap();
+        assert!(matches!(install.command, Command::ServiceInstall) && install.user_agent && !install.listen_given);
+        assert!(matches!(parse(&["service", "status"]).unwrap().command, Command::ServiceStatus));
+        assert!(parse(&["service"]).is_err() && parse(&["service", "restart"]).is_err());
+        let detached = parse(&["daemon", "--detached", "--listen", "127.0.0.1:1"]).unwrap();
+        assert!(detached.detached && detached.listen_given);
+        assert!(matches!(parse(&["unlock", "--stdin"]).unwrap(), Args { command: Command::Unlock, stdin: true, .. }));
         assert!(parse(&["bogus"]).is_err());
         assert!(parse(&["--listen"]).is_err());
     }

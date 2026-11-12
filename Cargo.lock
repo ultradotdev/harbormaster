@@ -799,14 +799,19 @@ dependencies = [
  "bytes",
  "harbormaster-hap",
  "harbormaster-protect",
+ "libc",
  "qrcode",
  "ratatui",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

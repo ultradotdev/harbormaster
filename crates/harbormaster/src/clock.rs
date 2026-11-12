@@ -55,6 +55,25 @@ fn month_day(days: i64) -> (usize, i64) {
     (month as usize, day)
 }
 
+/// The year a day number since the epoch falls in.
+fn year(days: i64) -> i64 {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    // Years here begin in March, so January and February belong to the next.
+    year_of_era + era * 400 + i64::from(day_of_year >= 306)
+}
+
+/// `2026-11-12 14:03:22`, in the zone that is `offset` seconds ahead of
+/// UTC. This is what the log file is stamped with.
+pub fn date_time(unix_secs: u64, offset: i64) -> String {
+    let (day, _) = local_day(unix_secs, offset);
+    let (month, day_of_month) = month_day(day);
+    format!("{:04}-{month:02}-{day_of_month:02} {}", year(day), time_of_day(unix_secs, offset))
+}
+
 /// `14:03:22`, in the zone that is `offset` seconds ahead of UTC.
 pub fn time_of_day(unix_secs: u64, offset: i64) -> String {
     let (_, second) = local_day(unix_secs, offset);
@@ -102,6 +121,17 @@ mod tests {
         assert_eq!(stamp(1_709_208_000, 0, |_| 0), "Feb 29 12:00");
         assert_eq!(stamp(1_704_067_199, 0, |_| 0), "Dec 31 23:59");
         assert_eq!(stamp(1_704_067_200, 0, |_| 0), "Jan 1 00:00");
+    }
+
+    #[test]
+    fn full_dates_carry_the_right_year() {
+        assert_eq!(date_time(1_700_000_000, -8 * 3600), "2023-11-14 14:13:20");
+        assert_eq!(date_time(1_709_208_000, 0), "2024-02-29 12:00:00");
+        assert_eq!(date_time(1_704_067_199, 0), "2023-12-31 23:59:59");
+        assert_eq!(date_time(1_704_067_200, 0), "2024-01-01 00:00:00");
+        // New Year arrives early east of Greenwich.
+        assert_eq!(date_time(1_704_067_199, 3600), "2024-01-01 00:59:59");
+        assert_eq!(date_time(0, 0), "1970-01-01 00:00:00");
     }
 
     #[test]

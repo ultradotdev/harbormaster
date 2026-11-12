@@ -57,6 +57,13 @@ impl Visit for MessageVisitor {
     }
 }
 
+/// An event's message followed by its fields, as one line of text.
+pub fn message(event: &Event<'_>) -> String {
+    let mut visitor = MessageVisitor(String::new());
+    event.record(&mut visitor);
+    visitor.0
+}
+
 impl<S: Subscriber> Layer<S> for LogBuffer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let level = *event.metadata().level();
@@ -64,12 +71,10 @@ impl<S: Subscriber> Layer<S> for LogBuffer {
         if level > Level::INFO {
             return;
         }
-        let mut visitor = MessageVisitor(String::new());
-        event.record(&mut visitor);
         self.push(LogLine {
             time: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
             level: level.to_string(),
-            message: visitor.0,
+            message: message(event),
         });
     }
 }

@@ -27,6 +27,7 @@ use ratatui::Frame;
 
 use crate::clock;
 use crate::control::{self, Command, Device, LogLine, Message, State};
+use crate::password::Secret;
 
 /// Longest device name that can be typed, matching what the daemon accepts.
 const MAX_NAME: usize = crate::overrides::MAX_NAME;
@@ -67,11 +68,17 @@ enum Target {
     Device(String),
     Prefix,
     Suffix,
+    /// The UniFi Protect password, which is never shown.
+    Password,
 }
+
+/// Longest password that can be typed into the dashboard.
+const MAX_PASSWORD: usize = 256;
 
 impl Target {
     fn limit(&self) -> usize {
         match self {
+            Target::Password => MAX_PASSWORD,
             Target::Device(_) => MAX_NAME,
             Target::Prefix | Target::Suffix => MAX_AFFIX,
         }
@@ -202,6 +209,8 @@ impl App {
                     };
                     self.state = Some(state);
                 }
+                // The daemon's log says how an unlock went.
+                Message::Unlock(_) => {}
                 Message::Log(line) => {
                     // Keep the view anchored while the user is reading history.
                     if self.log_scroll > 0 && self.log_matches(&line) {
@@ -313,6 +322,17 @@ impl App {
         spans
     }
 
+    /// Whether the daemon is waiting to be given the Protect password.
+    fn waiting_for_password(&self) -> bool {
+        self.attached && self.state.as_ref().is_some_and(|s| s.console.as_ref().is_some_and(|c| c.waiting_for_password))
+    }
+
+    fn start_unlock(&mut self) {
+        if self.waiting_for_password() {
+            self.modal = Modal::Edit { target: Target::Password, input: String::new() };
+        }
+    }
+
     fn run(&mut self, action: Action) {
         match action {
             Action::ToggleShared => self.toggle_shared(),
@@ -341,8 +361,10 @@ impl App {
                     // Sent exactly as typed: the spaces are what separate it from the name.
                     Target::Prefix => Command::SetNamePrefix { text: Some(input) },
                     Target::Suffix => Command::SetNameSuffix { text: Some(input) },
+                    Target::Password => Command::Unlock { password: Secret::new(input) },
                 }),
-                KeyCode::Esc => {}
+                // A half-typed password is wiped rather than left in memory.
+                KeyCode::Esc => zeroize::Zeroize::zeroize(&mut input),
                 other => {
                     match other {
                         KeyCode::Char(c) if input.chars().count() < target.limit() => input.push(c),
@@ -391,6 +413,7 @@ impl App {
                     }
                     KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Devices,
                     KeyCode::Char('p') => self.modal = Modal::Setup,
+                    KeyCode::Char('u') => self.start_unlock(),
                     KeyCode::Char('s') => self.toggle_shared(),
                     KeyCode::Char('r') => self.start_rename(),
                     KeyCode::Char('P') => self.edit_affix(Target::Prefix),
@@ -614,7 +637,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     draw_devices(frame, app, list);
     draw_detail(frame, app, detail);
     draw_log(frame, app, log);
-    let hints = if app.selected_device().is_some_and(|d| d.key.is_some()) {
+    let hints = if app.waiting_for_password() {
+        " u unlock (type the Protect password)  ↑↓ select  Tab pane  w warnings  q quit"
+    } else if app.selected_device().is_some_and(|d| d.key.is_some()) {
         " ↑↓ select  Tab pane  s share  r rename  w warnings  f device log  q quit"
     } else {
         " ↑↓ select  Tab pane  P prefix  S suffix  w warnings  f log  p pair  q quit"
@@ -640,6 +665,12 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Modal::Edit { target, input } => {
             let cursor = Span::styled("▏", Style::new().fg(Color::Cyan));
             let (title, typed, hints) = match target {
+                // One dot per character, so the password is never on screen.
+                Target::Password => (
+                    "UniFi Protect password",
+                    Span::raw("•".repeat(input.chars().count())),
+                    [" Kept in the daemon's memory only, until it", " stops. `harbormaster unlock` does the same."],
+                ),
                 Target::Device(_) => (
                     "Name to publish",
                     Span::raw(input.clone()),
@@ -657,10 +688,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
                     [" Spaces count: start it with one to keep it", " apart from the name. Empty means none."],
                 ),
             };
+            let enter = if *target == Target::Password { " Enter signs in · Esc cancels" } else { " Enter saves · Esc cancels" };
             let lines = vec![
                 Line::from(vec![Span::raw(" "), typed, cursor]),
                 Line::raw(""),
-                Line::styled(" Enter saves · Esc cancels", DIM),
+                Line::styled(enter, DIM),
                 Line::styled(hints[0], DIM),
                 Line::styled(hints[1], DIM),
             ];
@@ -694,6 +726,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Some(c) if c.connected => {
             let age = c.last_update.map_or(String::new(), |at| format!(" · {}", duration(s.time.saturating_sub(at))));
             row(dot(Some(true)), "Console", vec![Span::raw(format!("{}{age}", c.host))])
+        }
+        Some(c) if c.waiting_for_password => {
+            row(Span::styled("○", WARN), "Console", vec![Span::styled("needs password (u)", WARN)])
         }
         Some(c) => row(dot(Some(false)), "Console", vec![Span::styled(format!("{} down", c.host), BAD)]),
         None => row(dot(None), "Console", vec![Span::styled("not configured", DIM)]),
@@ -787,8 +822,6 @@ fn affix_setting(label: &str, key: &str, text: &str) -> Line<'static> {
 
 /// The lines of the overview, and which of them can be clicked.
 fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Vec<(usize, Action)>) {
-    // The two lines after the first five fields are the name settings.
-    let actions = vec![(5, Action::Prefix), (6, Action::Suffix)];
     let mut lines = vec![
         field("Bridge", format!("{}  v{}", s.name, s.version)),
         field("Listening", format!("{}  configuration {}", s.listen, s.config_number)),
@@ -809,6 +842,10 @@ fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Ve
                     c.host,
                     c.last_update.map_or("not yet".to_owned(), |at| app.ago(at))
                 )),
+                Some(c) if c.waiting_for_password => Span::styled(
+                    "waiting for the Protect password",
+                    WARN,
+                ),
                 Some(c) => Span::styled(
                     format!(
                         "{} down{}",
@@ -820,11 +857,19 @@ fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Ve
                 None => Span::styled("no UniFi Protect configured", DIM),
             },
         ),
+    ];
+    // Why the console is not connected, when the daemon knows.
+    if let Some(problem) = s.console.as_ref().and_then(|c| c.problem.clone()) {
+        lines.push(field("", Span::styled(problem, DIM)));
+    }
+    // The next two lines are the name settings.
+    let actions = vec![(lines.len(), Action::Prefix), (lines.len() + 1, Action::Suffix)];
+    lines.extend([
         affix_setting("Name prefix", "P", &s.name_prefix),
         affix_setting("Name suffix", "S", &s.name_suffix),
         Line::raw(""),
         heading("Controllers"),
-    ];
+    ]);
     for c in &s.connections {
         let who = match &c.controller {
             // Pairing ids are long UUIDs; the first group is enough to tell them apart.
@@ -1148,6 +1193,7 @@ mod tests {
             ..Device::default()
         };
         State {
+            pid: 0,
             name: "Harbormaster 6C2C".into(),
             version: "0.1.0".into(),
             listen: "[::]:51826".into(),
@@ -1166,7 +1212,7 @@ mod tests {
             name_prefix: String::new(),
             name_suffix: String::new(),
             config_number: 12,
-            console: Some(Console { host: "192.0.2.1".into(), connected: true, last_update: Some(NOW - 2) }),
+            console: Some(Console { host: "192.0.2.1".into(), connected: true, last_update: Some(NOW - 2), ..Console::default() }),
             devices: vec![
                 Device {
                     motion: Some(true),
@@ -1471,9 +1517,40 @@ mod tests {
     }
 
     #[test]
+    fn waiting_for_the_password_is_shown_and_it_can_be_typed_unseen() {
+        let mut state = sample_state(true);
+        state.console = Some(Console {
+            host: "192.0.2.1".into(),
+            waiting_for_password: true,
+            problem: Some("the console rejected the username or password".into()),
+            ..Console::default()
+        });
+        let mut app = app_with(state);
+        let screen = render(&mut app);
+        assert_shows(&screen, &["needs password (u)", "waiting for the Protect password", "u unlock", "rejected the username"]);
+
+        app.handle(key(KeyCode::Char('u')));
+        for c in "correct horse".chars() {
+            app.handle(key(KeyCode::Char(c)));
+        }
+        let screen = render(&mut app);
+        assert_shows(&screen, &["UniFi Protect password", "•••••••••••••", "Enter signs in"]);
+        assert!(!screen.contains("correct") && !screen.contains("horse"), "{screen}");
+        app.handle(key(KeyCode::Enter));
+        assert_eq!(app.outbox, [Command::Unlock { password: Secret::new("correct horse".into()) }]);
+        assert_eq!(app.modal, Modal::None);
+
+        // With a password in hand there is nothing to unlock.
+        let mut app = app_with(sample_state(true));
+        app.handle(key(KeyCode::Char('u')));
+        assert_eq!(app.modal, Modal::None);
+        assert!(!render(&mut app).contains("u unlock"));
+    }
+
+    #[test]
     fn console_trouble_and_absence_are_plain() {
         let mut state = sample_state(true);
-        state.console = Some(Console { host: "192.0.2.1".into(), connected: false, last_update: Some(NOW - 300) });
+        state.console = Some(Console { host: "192.0.2.1".into(), connected: false, last_update: Some(NOW - 300), ..Console::default() });
         let screen = render(&mut app_with(state));
         assert_shows(&screen, &["Console 192.0.2.1 down", "192.0.2.1 down, heard 5m 00s ago"]);
 
