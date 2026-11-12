@@ -29,6 +29,10 @@ use crate::{config, secrets};
 /// vanish after a restart and forget their rooms and automations.
 const CACHE_FILE: &str = "protect-devices.json";
 
+/// How long the console may say nothing before the connection is presumed
+/// dead.
+const UPDATE_SILENCE: Duration = Duration::from_secs(90);
+
 /// Reserved instance ids, one block per optional service, so that enabling
 /// or disabling a feature in Protect never renumbers the others.
 mod iid {
@@ -720,10 +724,19 @@ impl ProtectBridge {
         );
 
         let mut updates = client.updates(bootstrap["lastUpdateId"].as_str()).await?;
-        while let Some(update) = updates.next().await? {
-            self.devices.apply_update(&self.db, &update);
+        // A busy site sends several updates a second and even a quiet one
+        // sends statistics every few seconds, so a long silence means the
+        // connection has died without saying so. Reconnect rather than sit
+        // deaf to motion and doorbell presses.
+        loop {
+            match tokio::time::timeout(UPDATE_SILENCE, updates.next()).await {
+                Ok(update) => match update? {
+                    Some(update) => self.devices.apply_update(&self.db, &update),
+                    None => return Ok(()),
+                },
+                Err(_) => anyhow::bail!("no updates for {} seconds", UPDATE_SILENCE.as_secs()),
+            }
         }
-        Ok(())
     }
 }
 
