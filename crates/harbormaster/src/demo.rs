@@ -244,7 +244,7 @@ impl Fleet {
         let viewer: IpAddr = [10, 0, 0, 23].into();
         let (mut watching, mut recording) = (None, None);
         tracing::info!("connected to UniFi Protect at {CONSOLE} ({} devices)", self.devices.len());
-        for second in 0u64.. {
+        for second in 0u64..=u64::MAX {
             tokio::time::sleep(Duration::from_secs(1)).await;
             board.console_update();
             if overrides::take_changed() && self.sync() {

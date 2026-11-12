@@ -20,6 +20,10 @@ env:
   CARGO_TERM_COLOR: always
   # Lints are errors here, so a warning cannot slip in unnoticed.
   RUSTFLAGS: -D warnings
+  # One named Rust version, the one the release is built with. "stable"
+  # moves every six weeks and brings new lints, which would fail changes
+  # that touched nothing. Raise this deliberately, fixing what it finds.
+  RUST_VERSION: "1.97.1"
 
 jobs:
   test:
@@ -31,7 +35,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy && rustup default "$RUST_VERSION"
       - name: Lint
         run: cargo clippy --workspace --all-targets --locked
       - name: Test
@@ -57,7 +61,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal && rustup default "$RUST_VERSION"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
