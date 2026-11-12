@@ -25,6 +25,8 @@ struct Inner {
     console_last_update: Option<u64>,
     /// What kind of Protect device each accessory is.
     kinds: BTreeMap<u64, &'static str>,
+    /// The key each accessory's owner choices are kept under.
+    keys: BTreeMap<u64, String>,
     last_motion: BTreeMap<u64, u64>,
     last_ring: BTreeMap<u64, u64>,
     next_id: u64,
@@ -83,6 +85,7 @@ pub struct Snapshot {
     pub console_connected: bool,
     pub console_last_update: Option<u64>,
     pub kinds: BTreeMap<u64, &'static str>,
+    pub keys: BTreeMap<u64, String>,
     pub last_motion: BTreeMap<u64, u64>,
     pub last_ring: BTreeMap<u64, u64>,
     pub viewers: Vec<Viewer>,
@@ -107,6 +110,7 @@ impl Status {
                 console_connected: false,
                 console_last_update: None,
                 kinds: BTreeMap::new(),
+                keys: BTreeMap::new(),
                 last_motion: BTreeMap::new(),
                 last_ring: BTreeMap::new(),
                 next_id: 0,
@@ -135,9 +139,20 @@ impl Status {
     }
 
     /// Notes what kind of Protect device an accessory is ("camera",
-    /// "sensor" or "light").
-    pub fn device_kind(&self, aid: u64, kind: &'static str) {
-        self.lock().kinds.insert(aid, kind);
+    /// "sensor" or "light") and the key its owner choices are kept under.
+    pub fn device_kind(&self, aid: u64, kind: &'static str, key: &str) {
+        let mut inner = self.lock();
+        inner.kinds.insert(aid, kind);
+        inner.keys.insert(aid, key.to_owned());
+    }
+
+    /// Forgets an accessory that is no longer published.
+    pub fn device_removed(&self, aid: u64) {
+        let mut inner = self.lock();
+        inner.kinds.remove(&aid);
+        inner.keys.remove(&aid);
+        inner.last_motion.remove(&aid);
+        inner.last_ring.remove(&aid);
     }
 
     pub fn motion(&self, aid: u64) {
@@ -173,6 +188,7 @@ impl Status {
             console_connected: inner.console_connected,
             console_last_update: inner.console_last_update,
             kinds: inner.kinds.clone(),
+            keys: inner.keys.clone(),
             last_motion: inner.last_motion.clone(),
             last_ring: inner.last_ring.clone(),
             viewers: inner

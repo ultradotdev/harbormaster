@@ -14,6 +14,21 @@ pub enum Message {
     Log(LogLine),
 }
 
+/// What an attached TUI may ask of the daemon, one JSON object per line.
+/// The socket is the owner's alone, so these need no further permission.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Command {
+    /// Share a device with HomeKit, or stop sharing it.
+    SetShared { key: String, shared: bool },
+    /// Publish a device under a new name, or under its own again if absent.
+    Rename {
+        key: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+}
+
 /// Every struct here defaults its missing fields and ignores unknown ones,
 /// so a TUI and a daemon of different versions can still talk.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -90,6 +105,12 @@ pub struct Console {
 #[serde(default)]
 pub struct Device {
     pub aid: u64,
+    /// Identifies the device in commands. Absent if it cannot be edited.
+    pub key: Option<String>,
+    /// The owner chose not to share this device with HomeKit.
+    pub hidden: bool,
+    /// The device's own name, when it is published under another.
+    pub protect_name: Option<String>,
     /// "camera", "doorbell", "light" or "sensor".
     pub kind: String,
     pub name: String,
@@ -205,6 +226,18 @@ mod tests {
         assert!(matches!(serde_json::from_str(r#"{"type":"log","message":"m"}"#).unwrap(), Message::Log(_)));
         // A message kind this build does not know is an error the TUI skips.
         assert!(serde_json::from_str::<Message>(r#"{"type":"metrics"}"#).is_err());
+    }
+
+    #[test]
+    fn commands_have_a_stable_wire_form() {
+        let share = Command::SetShared { key: "protect:camera:cam1".into(), shared: false };
+        assert_eq!(
+            serde_json::to_string(&share).unwrap(),
+            r#"{"type":"set_shared","key":"protect:camera:cam1","shared":false}"#
+        );
+        let rename: Command = serde_json::from_str(r#"{"type":"rename","key":"k","extra":1}"#).unwrap();
+        assert_eq!(rename, Command::Rename { key: "k".into(), name: None });
+        assert!(serde_json::from_str::<Command>(r#"{"type":"reboot"}"#).is_err());
     }
 
     /// The fields a TUI from before the dashboard insists on must stay.

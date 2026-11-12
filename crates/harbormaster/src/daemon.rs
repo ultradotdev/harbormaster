@@ -10,11 +10,12 @@ use anyhow::{bail, Context, Result};
 use harbormaster_hap::model::kind;
 use harbormaster_hap::{Accessory, Bridge, Characteristic, Config, Database, Format, Info, Store};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 
-use crate::control::{self, Message, Reading, State};
+use crate::control::{self, Command, Message, Reading, State};
+use crate::overrides::{self, Overrides};
 use crate::status;
 use crate::protect_bridge::ProtectBridge;
 use crate::config;
@@ -73,6 +74,7 @@ pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
     // Publish known Protect devices before HomeKit can connect, so that a
     // restart never looks like the accessories were removed.
     status::watch(status::global(), &db);
+    overrides::init(&options.state_dir);
     let protect = config::load(&options.state_dir)?.protect;
     let console_host = protect.as_ref().map(|p| p.host.clone());
     let protect = match protect {
@@ -218,13 +220,18 @@ fn print_setup(store: &Store) {
 }
 
 impl Daemon {
-    async fn serve_client(&self, mut stream: UnixStream) -> std::io::Result<()> {
-        async fn send(stream: &mut UnixStream, message: &Message) -> std::io::Result<()> {
+    async fn serve_client(&self, stream: UnixStream) -> std::io::Result<()> {
+        async fn send(stream: &mut tokio::net::unix::OwnedWriteHalf, message: &Message) -> std::io::Result<()> {
             let mut line = serde_json::to_vec(message).expect("control messages serialize");
             line.push(b'\n');
             stream.write_all(&line).await
         }
 
+        let (requests, mut stream) = stream.into_split();
+        // Requests are a few dozen bytes each. The cap on what one
+        // attachment may send keeps a runaway client from filling memory;
+        // a TUI that reaches it is dropped and simply attaches again.
+        let mut requests = BufReader::new(tokio::io::AsyncReadExt::take(requests, 1 << 20)).lines();
         let (backlog, mut live) = self.logs.attach();
         send(&mut stream, &Message::State(Box::new(self.state()))).await?;
         for line in backlog {
@@ -239,6 +246,20 @@ impl Daemon {
                     // A slow TUI just misses some lines.
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                },
+                request = requests.next_line() => match request? {
+                    Some(line) => {
+                        // A request this build does not know is ignored.
+                        if let Ok(command) = serde_json::from_str::<Command>(&line) {
+                            let connected = status::global().snapshot().console_connected;
+                            match run_command(overrides::global(), connected, &command) {
+                                Ok(done) => tracing::info!("{done}"),
+                                Err(why) => tracing::warn!("{why}"),
+                            }
+                            send(&mut stream, &Message::State(Box::new(self.state()))).await?;
+                        }
+                    }
+                    None => return Ok(()),
                 },
             }
         }
@@ -257,7 +278,7 @@ impl Daemon {
                 connected: board.console_connected,
                 last_update: board.console_last_update,
             }),
-            devices: devices(&database, &board),
+            devices: devices(&database, &board, overrides::global().map(Overrides::list).unwrap_or_default()),
             name: self.name.clone(),
             version: VERSION.to_owned(),
             listen: self.bridge.local_addr.to_string(),
@@ -332,9 +353,32 @@ fn accessories(db: &Value) -> Vec<control::Accessory> {
         .collect()
 }
 
-/// Works out what each published device is and what it is doing, from the
-/// HomeKit database and the status board. The bridge itself is left out.
-fn devices(db: &Value, board: &status::Snapshot) -> Vec<control::Device> {
+/// Carries out a request from the terminal interface. Returns what to log:
+/// what was done, or why it was not.
+fn run_command(overrides: Option<&Overrides>, connected: bool, command: &Command) -> Result<String, String> {
+    let overrides = overrides.ok_or("devices cannot be changed: no choices file is loaded")?;
+    // The bridge acts on a change when the console next speaks to it.
+    let when = if connected { "" } else { "; this takes effect when the console is reachable" };
+    match command {
+        Command::SetShared { key, shared } => {
+            let entry = overrides.set_shared(key, *shared)?;
+            let what = if *shared { "will be shared with HomeKit" } else { "will no longer be shared with HomeKit" };
+            Ok(format!("{}: {what}, as asked in the terminal{when}", entry.display_name()))
+        }
+        Command::Rename { key, name } => {
+            let entry = overrides.rename(key, name.as_deref())?;
+            Ok(match &entry.name {
+                Some(name) => format!("{}: will be published as {name}, as asked in the terminal{when}", entry.protect_name),
+                None => format!("{}: will be published under its own name again{when}", entry.protect_name),
+            })
+        }
+    }
+}
+
+/// Works out what each known device is and what it is doing, from the
+/// HomeKit database, the status board and the owner's choices. The bridge
+/// itself is left out; devices that are not shared come last.
+fn devices(db: &Value, board: &status::Snapshot, choices: Vec<(String, overrides::Entry)>) -> Vec<control::Device> {
     use harbormaster_hap::camera::kind::CAMERA_RTP_STREAM_MANAGEMENT;
     use harbormaster_hap::recording::kind::{ACTIVE, CAMERA_RECORDING_MANAGEMENT};
     fn list(v: &Value) -> &[Value] {
@@ -415,7 +459,25 @@ fn devices(db: &Value, board: &status::Snapshot) -> Vec<control::Device> {
             recording.active_secs = active.copied();
             (recording.last_at, recording.last_secs) = (last.map(|l| l.0), last.map(|l| l.1));
         }
+        if let Some((key, entry)) = board.keys.get(&aid).and_then(|key| choices.iter().find(|(k, _)| k == key)) {
+            device.key = Some(key.clone());
+            // Still published for the moment it takes the bridge to act.
+            device.hidden = entry.hidden;
+            device.protect_name = entry.name.as_ref().map(|_| entry.protect_name.clone());
+        }
         out.push(device);
+    }
+    for (key, entry) in choices {
+        if entry.hidden && !out.iter().any(|d| d.key.as_ref() == Some(&key)) {
+            out.push(control::Device {
+                name: entry.display_name().to_owned(),
+                protect_name: entry.name.as_ref().map(|_| entry.protect_name.clone()),
+                kind: entry.kind,
+                key: Some(key),
+                hidden: true,
+                ..control::Device::default()
+            });
+        }
     }
     out
 }
@@ -547,14 +609,39 @@ mod tests {
         db.add(yard);
 
         let board = status::Status::new();
-        board.device_kind(2, "camera");
-        board.device_kind(3, "sensor");
+        board.device_kind(2, "camera", "protect:camera:cam1");
+        board.device_kind(3, "sensor", "protect:sensor:sen2");
         board.ring(2);
         let _viewer = board.viewing(2, "::ffff:10.0.0.5".parse().unwrap(), 1280, 720);
         let _recording = board.recording("Front Door");
-        let view = devices(&db.to_json(), &board.snapshot());
+        let choices = Overrides::in_memory();
+        let known = |kind, id: &str, name: &str| crate::protect_bridge::DeviceDef {
+            kind,
+            id: id.into(),
+            name: name.into(),
+            model: String::new(),
+            mac: String::new(),
+            firmware: String::new(),
+            features: Default::default(),
+            video: None,
+        };
+        use crate::protect_bridge::Kind;
+        choices.apply(
+            vec![known(Kind::Camera, "cam1", "Front Door Cam"), known(Kind::Sensor, "sen2", "Yard"), known(Kind::Light, "lit1", "Floodlight")],
+            true,
+        );
+        choices.rename("protect:camera:cam1", Some("Front Door")).unwrap();
+        choices.set_shared("protect:light:lit1", false).unwrap();
+        let view = devices(&db.to_json(), &board.snapshot(), choices.list());
 
-        assert_eq!(view.len(), 2, "the bridge itself is not a device");
+        assert_eq!(view.len(), 3, "the bridge itself is not a device");
+        assert_eq!(view[0].key.as_deref(), Some("protect:camera:cam1"));
+        assert_eq!((view[0].hidden, view[0].protect_name.as_deref()), (false, Some("Front Door Cam")));
+        assert_eq!((view[1].key.as_deref(), view[1].protect_name.as_deref()), (Some("protect:sensor:sen2"), None));
+        // A device that is not shared is still listed, so it can be shared again.
+        let light = &view[2];
+        assert_eq!((light.name.as_str(), light.kind.as_str(), light.hidden, light.aid), ("Floodlight", "light", true, 0));
+        assert_eq!(light.key.as_deref(), Some("protect:light:lit1"));
         let door = &view[0];
         assert_eq!((door.kind.as_str(), door.name.as_str()), ("doorbell", "Front Door"));
         assert_eq!((door.online, door.motion), (Some(true), Some(true)));
@@ -568,6 +655,39 @@ mod tests {
         assert_eq!((yard.battery, yard.low_battery), (Some(93), Some(false)));
         assert_eq!(yard.readings[0].value, "17.2 °C");
         assert!(yard.recording.is_none() && yard.viewers.is_empty());
+    }
+
+    #[test]
+    fn terminal_requests_change_choices_and_say_what_happened() {
+        let choices = Overrides::in_memory();
+        let def = crate::protect_bridge::DeviceDef {
+            kind: crate::protect_bridge::Kind::Camera,
+            id: "cam1".into(),
+            name: "Front Door".into(),
+            model: String::new(),
+            mac: String::new(),
+            firmware: String::new(),
+            features: Default::default(),
+            video: None,
+        };
+        choices.apply(vec![def], true);
+        let key = "protect:camera:cam1".to_owned();
+
+        let hide = Command::SetShared { key: key.clone(), shared: false };
+        assert_eq!(
+            run_command(Some(&choices), true, &hide).unwrap(),
+            "Front Door: will no longer be shared with HomeKit, as asked in the terminal"
+        );
+        assert!(choices.is_hidden(&key));
+        let rename = Command::Rename { key: key.clone(), name: Some("Porch".into()) };
+        let said = run_command(Some(&choices), false, &rename).unwrap();
+        assert!(said.starts_with("Front Door: will be published as Porch") && said.contains("when the console is reachable"));
+        let restore = Command::Rename { key: key.clone(), name: Some("  ".into()) };
+        assert!(run_command(Some(&choices), true, &restore).unwrap().contains("its own name again"));
+
+        let unknown = Command::SetShared { key: "protect:camera:nope".into(), shared: false };
+        assert!(run_command(Some(&choices), true, &unknown).is_err());
+        assert!(run_command(None, true, &hide).is_err());
     }
 
     #[test]

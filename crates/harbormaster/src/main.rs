@@ -10,6 +10,7 @@ mod daemon;
 mod fmp4;
 mod keychain;
 mod logbuf;
+mod overrides;
 mod protect_bridge;
 mod protect_check;
 mod qr;

@@ -576,7 +576,7 @@ impl Devices {
             let aid = store.accessory_id(&def.store_key())?;
             let (accessory, handles) = build_accessory(aid, def, self.video.is_some());
             db.replace(accessory);
-            crate::status::global().device_kind(aid, def.kind.model_key());
+            crate::status::global().device_kind(aid, def.kind.model_key(), &def.store_key());
             if let Some(live) = &self.live {
                 install_light_control(db, live, aid, &handles, &def.id);
             }
@@ -785,6 +785,7 @@ impl ProtectBridge {
             Devices { video: ffmpeg.map(|path| (live.clone(), path)), live: Some(live.clone()), recorder, ..Devices::default() };
         let mut cached = load_cache(state_dir);
         cached.retain(|def| selected(def, config.devices.as_deref()));
+        let cached = crate::overrides::apply(cached, false);
         devices.add(&cached, &store, &db)?;
         if !cached.is_empty() {
             tracing::info!("publishing {} UniFi Protect devices from the last run", cached.len());
@@ -836,7 +837,9 @@ impl ProtectBridge {
             }
         }
         let defs: Vec<DeviceDef> = all.into_iter().filter(|def| selected(def, filter)).collect();
+        let defs = crate::overrides::apply(defs, true);
         let added = self.devices.add(&defs, &self.store, &self.db)?;
+        let added = added + self.devices.drop_where(&self.db, crate::overrides::hidden);
         if added > 0 {
             save_cache(&self.state_dir, &self.devices.defs);
             tracing::info!("added or updated {added} UniFi Protect devices");
@@ -856,6 +859,9 @@ impl ProtectBridge {
         // connection has died without saying so. Reconnect rather than sit
         // deaf to motion and doorbell presses.
         loop {
+            if crate::overrides::take_changed() {
+                self.refresh(bridge, &client).await?;
+            }
             match tokio::time::timeout(UPDATE_SILENCE, updates.next()).await {
                 Ok(update) => match update? {
                     Some(update) => self.devices.apply_update(&self.db, &update),
@@ -864,6 +870,117 @@ impl ProtectBridge {
                 Err(_) => anyhow::bail!("no updates for {} seconds", UPDATE_SILENCE.as_secs()),
             }
         }
+    }
+}
+
+impl Devices {
+    /// Stops publishing the devices `unwanted` picks out, such as those the
+    /// owner chose not to share. Returns how many accessories were removed.
+    fn drop_where(&mut self, db: &Database, unwanted: impl Fn(&DeviceDef) -> bool) -> usize {
+        let dropped: Vec<DeviceDef> = self.defs.iter().filter(|def| unwanted(def)).cloned().collect();
+        for def in &dropped {
+            if let Some(handles) = self.handles.remove(&(def.kind.model_key(), def.id.clone())) {
+                db.remove(handles.aid);
+                if let Some(recorder) = &self.recorder {
+                    recorder.remove(handles.aid);
+                }
+                if let Some((live, _)) = &self.video {
+                    live.inner.write().unwrap().cameras.remove(&handles.aid);
+                }
+                crate::status::global().device_removed(handles.aid);
+                tracing::info!("{} is no longer shared with HomeKit", handles.name);
+            }
+        }
+        self.defs.retain(|def| !unwanted(def));
+        dropped.len()
+    }
+}
+
+impl ProtectBridge {
+    /// Publishes again from a fresh inventory, after the owner changed
+    /// which devices are shared or what they are called.
+    async fn refresh(&mut self, bridge: &Bridge, client: &Client) -> Result<()> {
+        let bootstrap = client.bootstrap_raw().await?;
+        let filter = self.config.devices.as_deref();
+        let defs: Vec<DeviceDef> = definitions(&bootstrap).into_iter().filter(|def| selected(def, filter)).collect();
+        let defs = crate::overrides::apply(defs, true);
+        let changed = self.devices.add(&defs, &self.store, &self.db)?
+            + self.devices.drop_where(&self.db, crate::overrides::hidden);
+        if changed > 0 {
+            save_cache(&self.state_dir, &self.devices.defs);
+            bridge.config_changed();
+        }
+        self.devices.apply_snapshot(&self.db, &bootstrap);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sharing_tests {
+    use super::*;
+
+    #[test]
+    fn the_choices_key_is_the_accessory_id_key() {
+        for kind in [Kind::Camera, Kind::Sensor, Kind::Light] {
+            let def = DeviceDef {
+                kind,
+                id: "abc".into(),
+                name: "n".into(),
+                model: "m".into(),
+                mac: "AA".into(),
+                firmware: "1".into(),
+                features: Features::default(),
+                video: None,
+            };
+            assert_eq!(crate::overrides::key(&def), def.store_key());
+        }
+    }
+
+    #[test]
+    fn unsharing_removes_the_accessory_and_sharing_again_restores_its_id() {
+        let dir = std::env::temp_dir().join(format!("hm-protect-{}-sharing", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(dir.join("state.json")).unwrap());
+        let db = Database::new();
+        let overrides = crate::overrides::Overrides::in_memory();
+        let inventory = json!({
+            "cameras": [{"id": "cam1", "mac": "AA01", "name": "Front Door", "type": "G4", "state": "CONNECTED",
+                         "isMotionDetected": false}],
+            "sensors": [{"id": "sen1", "mac": "BB01", "name": "Yard", "type": "USL", "state": "CONNECTED",
+                         "mountType": "door", "isOpened": false}]
+        });
+        let publish = |devices: &mut Devices| {
+            let defs = overrides.apply(definitions(&inventory), true);
+            let added = devices.add(&defs, &store, &db).unwrap();
+            let removed = devices.drop_where(&db, |def| overrides.is_hidden(&crate::overrides::key(def)));
+            devices.apply_snapshot(&db, &inventory);
+            (added, removed)
+        };
+        let mut devices = Devices::default();
+        assert_eq!(publish(&mut devices), (2, 0));
+        let camera = devices.handles[&("camera", "cam1".to_owned())].aid;
+        let layout = db.layout();
+
+        overrides.set_shared("protect:camera:cam1", false).unwrap();
+        assert_eq!(publish(&mut devices), (0, 1));
+        assert!(!db.contains(camera) && devices.len() == 1);
+        assert_ne!(db.layout(), layout, "HomeKit must be told the accessory is gone");
+        // Updates for a device that is not shared are quietly ignored.
+        devices.apply(&db, "camera", "cam1", &json!({"isMotionDetected": true}), true);
+        assert_eq!(publish(&mut devices), (0, 0), "nothing more to do");
+
+        overrides.set_shared("protect:camera:cam1", true).unwrap();
+        overrides.rename("protect:camera:cam1", Some("Porch")).unwrap();
+        assert_eq!(publish(&mut devices), (1, 0));
+        assert_eq!(devices.handles[&("camera", "cam1".to_owned())].aid, camera, "the same accessory id comes back");
+        assert_eq!(devices.handles[&("camera", "cam1".to_owned())].name, "Porch");
+
+        // A rename alone rebuilds the one accessory under its new name.
+        overrides.rename("protect:sensor:sen1", Some("Back Yard")).unwrap();
+        assert_eq!(publish(&mut devices), (1, 0));
+        let names: Vec<&str> = devices.defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["Back Yard", "Porch"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -441,6 +441,18 @@ impl Recorder {
     }
 }
 
+impl Recorder {
+    /// Forgets a camera that is no longer published and stops buffering
+    /// its video.
+    pub fn remove(&self, aid: u64) {
+        if let Some(camera) = self.cameras.lock().unwrap().remove(&aid) {
+            if let Some(task) = camera.task.lock().unwrap().take() {
+                task.abort();
+            }
+        }
+    }
+}
+
 impl RecordingSource for Recorder {
     fn open(&self, aid: u64) -> Result<mpsc::Receiver<Vec<u8>>, Refusal> {
         let camera = self.cameras.lock().unwrap().get(&aid).cloned().ok_or(Refusal::Unexpected)?;
