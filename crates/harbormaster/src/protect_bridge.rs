@@ -946,6 +946,7 @@ impl ProtectBridge {
                 recorder,
                 ..Devices::default()
             };
+        devices.affix = crate::overrides::affix_from(&config.name_prefix, &config.name_suffix);
         let mut cached = load_cache(state_dir);
         cached.retain(|def| selected(def, config.devices.as_deref()));
         let cached = crate::overrides::apply(cached, false);
@@ -1002,6 +1003,9 @@ impl ProtectBridge {
         let defs: Vec<DeviceDef> = all.into_iter().filter(|def| selected(def, filter)).collect();
         // Sharing choices and names the owner set in the dashboard.
         let defs = crate::overrides::apply(defs, true);
+        if self.devices.retitle(crate::overrides::affix(), &self.store, &self.db)? > 0 {
+            bridge.republish();
+        }
         // Whatever is published but no longer wanted is withdrawn: deleted
         // in Protect, dropped from the filter, or unshared. A device in the
         // middle of being adopted is kept, so HomeKit does not forget its
@@ -1082,6 +1086,25 @@ impl Devices {
         }
         names.len()
     }
+
+    /// Puts a new prefix and suffix on every published name. Each
+    /// accessory is rebuilt under its new HomeKit name and keeps its
+    /// accessory id. Returns how many were rebuilt.
+    fn retitle(&mut self, affix: Option<(String, String)>, store: &Store, db: &Arc<Database>) -> Result<usize> {
+        let Some(affix) = affix.filter(|affix| *affix != self.affix) else { return Ok(0) };
+        tracing::info!("names sent to HomeKit now read \"{}<name>{}\"", affix.0, affix.1);
+        self.affix = affix;
+        // `add` skips definitions it already holds, so hand them back as new.
+        let defs = std::mem::take(&mut self.defs);
+        let rebuilt = self.add(&defs, store, db);
+        // Whatever a failure left out is still published under its old name.
+        for def in defs {
+            if !self.defs.iter().any(|d| d.kind == def.kind && d.id == def.id && d.lens == def.lens) {
+                self.defs.push(def);
+            }
+        }
+        rebuilt
+    }
 }
 
 impl ProtectBridge {
@@ -1092,11 +1115,14 @@ impl ProtectBridge {
         let filter = self.config.devices.as_deref();
         let defs: Vec<DeviceDef> = definitions(&bootstrap).into_iter().filter(|def| selected(def, filter)).collect();
         let defs = crate::overrides::apply(defs, true);
-        let changed = self.devices.add(&defs, &self.store, &self.db)?
+        let changed = self.devices.retitle(crate::overrides::affix(), &self.store, &self.db)?
+            + self.devices.add(&defs, &self.store, &self.db)?
             + self.devices.drop_where(&self.db, crate::overrides::hidden);
         if changed > 0 {
             save_cache(&self.state_dir, &self.devices.defs);
-            bridge.config_changed();
+            // A new name does not change the database's shape, so
+            // controllers are told to read it again regardless.
+            bridge.republish();
         }
         self.devices.apply_snapshot(&self.db, &bootstrap);
         Ok(())
@@ -1122,7 +1148,52 @@ mod sharing_tests {
                 lens: 0,
             };
             assert_eq!(crate::overrides::key(&def), def.store_key());
+            let second = DeviceDef { lens: 2, ..def };
+            assert_eq!(crate::overrides::key(&second), second.store_key());
         }
+    }
+
+    #[test]
+    fn a_new_prefix_renames_every_accessory_and_keeps_its_id() {
+        let dir = std::env::temp_dir().join(format!("hm-protect-{}-retitle", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(dir.join("state.json")).unwrap());
+        let db = Database::new();
+        let inventory = json!({
+            "cameras": [{"id": "cam1", "mac": "AA01", "name": "Front Door", "type": "G4", "state": "CONNECTED",
+                         "isMotionDetected": false}],
+            "sensors": [{"id": "sen1", "mac": "BB01", "name": "Yard", "type": "USL", "state": "CONNECTED",
+                         "mountType": "door", "isOpened": false}]
+        });
+        let mut devices = Devices { affix: ("HM ".into(), String::new()), ..Devices::default() };
+        devices.add(&definitions(&inventory), &store, &db).unwrap();
+        let aids: Vec<u64> = ["cam1", "sen1"]
+            .iter()
+            .zip(["camera", "sensor"])
+            .map(|(id, kind)| devices.handles[&(kind, id.to_string())].aid)
+            .collect();
+        // The name characteristic of the accessory information service.
+        let homekit_name = |aid: u64| db.read(aid, 5).unwrap();
+        assert_eq!(homekit_name(aids[0]), json!("HM Front Door"));
+        let layout = db.layout();
+
+        // No choices loaded, or the same affix: nothing is touched.
+        assert_eq!(devices.retitle(None, &store, &db).unwrap(), 0);
+        assert_eq!(devices.retitle(Some(("HM ".into(), String::new())), &store, &db).unwrap(), 0);
+
+        assert_eq!(devices.retitle(Some((String::new(), " (UP)".into())), &store, &db).unwrap(), 2);
+        assert_eq!(homekit_name(aids[0]), json!("Front Door (UP)"));
+        assert_eq!(homekit_name(aids[1]), json!("Yard (UP)"));
+        assert_eq!(devices.handles[&("camera", "cam1".to_owned())].aid, aids[0], "the accessory id is unchanged");
+        assert_eq!(devices.handles[&("sensor", "sen1".to_owned())].aid, aids[1]);
+        // The plain names are untouched, and nothing was added or lost.
+        let names: Vec<&str> = devices.defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["Front Door", "Yard"]);
+        assert_eq!(devices.handles[&("camera", "cam1".to_owned())].name, "Front Door");
+        assert_eq!(db.layout(), layout, "only names changed, which is why controllers must be told outright");
+        // Later inventories are not mistaken for changes.
+        assert_eq!(devices.add(&definitions(&inventory), &store, &db).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use crate::protect_bridge::DeviceDef;
 
 const FILE_NAME: &str = "devices.json";
+/// Where the prefix and suffix chosen in the dashboard are kept.
+const NAMES_FILE: &str = "names.json";
+/// Longest prefix or suffix accepted, as for `config.toml`.
+pub const MAX_AFFIX: usize = 24;
 /// Longest name accepted for a device.
 pub const MAX_NAME: usize = 64;
 
@@ -43,9 +47,29 @@ impl Entry {
     }
 }
 
+/// The text put before and after every name sent to HomeKit.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct Affix {
+    /// What was chosen in the dashboard. Absent means `config.toml` decides.
+    prefix: Option<String>,
+    suffix: Option<String>,
+    /// What `config.toml` says, which is never written back.
+    #[serde(skip)]
+    default: (String, String),
+}
+
+/// Which end of the name a piece of text goes on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum End {
+    Prefix,
+    Suffix,
+}
+
 pub struct Overrides {
     /// Where the choices are kept, if anywhere.
     path: Option<PathBuf>,
+    affix: Mutex<Affix>,
     entries: Mutex<BTreeMap<String, Entry>>,
     /// Set when a choice changed and the bridge has yet to act on it.
     changed: AtomicBool,
@@ -66,7 +90,25 @@ pub fn global() -> Option<&'static Overrides> {
 /// stable accessory id in the HomeKit store.
 pub fn key(def: &DeviceDef) -> String {
     let kind = serde_json::to_value(def.kind).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
-    format!("protect:{kind}:{}", def.id)
+    match def.lens {
+        0 => format!("protect:{kind}:{}", def.id),
+        // A camera's second lens is an accessory of its own.
+        lens => format!("protect:{kind}:{}:lens{lens}", def.id),
+    }
+}
+
+/// Notes the prefix and suffix `config.toml` asks for, and returns the ones
+/// to use: those chosen in the dashboard, where any were.
+pub fn affix_from(prefix: &str, suffix: &str) -> (String, String) {
+    match global() {
+        Some(overrides) => overrides.affix_from(prefix, suffix),
+        None => (prefix.to_owned(), suffix.to_owned()),
+    }
+}
+
+/// The prefix and suffix now in force, if choices are loaded.
+pub fn affix() -> Option<(String, String)> {
+    global().map(Overrides::affix)
 }
 
 /// Drops devices that are not shared and applies chosen names. `fresh` says
@@ -89,11 +131,80 @@ pub fn take_changed() -> bool {
     global().is_some_and(|overrides| overrides.changed.swap(false, Ordering::Relaxed))
 }
 
+/// Replaces a file in one step with one only its owner can read.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let temporary = path.with_extension("json.tmp");
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, path)
+}
+
 impl Overrides {
     /// Choices that are kept only in memory.
     #[cfg(test)]
     pub fn in_memory() -> Self {
-        Self { path: None, entries: Mutex::new(BTreeMap::new()), changed: AtomicBool::new(false) }
+        Self {
+            path: None,
+            affix: Mutex::new(Affix::default()),
+            entries: Mutex::new(BTreeMap::new()),
+            changed: AtomicBool::new(false),
+        }
+    }
+
+    fn lock_affix(&self) -> MutexGuard<'_, Affix> {
+        self.affix.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn affix_from(&self, prefix: &str, suffix: &str) -> (String, String) {
+        self.lock_affix().default = (prefix.to_owned(), suffix.to_owned());
+        self.affix()
+    }
+
+    pub fn affix(&self) -> (String, String) {
+        let affix = self.lock_affix();
+        (
+            affix.prefix.clone().unwrap_or_else(|| affix.default.0.clone()),
+            affix.suffix.clone().unwrap_or_else(|| affix.default.1.clone()),
+        )
+    }
+
+    /// Sets the text put before or after every name sent to HomeKit, or
+    /// with `None` goes back to what `config.toml` says. Returns the prefix
+    /// and suffix now in force, or why nothing was changed.
+    pub fn set_affix(&self, end: End, text: Option<&str>) -> Result<(String, String), String> {
+        let what = if end == End::Prefix { "prefix" } else { "suffix" };
+        if let Some(text) = text {
+            // The same limits as for `config.toml`.
+            if text.chars().count() > MAX_AFFIX {
+                return Err(format!("a name {what} can be at most {MAX_AFFIX} characters"));
+            }
+            if text.chars().any(char::is_control) {
+                return Err(format!("a name {what} cannot contain control characters"));
+            }
+        }
+        let mut affix = self.lock_affix();
+        let before = affix.clone();
+        let slot = if end == End::Prefix { &mut affix.prefix } else { &mut affix.suffix };
+        *slot = text.map(str::to_owned);
+        if *affix != before {
+            let saved = match &self.path {
+                Some(path) => serde_json::to_vec_pretty(&*affix)
+                    .map_err(std::io::Error::other)
+                    .and_then(|bytes| write_private(&path.with_file_name(NAMES_FILE), &bytes))
+                    .map_err(|e| format!("could not save {NAMES_FILE}: {e}")),
+                None => Ok(()),
+            };
+            if let Err(e) = saved {
+                *affix = before;
+                return Err(e);
+            }
+            self.changed.store(true, Ordering::Relaxed);
+        }
+        drop(affix);
+        Ok(self.affix())
     }
 
     pub fn load(path: PathBuf) -> Self {
@@ -104,7 +215,15 @@ impl Overrides {
             }),
             Err(_) => BTreeMap::new(),
         };
-        Self { path: Some(path), entries: Mutex::new(entries), changed: AtomicBool::new(false) }
+        let names = path.with_file_name(NAMES_FILE);
+        let affix = match std::fs::read(&names) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                tracing::warn!("ignoring unreadable {}: {e}", names.display());
+                Affix::default()
+            }),
+            Err(_) => Affix::default(),
+        };
+        Self { path: Some(path), affix: Mutex::new(affix), entries: Mutex::new(entries), changed: AtomicBool::new(false) }
     }
 
     fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Entry>> {
@@ -114,20 +233,11 @@ impl Overrides {
     /// Writes the devices that have a choice made about them; the rest need
     /// no record.
     fn save(&self, entries: &BTreeMap<String, Entry>) -> Result<(), String> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
         let Some(path) = &self.path else { return Ok(()) };
         let chosen: BTreeMap<&String, &Entry> = entries.iter().filter(|(_, e)| !e.is_default()).collect();
-        let temporary = path.with_extension("json.tmp");
         serde_json::to_vec_pretty(&chosen)
             .map_err(std::io::Error::other)
-            .and_then(|bytes| {
-                let mut file =
-                    std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&temporary)?;
-                file.write_all(&bytes)?;
-                file.sync_all()?;
-                std::fs::rename(&temporary, path)
-            })
+            .and_then(|bytes| write_private(path, &bytes))
             .map_err(|e| format!("could not save {}: {e}", path.display()))
     }
 
@@ -226,6 +336,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_second_lens_has_choices_of_its_own() {
+        let mut lens = def(Kind::Camera, "cam1", "Front Door Package Camera");
+        lens.lens = 2;
+        assert_eq!(key(&lens), "protect:camera:cam1:lens2");
+        let overrides = Overrides::in_memory();
+        overrides.apply(vec![def(Kind::Camera, "cam1", "Front Door"), lens.clone()], true);
+        overrides.set_shared("protect:camera:cam1:lens2", false).unwrap();
+        let published = overrides.apply(vec![def(Kind::Camera, "cam1", "Front Door"), lens], true);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].lens, 0);
+    }
+
     fn inventory() -> Vec<DeviceDef> {
         vec![def(Kind::Camera, "cam1", "Front Door"), def(Kind::Sensor, "sen1", "Yard")]
     }
@@ -263,6 +386,49 @@ mod tests {
         // A change that changes nothing does not disturb the bridge either.
         overrides.set_shared("protect:camera:cam1", true).unwrap();
         assert!(!overrides.changed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn prefix_and_suffix_default_to_the_config_and_keep_its_limits() {
+        let overrides = Overrides::in_memory();
+        assert_eq!(overrides.affix(), (String::new(), String::new()));
+        assert_eq!(overrides.affix_from("HM ", ""), ("HM ".to_owned(), String::new()), "the config decides at first");
+        assert!(!overrides.changed.load(Ordering::Relaxed));
+
+        // Spaces are kept exactly: they are what separates the name.
+        assert_eq!(overrides.set_affix(End::Suffix, Some(" (UP)")).unwrap(), ("HM ".to_owned(), " (UP)".to_owned()));
+        assert!(overrides.changed.swap(false, Ordering::Relaxed));
+        // An empty prefix is a choice too, and overrides the config.
+        assert_eq!(overrides.set_affix(End::Prefix, Some("")).unwrap().0, "");
+        // Going back to the config's.
+        assert_eq!(overrides.set_affix(End::Prefix, None).unwrap().0, "HM ");
+
+        overrides.changed.store(false, Ordering::Relaxed);
+        assert!(overrides.set_affix(End::Prefix, Some(&"x".repeat(MAX_AFFIX + 1))).is_err());
+        assert!(overrides.set_affix(End::Suffix, Some("a\tb")).is_err());
+        assert_eq!(overrides.set_affix(End::Suffix, Some(" (UP)")).unwrap().1, " (UP)", "unchanged");
+        assert!(!overrides.changed.load(Ordering::Relaxed), "refused and unchanged settings disturb nothing");
+        assert!(overrides.set_affix(End::Prefix, Some(&"é".repeat(MAX_AFFIX))).is_ok(), "characters, not bytes");
+    }
+
+    #[test]
+    fn prefix_and_suffix_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("hm-overrides-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let overrides = Overrides::load(dir.join(FILE_NAME));
+        overrides.affix_from("HM ", " cfg");
+        overrides.set_affix(End::Prefix, Some("UP ")).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let names = dir.join(NAMES_FILE);
+        assert_eq!(std::fs::metadata(&names).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!std::fs::read_to_string(&names).unwrap().contains("cfg"), "the config's values are not copied");
+
+        let reloaded = Overrides::load(dir.join(FILE_NAME));
+        // The chosen prefix holds; the suffix still follows the config, even if that changes.
+        assert_eq!(reloaded.affix_from("HM ", " new"), ("UP ".to_owned(), " new".to_owned()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

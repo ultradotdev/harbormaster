@@ -218,6 +218,16 @@ impl Store {
         Ok(true)
     }
 
+    /// Raises the configuration number although the database's shape is
+    /// unchanged, for a change controllers cache but the shape does not
+    /// show, such as an accessory's name.
+    pub fn bump_config_number(&self) -> Result<u32, StoreError> {
+        self.update(|s| {
+            s.config_number = if s.config_number >= 65535 { 1 } else { s.config_number + 1 };
+            s.config_number
+        })
+    }
+
     pub fn signing_key(&self) -> SigningKey {
         let bytes = from_hex(&self.state.lock().unwrap().secret_key).expect("validated on open");
         SigningKey::from_bytes(&bytes.try_into().expect("validated on open"))
@@ -290,6 +300,17 @@ mod tests {
         assert_eq!(store.accessory_id("tempest:1").unwrap(), 2);
         assert!(store.is_paired());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn configuration_can_be_bumped_without_a_layout_change() {
+        let path = temp_path("bump");
+        let store = Store::open(&path).unwrap();
+        store.sync_layout("one").unwrap();
+        let before = store.config_number();
+        assert_eq!(store.bump_config_number().unwrap(), before + 1);
+        assert!(!store.sync_layout("one").unwrap(), "the layout itself is still current");
+        assert_eq!(Store::open(&path).unwrap().config_number(), before + 1, "and the bump is saved");
     }
 
     #[test]

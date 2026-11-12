@@ -77,6 +77,9 @@ pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
     overrides::init(&options.state_dir);
     let protect = config::load(&options.state_dir)?.protect;
     let console_host = protect.as_ref().map(|p| p.host.clone());
+    // With no real console, the demo brings a pretend one.
+    let fleet = if options.demo && protect.is_none() { crate::demo::Fleet::publish(&store, &db)? } else { None };
+    let console_host = console_host.or(fleet.as_ref().map(|_| crate::demo::CONSOLE.to_owned()));
     let protect = match protect {
         Some(protect) => Some(ProtectBridge::prepare(&options.state_dir, protect, store.clone(), db.clone())?),
         None => None,
@@ -97,6 +100,9 @@ pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
 
     if let Some(protect) = protect {
         tokio::spawn(protect.run(bridge.clone()));
+    }
+    if let Some(fleet) = fleet {
+        tokio::spawn(fleet.run(bridge.clone()));
     }
 
     let daemon = Arc::new(Daemon { name, started: Instant::now(), store, db, bridge, logs, console_host });
@@ -270,6 +276,7 @@ impl Daemon {
         let now = SystemTime::now();
         let board = status::global().snapshot();
         let database = self.db.to_json();
+        let affix = overrides::affix().unwrap_or_default();
         State {
             time: now.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
             config_number: self.store.config_number(),
@@ -278,7 +285,9 @@ impl Daemon {
                 connected: board.console_connected,
                 last_update: board.console_last_update,
             }),
-            devices: devices(&database, &board, overrides::global().map(Overrides::list).unwrap_or_default()),
+            devices: devices(&database, &board, overrides::global().map(Overrides::list).unwrap_or_default(), &affix),
+            name_prefix: affix.0.clone(),
+            name_suffix: affix.1.clone(),
             name: self.name.clone(),
             version: VERSION.to_owned(),
             listen: self.bridge.local_addr.to_string(),
@@ -365,6 +374,15 @@ fn run_command(overrides: Option<&Overrides>, connected: bool, command: &Command
             let what = if *shared { "will be shared with HomeKit" } else { "will no longer be shared with HomeKit" };
             Ok(format!("{}: {what}, as asked in the terminal{when}", entry.display_name()))
         }
+        Command::SetNamePrefix { text } | Command::SetNameSuffix { text } => {
+            let (end, what) = match command {
+                Command::SetNamePrefix { .. } => (overrides::End::Prefix, "prefix"),
+                _ => (overrides::End::Suffix, "suffix"),
+            };
+            let (prefix, suffix) = overrides.set_affix(end, text.as_deref())?;
+            let source = if text.is_some() { "as asked in the terminal" } else { "as config.toml says" };
+            Ok(format!("names sent to HomeKit will read \"{prefix}<name>{suffix}\": {what} set {source}{when}"))
+        }
         Command::Rename { key, name } => {
             let entry = overrides.rename(key, name.as_deref())?;
             Ok(match &entry.name {
@@ -378,7 +396,12 @@ fn run_command(overrides: Option<&Overrides>, connected: bool, command: &Command
 /// Works out what each known device is and what it is doing, from the
 /// HomeKit database, the status board and the owner's choices. The bridge
 /// itself is left out; devices that are not shared come last.
-fn devices(db: &Value, board: &status::Snapshot, choices: Vec<(String, overrides::Entry)>) -> Vec<control::Device> {
+fn devices(
+    db: &Value,
+    board: &status::Snapshot,
+    choices: Vec<(String, overrides::Entry)>,
+    affix: &(String, String),
+) -> Vec<control::Device> {
     use harbormaster_hap::camera::kind::CAMERA_RTP_STREAM_MANAGEMENT;
     use harbormaster_hap::recording::kind::{ACTIVE, CAMERA_RECORDING_MANAGEMENT};
     fn list(v: &Value) -> &[Value] {
@@ -437,6 +460,12 @@ fn devices(db: &Value, board: &status::Snapshot, choices: Vec<(String, overrides
         if bridge {
             continue;
         }
+        // HomeKit's copy of the name carries the owner's prefix and suffix.
+        // Everything here, like the log, goes by the plain name.
+        if board.keys.contains_key(&aid) {
+            let plain = device.name.strip_prefix(affix.0.as_str()).unwrap_or(&device.name);
+            device.name = plain.strip_suffix(affix.1.as_str()).unwrap_or(plain).to_owned();
+        }
         device.kind = match (doorbell, board.kinds.get(&aid).copied()) {
             (true, _) => "doorbell",
             (false, Some(kind)) => kind,
@@ -461,6 +490,9 @@ fn devices(db: &Value, board: &status::Snapshot, choices: Vec<(String, overrides
         }
         if let Some((key, entry)) = board.keys.get(&aid).and_then(|key| choices.iter().find(|(k, _)| k == key)) {
             device.key = Some(key.clone());
+            if !entry.display_name().is_empty() {
+                device.name = entry.display_name().to_owned();
+            }
             // Still published for the moment it takes the bridge to act.
             device.hidden = entry.hidden;
             device.protect_name = entry.name.as_ref().map(|_| entry.protect_name.clone());
@@ -566,7 +598,7 @@ mod tests {
         bridge.add_service(kind::PROTOCOL_INFORMATION, false, vec![Characteristic::text(kind::VERSION, "1.1.0")]);
         db.add(bridge);
 
-        let mut door = Accessory::new(2, &info("Front Door"));
+        let mut door = Accessory::new(2, &info("HM Front Door (UP)"));
         door.add_service(
             kind::DOORBELL,
             true,
@@ -588,7 +620,7 @@ mod tests {
         );
         db.add(door);
 
-        let mut yard = Accessory::new(3, &info("Yard"));
+        let mut yard = Accessory::new(3, &info("HM Yard (UP)"));
         yard.add_service(
             kind::TEMPERATURE_SENSOR,
             true,
@@ -633,7 +665,8 @@ mod tests {
         );
         choices.rename("protect:camera:cam1", Some("Front Door")).unwrap();
         choices.set_shared("protect:light:lit1", false).unwrap();
-        let view = devices(&db.to_json(), &board.snapshot(), choices.list());
+        let affix = ("HM ".to_owned(), " (UP)".to_owned());
+        let view = devices(&db.to_json(), &board.snapshot(), choices.list(), &affix);
 
         assert_eq!(view.len(), 3, "the bridge itself is not a device");
         assert_eq!(view[0].key.as_deref(), Some("protect:camera:cam1"));
@@ -653,6 +686,7 @@ mod tests {
 
         let yard = &view[1];
         assert_eq!((yard.kind.as_str(), yard.online, yard.tampered), ("sensor", Some(false), Some(true)));
+        assert_eq!(yard.name, "Yard", "names are plain, without HomeKit's prefix and suffix");
         assert_eq!((yard.battery, yard.low_battery), (Some(93), Some(false)));
         assert_eq!(yard.readings[0].value, "17.2 °C");
         assert!(yard.recording.is_none() && yard.viewers.is_empty());
@@ -686,6 +720,18 @@ mod tests {
         assert!(said.starts_with("Front Door: will be published as Porch") && said.contains("when the console is reachable"));
         let restore = Command::Rename { key: key.clone(), name: Some("  ".into()) };
         assert!(run_command(Some(&choices), true, &restore).unwrap().contains("its own name again"));
+
+        // The prefix and suffix, spaces and all.
+        let prefix = Command::SetNamePrefix { text: Some("HM ".into()) };
+        let said = run_command(Some(&choices), true, &prefix).unwrap();
+        assert!(said.contains("\"HM <name>\"") && said.contains("prefix set as asked in the terminal"), "{said}");
+        let suffix = Command::SetNameSuffix { text: Some(" (UP)".into()) };
+        assert!(run_command(Some(&choices), true, &suffix).unwrap().contains("\"HM <name> (UP)\""));
+        assert_eq!(choices.affix(), ("HM ".to_owned(), " (UP)".to_owned()));
+        let reset = Command::SetNamePrefix { text: None };
+        assert!(run_command(Some(&choices), true, &reset).unwrap().contains("as config.toml says"));
+        let long = Command::SetNameSuffix { text: Some("x".repeat(25)) };
+        assert!(run_command(Some(&choices), true, &long).is_err());
 
         let unknown = Command::SetShared { key: "protect:camera:nope".into(), shared: false };
         assert!(run_command(Some(&choices), true, &unknown).is_err());
