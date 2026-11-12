@@ -77,6 +77,9 @@ pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
     overrides::init(&options.state_dir);
     let protect = config::load(&options.state_dir)?.protect;
     let console_host = protect.as_ref().map(|p| p.host.clone());
+    // With no real console, the demo brings a pretend one.
+    let fleet = if options.demo && protect.is_none() { crate::demo::Fleet::publish(&store, &db)? } else { None };
+    let console_host = console_host.or(fleet.as_ref().map(|_| crate::demo::CONSOLE.to_owned()));
     let protect = match protect {
         Some(protect) => Some(ProtectBridge::prepare(&options.state_dir, protect, store.clone(), db.clone())?),
         None => None,
@@ -97,6 +100,9 @@ pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
 
     if let Some(protect) = protect {
         tokio::spawn(protect.run(bridge.clone()));
+    }
+    if let Some(fleet) = fleet {
+        tokio::spawn(fleet.run(bridge.clone()));
     }
 
     let daemon = Arc::new(Daemon { name, started: Instant::now(), store, db, bridge, logs, console_host });

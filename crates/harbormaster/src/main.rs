@@ -7,6 +7,7 @@ mod clock;
 mod config;
 mod control;
 mod daemon;
+mod demo;
 mod fmp4;
 mod keychain;
 mod logbuf;
@@ -44,7 +45,8 @@ Options:
   --state-dir DIR   where config.toml, pairing state and the control socket live
   --listen ADDR     daemon: address and port to serve HomeKit on
                     (default 0.0.0.0:51826, which serves IPv4 and IPv6)
-  --demo            daemon: publish a simulated temperature sensor
+  --demo            daemon: publish simulated devices, to try the dashboard
+                    without a UniFi Protect console
   --verbose         daemon: also log each event sent to a controller
   --seconds N       protect-capture, protect-feed: how long to record (default 120)
   --camera NAME     protect-feed: which camera (default: the first in `devices`)
