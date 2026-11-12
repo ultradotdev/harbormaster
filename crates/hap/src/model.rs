@@ -32,6 +32,7 @@ pub mod kind {
     pub const NAME: &str = "23";
     pub const SERIAL_NUMBER: &str = "30";
     pub const FIRMWARE_REVISION: &str = "52";
+    pub const CONFIGURED_NAME: &str = "E3";
     pub const VERSION: &str = "37";
     pub const CURRENT_TEMPERATURE: &str = "11";
     pub const CURRENT_RELATIVE_HUMIDITY: &str = "10";
@@ -310,6 +311,23 @@ impl Accessory {
         let ids = self.add_service(kind, primary, characteristics);
         self.next_iid = restore.max(end + 1);
         ids
+    }
+
+    /// Gives the accessory a name that can change after it has been added
+    /// to a home. Controllers follow changes to it, and write to it when the
+    /// owner renames the accessory in their app. `iid` must be free.
+    pub fn set_configured_name(&mut self, iid: u64, name: &str) {
+        let in_use =
+            self.services.iter().any(|s| s.iid == iid || s.characteristics.iter().any(|c| c.iid == iid));
+        assert!(!in_use, "instance id {iid} is already in use");
+        let name = Characteristic {
+            iid,
+            writable: true,
+            ..Characteristic::sensor(kind::CONFIGURED_NAME, Format::String, Value::String(name.to_owned()))
+        };
+        // The accessory information service is always the first.
+        self.services[0].characteristics.push(name);
+        self.next_iid = self.next_iid.max(iid + 1);
     }
 
     /// Records that the service at `from` works together with the one at
