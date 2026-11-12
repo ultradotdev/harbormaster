@@ -66,6 +66,15 @@ fn answer(request: &str, behaviour: Behaviour) -> String {
             let wants_size = line.contains("&w=640&h=480");
             reply("200 OK", "Content-Type: image/jpeg\r\n", if wants_size { "JPEG-640" } else { "JPEG" })
         }
+        ("PATCH /proxy/protect/api/lights/l1 HTTP/1.1", _) if signed_in => {
+            let json: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+            if json == serde_json::json!({"lightOnSettings": {"isLedForceOn": true}}) {
+                reply("200 OK", "Content-Type: application/json\r\n", "{}")
+            } else {
+                reply("400 Bad Request", "", "{}")
+            }
+        }
+        ("PATCH /proxy/protect/api/lights/readonly HTTP/1.1", _) if signed_in => reply("403 Forbidden", "", "{}"),
         _ => reply("404 Not Found", "", "{}"),
     }
 }
@@ -195,4 +204,20 @@ async fn fetches_snapshots_and_refuses_odd_camera_ids() {
     assert!(matches!(client.snapshot("", 1, 1).await, Err(Error::Protocol(_))));
     assert_eq!(console.requests.load(Ordering::SeqCst), before, "bad ids never reach the console");
     assert!(matches!(client.snapshot("missing", 1, 1).await, Err(Error::Status(_))));
+}
+
+#[tokio::test]
+async fn changes_a_device_and_reports_refusals() {
+    let console = start(Behaviour::Normal).await;
+    let mut client = Client::new("localhost", console.port, console.fingerprint);
+    let on = serde_json::json!({"lightOnSettings": {"isLedForceOn": true}});
+    assert!(matches!(client.update_device("lights", "l1", &on).await, Err(Error::NotSignedIn)));
+    client.login("harbormaster", "correct horse").await.unwrap();
+    client.update_device("lights", "l1", &on).await.unwrap();
+    assert!(matches!(client.update_device("lights", "readonly", &on).await, Err(Error::Forbidden)));
+    assert!(matches!(client.update_device("lights", "missing", &on).await, Err(Error::Status(_))));
+    let before = console.requests.load(Ordering::SeqCst);
+    assert!(matches!(client.update_device("lights/../users", "l1", &on).await, Err(Error::Protocol(_))));
+    assert!(matches!(client.update_device("lights", "../admin", &on).await, Err(Error::Protocol(_))));
+    assert_eq!(console.requests.load(Ordering::SeqCst), before, "odd paths never reach the console");
 }

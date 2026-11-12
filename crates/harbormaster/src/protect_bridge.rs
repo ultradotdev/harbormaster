@@ -48,6 +48,7 @@ mod iid {
     pub const BATTERY: u64 = 170;
     /// HomeKit expects a camera to handle two viewers at once.
     pub const STREAMS: [u64; 2] = [200, 210];
+    pub const LIGHTBULB: u64 = 180;
     /// Three services, ten ids apart: camera switches, recording, data stream.
     pub const RECORDING: u64 = 300;
 }
@@ -373,6 +374,10 @@ struct Handles {
     leak: Option<u64>,
     battery_level: Option<u64>,
     low_battery: Option<u64>,
+    /// One per sensor service, all showing whether the case was opened.
+    tampered: Vec<u64>,
+    light_on: Option<u64>,
+    brightness: Option<u64>,
     streams: Vec<StreamIds>,
     recording: Option<RecordingIds>,
 }
@@ -397,8 +402,17 @@ fn build_accessory(aid: u64, def: &DeviceDef, with_video: bool) -> (Accessory, H
     let f = &def.features;
     // The first service present is the primary one.
     let primary = std::cell::Cell::new(true);
+    // Battery sensors can tell when their case has been opened.
+    let reports_tampering = def.kind == Kind::Sensor;
+    let tampered = std::cell::RefCell::new(Vec::new());
     let sensor = |accessory: &mut Accessory, base: u64, service: &'static str, value: Characteristic| {
-        let ids = accessory.add_service_at(base, service, primary.take(), vec![value, status_active()]);
+        let mut characteristics = vec![value, status_active()];
+        if reports_tampering {
+            characteristics
+                .push(Characteristic::sensor(kind::STATUS_TAMPERED, Format::Uint8, json!(0)).range(0.0, 1.0, 1.0));
+        }
+        let ids = accessory.add_service_at(base, service, primary.take(), characteristics);
+        tampered.borrow_mut().extend(ids.get(2));
         (ids[0], ids[1])
     };
 
@@ -445,6 +459,20 @@ fn build_accessory(aid: u64, def: &DeviceDef, with_video: bool) -> (Accessory, H
         let (value, active) = sensor(&mut accessory, iid::LIGHT_LEVEL, kind::LIGHT_SENSOR, state);
         (handles.light_level, _) = (Some(value), handles.active.push(active));
     }
+    if def.kind == Kind::Light {
+        let ids = accessory.add_service_at(
+            iid::LIGHTBULB,
+            kind::LIGHTBULB,
+            false,
+            vec![
+                Characteristic { writable: true, ..Characteristic::sensor(kind::ON, Format::Bool, json!(false)) },
+                Characteristic { writable: true, ..Characteristic::sensor(kind::BRIGHTNESS, Format::Int, json!(100)) }
+                    .unit("percentage")
+                    .range(0.0, 100.0, 1.0),
+            ],
+        );
+        (handles.light_on, handles.brightness) = (Some(ids[0]), Some(ids[1]));
+    }
     if let (true, Some((width, height))) = (with_video, def.video) {
         let offered = video::resolutions(width, height);
         handles.streams = iid::STREAMS.iter().map(|iid| video::add_stream_service(&mut accessory, *iid, &offered)).collect();
@@ -469,7 +497,54 @@ fn build_accessory(aid: u64, def: &DeviceDef, with_video: bool) -> (Accessory, H
         );
         (handles.battery_level, handles.low_battery) = (Some(ids[0]), Some(ids[2]));
     }
+    handles.tampered = tampered.into_inner();
     (accessory, handles)
+}
+
+/// The floodlight has six brightness steps; HomeKit works in percent.
+fn level_to_percent(level: u64) -> u64 {
+    (level.clamp(1, 6) * 100 + 3) / 6
+}
+
+fn percent_to_level(percent: u64) -> u64 {
+    ((percent.min(100) * 6 + 50) / 100).clamp(1, 6)
+}
+
+/// Lets HomeKit switch a floodlight on and off and set its brightness. The
+/// change shows in HomeKit at once and is undone if the console refuses it.
+fn install_light_control(db: &Arc<Database>, live: &Arc<Live>, aid: u64, handles: &Handles, id: &str) {
+    let control = |iid: u64, changes: fn(&Value) -> Option<Value>| {
+        let (db_for_task, live, id, name) = (db.clone(), live.clone(), id.to_owned(), handles.name.clone());
+        db.on_write(
+            aid,
+            iid,
+            Arc::new(move |value, _| {
+                let changes = changes(value).ok_or(harbormaster_hap::model::status::INVALID_VALUE)?;
+                let previous = db_for_task.read(aid, iid).ok();
+                let (db, live, id, name) = (db_for_task.clone(), live.clone(), id.clone(), name.clone());
+                tokio::spawn(async move {
+                    let client = live.inner.read().unwrap().client.clone();
+                    let result = match client {
+                        Some(client) => client.update_device("lights", &id, &changes).await.map_err(|e| e.to_string()),
+                        None => Err("the console is not reachable".to_owned()),
+                    };
+                    if let Err(why) = result {
+                        tracing::warn!("{name}: could not change the light: {why}");
+                        if let Some(previous) = previous {
+                            db.set(aid, iid, previous);
+                        }
+                    }
+                });
+                Ok(None)
+            }),
+        );
+    };
+    if let Some(iid) = handles.light_on {
+        control(iid, |v| Some(json!({ "lightOnSettings": { "isLedForceOn": v.as_bool()? } })));
+    }
+    if let Some(iid) = handles.brightness {
+        control(iid, |v| Some(json!({ "lightDeviceSettings": { "ledLevel": percent_to_level(v.as_u64()?) } })));
+    }
 }
 
 /// The Protect devices currently published, and how updates reach them.
@@ -480,6 +555,8 @@ pub struct Devices {
     /// Set when live video can be served: the shared console state and the
     /// ffmpeg to run.
     video: Option<(Arc<Live>, PathBuf)>,
+    /// The console connection that commands are sent over.
+    live: Option<Arc<Live>>,
     /// Set when recordings can be made for HomeKit.
     recorder: Option<Arc<Recorder>>,
 }
@@ -499,6 +576,9 @@ impl Devices {
             let aid = store.accessory_id(&def.store_key())?;
             let (accessory, handles) = build_accessory(aid, def, self.video.is_some());
             db.replace(accessory);
+            if let Some(live) = &self.live {
+                install_light_control(db, live, aid, &handles, &def.id);
+            }
             if let Some((live, ffmpeg)) = &self.video {
                 for ids in &handles.streams {
                     let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone() });
@@ -571,6 +651,18 @@ impl Devices {
             }
             // 0 is a single press, the only kind a doorbell has.
             db.emit(h.aid, iid, json!(0));
+        }
+        if let Some(on) = data["isLightOn"].as_bool() {
+            set(h.light_on, json!(on));
+        }
+        if let Some(level) = data["lightDeviceSettings"]["ledLevel"].as_u64() {
+            set(h.brightness, json!(level_to_percent(level)));
+        }
+        // A time while the case is open, null once it is closed again.
+        if let Some(opened) = data.get("tamperingDetectedAt") {
+            for iid in &h.tampered {
+                db.set(h.aid, *iid, json!(u8::from(!opened.is_null())));
+            }
         }
         if let Some(open) = data["isOpened"].as_bool() {
             // HomeKit: 0 is contact detected (closed), 1 is not detected (open).
@@ -688,7 +780,7 @@ impl ProtectBridge {
         }
         let recorder = ffmpeg.as_deref().map(|path| Recorder::new(state_dir, path));
         let mut devices =
-            Devices { video: ffmpeg.map(|path| (live.clone(), path)), recorder, ..Devices::default() };
+            Devices { video: ffmpeg.map(|path| (live.clone(), path)), live: Some(live.clone()), recorder, ..Devices::default() };
         let mut cached = load_cache(state_dir);
         cached.retain(|def| selected(def, config.devices.as_deref()));
         devices.add(&cached, &store, &db)?;
@@ -1005,6 +1097,59 @@ mod tests {
         f.update("camera", "nope", json!({"isMotionDetected": true}));
         f.update("event", "cam1", json!({"isMotionDetected": true}));
         assert!(changes.try_recv().is_err());
+    }
+
+    #[test]
+    fn floodlight_state_and_sensor_tampering_follow_the_console() {
+        let f = Fixture::new("light");
+        let light = f.aid("light", "lit1");
+        assert_eq!(f.db.read(light, iid::LIGHTBULB + 1), Ok(json!(false)));
+        f.update("light", "lit1", json!({"isLightOn": true, "lightDeviceSettings": {"ledLevel": 3}}));
+        assert_eq!(f.db.read(light, iid::LIGHTBULB + 1), Ok(json!(true)));
+        assert_eq!(f.db.read(light, iid::LIGHTBULB + 2), Ok(json!(50)));
+        // Cameras have no light to control.
+        let camera = f.aid("camera", "cam1");
+        assert_eq!(f.db.read(camera, iid::LIGHTBULB + 1), Err(harbormaster_hap::model::status::NOT_FOUND));
+
+        // Six steps map onto percentages and back without drifting.
+        assert_eq!((1..=6).map(level_to_percent).collect::<Vec<_>>(), [17, 33, 50, 67, 83, 100]);
+        assert!((1..=6).all(|level| percent_to_level(level_to_percent(level)) == level));
+        assert_eq!((percent_to_level(0), percent_to_level(100), percent_to_level(250)), (1, 6, 6));
+
+        let sensor = f.aid("sensor", "sen1");
+        assert_eq!(f.db.read(sensor, iid::CONTACT + 3), Ok(json!(0)));
+        f.update("sensor", "sen1", json!({"tamperingDetectedAt": 1700000000000u64}));
+        assert_eq!(f.db.read(sensor, iid::CONTACT + 3), Ok(json!(1)));
+        assert_eq!(f.db.read(sensor, iid::BATTERY + 1), Ok(json!(96)), "other readings are untouched");
+        f.update("sensor", "sen1", json!({"tamperingDetectedAt": null}));
+        assert_eq!(f.db.read(sensor, iid::CONTACT + 3), Ok(json!(0)));
+    }
+
+    #[tokio::test]
+    async fn a_light_change_the_console_cannot_take_is_undone() {
+        let dir = std::env::temp_dir().join(format!("hm-protect-{}-control", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(dir.join("state.json")).unwrap());
+        let db = Database::new();
+        // Never signed in, so there is no console to send the command to.
+        let mut devices = Devices { live: Some(Arc::new(Live::default())), ..Devices::default() };
+        devices.add(&definitions(&bootstrap()), &store, &db).unwrap();
+        let light = devices.handles[&("light", "lit1".to_owned())].aid;
+        let context = harbormaster_hap::model::WriteContext {
+            connection: 1,
+            local_ip: "127.0.0.1".parse().unwrap(),
+            peer_ip: "127.0.0.1".parse().unwrap(),
+            shared_secret: None,
+        };
+        assert_eq!(db.write(light, iid::LIGHTBULB + 1, &json!(true), &context), Ok(json!(true)));
+        let mut waited = 0;
+        while db.read(light, iid::LIGHTBULB + 1) != Ok(json!(false)) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 1;
+            assert!(waited < 100, "the light still shows on although the command failed");
+        }
+        assert_eq!(db.write(light, iid::LIGHTBULB + 2, &json!(250), &context), Err(harbormaster_hap::model::status::INVALID_VALUE));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

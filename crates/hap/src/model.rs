@@ -42,6 +42,7 @@ pub mod kind {
     pub const LEAK_SENSOR: &str = "83";
     pub const BATTERY: &str = "96";
     pub const DOORBELL: &str = "121";
+    pub const LIGHTBULB: &str = "43";
 
     pub const MOTION_DETECTED: &str = "22";
     pub const CONTACT_SENSOR_STATE: &str = "6A";
@@ -51,6 +52,9 @@ pub mod kind {
     pub const CHARGING_STATE: &str = "8F";
     pub const STATUS_LOW_BATTERY: &str = "79";
     pub const STATUS_ACTIVE: &str = "75";
+    pub const STATUS_TAMPERED: &str = "7A";
+    pub const ON: &str = "25";
+    pub const BRIGHTNESS: &str = "8";
     pub const PROGRAMMABLE_SWITCH_EVENT: &str = "73";
 }
 

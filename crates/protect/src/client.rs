@@ -34,6 +34,8 @@ pub enum Error {
     RateLimited,
     #[error("not signed in, or the session expired")]
     NotSignedIn,
+    #[error("the console refused: this account is not allowed to change devices")]
+    Forbidden,
     #[error("UniFi Protect is not running on this console")]
     ProtectNotFound,
     #[error("the console answered {0}")]
@@ -201,6 +203,31 @@ impl Client {
             return Err(Error::Protocol("snapshot was not a JPEG image".into()));
         }
         Ok(response.into_body())
+    }
+
+    /// Changes settings of one device. `kind` is the console's plural name
+    /// for the sort of device (`lights`, `cameras`, ...) and `changes` holds
+    /// only the fields to change. This is the one call that alters anything
+    /// on the console.
+    pub async fn update_device(&self, kind: &str, id: &str, changes: &serde_json::Value) -> Result<(), Error> {
+        if self.session.is_none() {
+            return Err(Error::NotSignedIn);
+        }
+        // Both become part of the request path; refuse anything that could alter it.
+        let plain = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric());
+        if !plain(kind) || !plain(id) {
+            return Err(Error::Protocol("unexpected characters in device kind or id".into()));
+        }
+        let path = format!("/proxy/protect/api/{kind}/{id}");
+        let mut request = self.request(Method::PATCH, &path, Bytes::from(changes.to_string()));
+        request.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = self.send(request).await?;
+        match response.status() {
+            StatusCode::OK => Ok(()),
+            StatusCode::UNAUTHORIZED => Err(Error::NotSignedIn),
+            StatusCode::FORBIDDEN => Err(Error::Forbidden),
+            status => Err(Error::Status(status)),
+        }
     }
 
     /// Opens the realtime update stream. Pass the bootstrap's
