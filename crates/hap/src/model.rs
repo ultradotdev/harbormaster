@@ -388,6 +388,16 @@ impl Database {
         }
     }
 
+    /// Takes an accessory out of the database, along with its write
+    /// handlers. Returns `false` if there was no such accessory.
+    pub fn remove(&self, aid: u64) -> bool {
+        self.handlers.write().unwrap().retain(|(handler_aid, _), _| *handler_aid != aid);
+        let mut accessories = self.accessories.write().unwrap();
+        let before = accessories.len();
+        accessories.retain(|a| a.aid != aid);
+        accessories.len() != before
+    }
+
     /// Registers the handler for writes to one characteristic.
     pub fn on_write(&self, aid: u64, iid: u64, handler: WriteHandler) {
         self.handlers.write().unwrap().insert((aid, iid), handler);
@@ -611,6 +621,16 @@ mod tests {
         assert_eq!(db.write(2, iid, &json!("ask"), &context()), Ok(json!("ask")));
         assert_eq!(db.read(2, iid), Ok(json!("ask")), "the old handler is gone");
         assert_eq!(db.to_json()["accessories"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn removing_an_accessory_drops_it_and_its_handlers() {
+        let (db, iid) = sample();
+        db.on_write(2, iid, Arc::new(|_, _| Ok(None)));
+        assert!(db.remove(2));
+        assert!(!db.contains(2) && !db.remove(2));
+        assert_eq!(db.read(2, iid), Err(status::NOT_FOUND));
+        assert!(db.handlers.read().unwrap().is_empty());
     }
 
     #[test]
