@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -52,6 +52,8 @@ mod iid {
     pub const LIGHTBULB: u64 = 180;
     pub const MICROPHONE: u64 = 220;
     pub const SPEAKER: u64 = 230;
+    /// One occupancy sensor per kind of thing recognised, ten ids apart.
+    pub const DETECTION: u64 = 240;
     /// Three services, ten ids apart: camera switches, recording, data stream.
     pub const RECORDING: u64 = 300;
 }
@@ -83,6 +85,58 @@ impl Kind {
     }
 }
 
+/// A kind of thing a camera can recognise. Each can be published as an
+/// occupancy sensor of its own, for notifications and automations that
+/// plain motion is too coarse for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Detection {
+    Person,
+    Vehicle,
+    Animal,
+    Package,
+}
+
+impl Detection {
+    pub const ALL: [Detection; 4] = [Detection::Person, Detection::Vehicle, Detection::Animal, Detection::Package];
+
+    /// Protect's word for it, which is also how it is written in settings.
+    pub fn word(self) -> &'static str {
+        match self {
+            Detection::Person => "person",
+            Detection::Vehicle => "vehicle",
+            Detection::Animal => "animal",
+            Detection::Package => "package",
+        }
+    }
+
+    /// How it is named in HomeKit and the dashboard.
+    pub fn label(self) -> &'static str {
+        match self {
+            Detection::Person => "Person",
+            Detection::Vehicle => "Vehicle",
+            Detection::Animal => "Animal",
+            Detection::Package => "Package",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|d| d.word() == word)
+    }
+
+    /// The kinds named in one of Protect's lists, in a fixed order. Kinds
+    /// with no sensor here, such as faces and sounds, are left out.
+    fn list(words: &Value) -> Vec<Self> {
+        let named = |d: &Self| words.as_array().is_some_and(|words| words.iter().any(|w| w.as_str() == Some(d.word())));
+        Self::ALL.into_iter().filter(named).collect()
+    }
+
+    /// Where this kind's sensor sits among an accessory's instance ids.
+    fn iid(self) -> u64 {
+        iid::DETECTION + 10 * self as u64
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Features {
@@ -96,6 +150,10 @@ pub struct Features {
     pub battery: bool,
     /// A camera with a speaker that a viewer can talk through.
     pub talk: bool,
+    /// What a camera can recognise.
+    pub detects: Vec<Detection>,
+    /// Which of those the owner asked to have a sensor for.
+    pub sensors: Vec<Detection>,
 }
 
 /// Everything needed to publish one Protect device as an accessory.
@@ -155,6 +213,7 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
                     motion: true,
                     doorbell: device["featureFlags"]["isDoorbell"] == true,
                     talk: speaker_rate(device).is_some(),
+                    detects: Detection::list(&device["featureFlags"]["smartDetectTypes"]),
                     ..Features::default()
                 },
                 Kind::Light => Features { motion: true, ..Features::default() },
@@ -166,8 +225,7 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
                     humidity: enabled("humiditySettings"),
                     light_level: enabled("lightSettings"),
                     battery: true,
-                    doorbell: false,
-                    talk: false,
+                    ..Features::default()
                 },
             };
             let name = [text("name"), text("marketName"), model.clone()]
@@ -489,6 +547,8 @@ struct Handles {
     tampered: Vec<u64>,
     light_on: Option<u64>,
     brightness: Option<u64>,
+    /// The occupancy sensor for each kind of thing recognised.
+    detections: Vec<(Detection, u64)>,
     streams: Vec<StreamIds>,
     recording: Option<RecordingIds>,
 }
@@ -569,6 +629,21 @@ fn build_accessory(aid: u64, def: &DeviceDef, with_video: bool) -> (Accessory, H
             .range(0.0001, 100_000.0, 0.0001);
         let (value, active) = sensor(&mut accessory, iid::LIGHT_LEVEL, kind::LIGHT_SENSOR, state);
         (handles.light_level, _) = (Some(value), handles.active.push(active));
+    }
+    for detection in f.sensors.iter().filter(|_| def.kind == Kind::Camera) {
+        // Named, so that a list of sensors in HomeKit says which is which.
+        let ids = accessory.add_service_at(
+            detection.iid(),
+            kind::OCCUPANCY_SENSOR,
+            false,
+            vec![
+                Characteristic::sensor(kind::OCCUPANCY_DETECTED, Format::Uint8, json!(0)).range(0.0, 1.0, 1.0),
+                status_active(),
+                Characteristic::constant(kind::NAME, Format::String, json!(format!("{} {}", def.name, detection.label()))),
+            ],
+        );
+        handles.detections.push((*detection, ids[0]));
+        handles.active.push(ids[1]);
     }
     if def.kind == Kind::Light {
         let ids = accessory.add_service_at(
@@ -678,6 +753,9 @@ pub struct Devices {
     affix: (String, String),
     /// Set when recordings can be made for HomeKit.
     recorder: Option<Arc<Recorder>>,
+    /// Recognitions in progress, by Protect's event id: the camera and
+    /// what it sees.
+    events: Mutex<HashMap<String, (String, Vec<Detection>)>>,
 }
 
 impl Devices {
@@ -790,6 +868,13 @@ impl Devices {
         }
         if let Some(detected) = data["isSmartDetected"].as_bool() {
             h.smart_motion.store(detected, Ordering::Relaxed);
+            // The camera recognises nothing now, so whatever was in
+            // progress is over even if its ending was never reported.
+            if !detected && !h.detections.is_empty() {
+                let mut events = self.events.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                events.retain(|_, (camera, _)| camera != id);
+                self.show_detections(h, db, id, &events, live);
+            }
         }
         if let (true, Some(iid)) = (data[motion].is_boolean() || data["isSmartDetected"].is_boolean(), h.motion) {
             let detected = h.plain_motion.load(Ordering::Relaxed) || h.smart_motion.load(Ordering::Relaxed);
@@ -849,8 +934,65 @@ impl Devices {
         }
     }
 
+    /// Sets a camera's recognition sensors from the events in progress.
+    fn show_detections(
+        &self,
+        h: &Handles,
+        db: &Database,
+        camera: &str,
+        events: &HashMap<String, (String, Vec<Detection>)>,
+        live: bool,
+    ) {
+        for (detection, iid) in &h.detections {
+            let seen = events.values().any(|(at, kinds)| at == camera && kinds.contains(detection));
+            let value = json!(u8::from(seen));
+            let changed = db.read(h.aid, *iid).ok() != Some(value.clone());
+            if db.set(h.aid, *iid, value) && live && changed {
+                tracing::info!("{}: {} {}", h.name, detection.word(), if seen { "detected" } else { "gone" });
+            }
+        }
+    }
+
+    /// Follows one of Protect's events, which is how it says what a camera
+    /// recognised: the event names the camera and the kinds when it starts,
+    /// may add kinds as it goes, and gains an end time when it is over.
+    fn apply_event(&self, db: &Database, update: &Update) {
+        let data = &update.data;
+        let mut events = self.events.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let kinds = data.get("smartDetectTypes").map(Detection::list);
+        let camera = if data.get("end").is_some_and(|end| !end.is_null()) {
+            events.remove(&update.id).map(|(camera, _)| camera)
+        } else if let Some((camera, seen)) = events.get_mut(&update.id) {
+            if let Some(kinds) = kinds {
+                *seen = kinds;
+            }
+            Some(camera.clone())
+        } else {
+            match (data["camera"].as_str(), kinds) {
+                (Some(camera), Some(kinds)) if !kinds.is_empty() => {
+                    events.insert(update.id.clone(), (camera.to_owned(), kinds));
+                    Some(camera.to_owned())
+                }
+                _ => None,
+            }
+        };
+        let handles = camera.as_ref().and_then(|camera| self.handles.get(&("camera", camera.clone())));
+        if let (Some(camera), Some(h)) = (&camera, handles) {
+            self.show_detections(h, db, camera, &events, true);
+        }
+    }
+
     /// Brings every device up to date from a full inventory.
     fn apply_snapshot(&self, db: &Database, bootstrap: &Value) {
+        // Events that ended while the console was out of reach were missed.
+        let mut events = self.events.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        events.clear();
+        for ((kind, id), h) in &self.handles {
+            if *kind == "camera" {
+                self.show_detections(h, db, id, &events, false);
+            }
+        }
+        drop(events);
         for kind in [Kind::Camera, Kind::Sensor, Kind::Light] {
             for device in bootstrap[kind.section()].as_array().into_iter().flatten() {
                 if let Some(id) = device["id"].as_str() {
@@ -862,7 +1004,11 @@ impl Devices {
 
     fn apply_update(&self, db: &Database, update: &Update) {
         crate::status::global().console_update();
-        if update.action == "update" {
+        if update.model_key == "event" {
+            if matches!(update.action.as_str(), "add" | "update") {
+                self.apply_event(db, update);
+            }
+        } else if update.action == "update" {
             self.apply(db, &update.model_key, &update.id, &update.data, true);
         }
     }
@@ -1558,6 +1704,56 @@ mod tests {
         f.update("camera", "nope", json!({"isMotionDetected": true}));
         f.update("event", "cam1", json!({"isMotionDetected": true}));
         assert!(changes.try_recv().is_err());
+    }
+
+    #[test]
+    fn recognition_sensors_follow_the_consoles_events() {
+        let mut f = Fixture::new("detect");
+        let mut defs = f.devices.defs.clone();
+        let camera = defs.iter_mut().find(|def| def.id == "cam1" && def.lens == 0).unwrap();
+        camera.features.sensors = vec![Detection::Person, Detection::Vehicle];
+        assert_eq!(f.devices.add(&defs, &f.store, &f.db).unwrap(), 1, "only the changed camera is rebuilt");
+        let aid = f.aid("camera", "cam1");
+        let (person, vehicle) = (Detection::Person.iid() + 1, Detection::Vehicle.iid() + 1);
+        let seen = |f: &Fixture| (f.db.read(aid, person).unwrap(), f.db.read(aid, vehicle).unwrap());
+        assert_eq!(seen(&f), (json!(0), json!(0)));
+        assert_eq!(f.db.read(aid, person + 2), Ok(json!("Front Door Person")), "named for lists in HomeKit");
+        assert_eq!(f.db.read(aid, Detection::Animal.iid() + 1), Err(harbormaster_hap::model::status::NOT_FOUND));
+
+        let event = |f: &Fixture, action: &str, id: &str, data: Value| {
+            let update = Update { action: action.into(), model_key: "event".into(), id: id.into(), new_update_id: None, data };
+            f.devices.apply_update(&f.db, &update);
+        };
+        let start = json!({"camera": "cam1", "type": "smartDetectZone", "smartDetectTypes": ["person"], "start": 1});
+        event(&f, "add", "ev1", start);
+        assert_eq!(seen(&f), (json!(1), json!(0)));
+        // Updates that say nothing of the kinds change nothing; one that
+        // names more adds them.
+        event(&f, "update", "ev1", json!({"labels": []}));
+        assert_eq!(seen(&f), (json!(1), json!(0)));
+        event(&f, "update", "ev1", json!({"smartDetectTypes": ["person", "vehicle", "face"]}));
+        assert_eq!(seen(&f), (json!(1), json!(1)));
+        // A second event keeps its kind up after the first ends.
+        event(&f, "add", "ev2", json!({"camera": "cam1", "smartDetectTypes": ["vehicle"], "start": 2}));
+        event(&f, "update", "ev1", json!({"end": 3, "score": 90}));
+        assert_eq!(seen(&f), (json!(0), json!(1)));
+        // What follows an ending repeats it and must not start it again.
+        event(&f, "update", "ev1", json!({"camera": "cam1", "smartDetectTypes": ["person"], "start": 1, "end": 3}));
+        assert_eq!(seen(&f), (json!(0), json!(1)));
+        // Plain motion, sounds and other cameras are not recognitions here.
+        event(&f, "add", "ev3", json!({"camera": "cam1", "type": "motion", "smartDetectTypes": [], "start": 4}));
+        event(&f, "add", "ev4", json!({"camera": "cam1", "smartDetectTypes": ["alrmSpeak"], "start": 4}));
+        event(&f, "add", "ev5", json!({"camera": "nope", "smartDetectTypes": ["person"], "start": 4}));
+        assert_eq!(seen(&f), (json!(0), json!(1)));
+        // If an ending is never reported, the camera saying it recognises
+        // nothing ends it.
+        f.update("camera", "cam1", json!({"isSmartDetected": false}));
+        assert_eq!(seen(&f), (json!(0), json!(0)));
+        // So does reading the whole inventory again after a lost connection.
+        event(&f, "add", "ev6", json!({"camera": "cam1", "smartDetectTypes": ["person"], "start": 5}));
+        assert_eq!(seen(&f), (json!(1), json!(0)));
+        f.devices.apply_snapshot(&f.db, &bootstrap());
+        assert_eq!(seen(&f), (json!(0), json!(0)));
     }
 
     #[test]

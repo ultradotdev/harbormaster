@@ -5,18 +5,20 @@
 //! in the state directory, and applied by the Protect bridge each time it
 //! works out which accessories to publish.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::protect_bridge::DeviceDef;
+use crate::protect_bridge::{Detection, DeviceDef};
 
 const FILE_NAME: &str = "devices.json";
 /// Where the prefix and suffix chosen in the dashboard are kept.
 const NAMES_FILE: &str = "names.json";
+/// Where the recognition sensors chosen for every camera are kept.
+const DETECTION_FILE: &str = "detection.json";
 /// Longest prefix or suffix accepted, as for `config.toml`.
 pub const MAX_AFFIX: usize = 24;
 /// Longest name accepted for a device.
@@ -34,6 +36,12 @@ pub struct Entry {
     pub protect_name: String,
     /// "camera", "sensor" or "light".
     pub kind: String,
+    /// What the device can recognise, as last seen.
+    #[serde(skip)]
+    pub detects: Vec<Detection>,
+    /// The recognition sensors chosen for this device in particular, on
+    /// top of those chosen for every camera.
+    pub sensors: BTreeSet<Detection>,
 }
 
 impl Entry {
@@ -43,7 +51,7 @@ impl Entry {
     }
 
     fn is_default(&self) -> bool {
-        !self.hidden && self.name.is_none()
+        !self.hidden && self.name.is_none() && self.sensors.is_empty()
     }
 }
 
@@ -59,6 +67,13 @@ struct Affix {
     default: (String, String),
 }
 
+/// The recognition sensors published for every camera that can tell.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct Everywhere {
+    all: BTreeSet<Detection>,
+}
+
 /// Which end of the name a piece of text goes on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum End {
@@ -70,6 +85,7 @@ pub struct Overrides {
     /// Where the choices are kept, if anywhere.
     path: Option<PathBuf>,
     affix: Mutex<Affix>,
+    everywhere: Mutex<Everywhere>,
     entries: Mutex<BTreeMap<String, Entry>>,
     /// Set when a choice changed and the bridge has yet to act on it.
     changed: AtomicBool,
@@ -149,6 +165,7 @@ impl Overrides {
         Self {
             path: None,
             affix: Mutex::new(Affix::default()),
+            everywhere: Mutex::new(Everywhere::default()),
             entries: Mutex::new(BTreeMap::new()),
             changed: AtomicBool::new(false),
         }
@@ -223,7 +240,21 @@ impl Overrides {
             }),
             Err(_) => Affix::default(),
         };
-        Self { path: Some(path), affix: Mutex::new(affix), entries: Mutex::new(entries), changed: AtomicBool::new(false) }
+        let chosen = path.with_file_name(DETECTION_FILE);
+        let everywhere = match std::fs::read(&chosen) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                tracing::warn!("ignoring unreadable {}: {e}", chosen.display());
+                Everywhere::default()
+            }),
+            Err(_) => Everywhere::default(),
+        };
+        Self {
+            path: Some(path),
+            affix: Mutex::new(affix),
+            everywhere: Mutex::new(everywhere),
+            entries: Mutex::new(entries),
+            changed: AtomicBool::new(false),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Entry>> {
@@ -241,7 +272,59 @@ impl Overrides {
             .map_err(|e| format!("could not save {}: {e}", path.display()))
     }
 
+    fn lock_everywhere(&self) -> MutexGuard<'_, Everywhere> {
+        self.everywhere.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The recognition sensors published for every camera that can tell.
+    pub fn sensors_everywhere(&self) -> Vec<Detection> {
+        self.lock_everywhere().all.iter().copied().collect()
+    }
+
+    /// Publishes, or stops publishing, a sensor for one kind of thing
+    /// cameras recognise: on the device with this key, or with no key on
+    /// every camera that can tell. Returns the name of the device changed,
+    /// if it was one, or why nothing was changed.
+    pub fn set_sensor(&self, key: Option<&str>, detection: Detection, on: bool) -> Result<Option<String>, String> {
+        let Some(key) = key else {
+            let mut everywhere = self.lock_everywhere();
+            let before = everywhere.clone();
+            if on {
+                everywhere.all.insert(detection);
+            } else {
+                everywhere.all.remove(&detection);
+            }
+            if *everywhere != before {
+                let saved = match &self.path {
+                    Some(path) => serde_json::to_vec_pretty(&*everywhere)
+                        .map_err(std::io::Error::other)
+                        .and_then(|bytes| write_private(&path.with_file_name(DETECTION_FILE), &bytes))
+                        .map_err(|e| format!("could not save {DETECTION_FILE}: {e}")),
+                    None => Ok(()),
+                };
+                if let Err(e) = saved {
+                    *everywhere = before;
+                    return Err(e);
+                }
+                self.changed.store(true, Ordering::Relaxed);
+            }
+            return Ok(None);
+        };
+        if on && self.lock().get(key).is_some_and(|entry| !entry.detects.contains(&detection)) {
+            return Err(format!("that device does not recognise a {}", detection.word()));
+        }
+        let entry = self.change(key, |entry| {
+            if on {
+                entry.sensors.insert(detection);
+            } else {
+                entry.sensors.remove(&detection);
+            }
+        })?;
+        Ok(Some(entry.display_name().to_owned()))
+    }
+
     pub fn apply(&self, defs: Vec<DeviceDef>, fresh: bool) -> Vec<DeviceDef> {
+        let everywhere = self.lock_everywhere().all.clone();
         let mut entries = self.lock();
         let mut out = Vec::new();
         for mut def in defs {
@@ -252,6 +335,9 @@ impl Overrides {
                 entry.protect_name = def.name.clone();
             }
             entry.kind = key(&def).split(':').nth(1).unwrap_or_default().to_owned();
+            entry.detects = def.features.detects.clone();
+            def.features.sensors =
+                def.features.detects.iter().copied().filter(|d| everywhere.contains(d) || entry.sensors.contains(d)).collect();
             if entry.hidden {
                 continue;
             }
@@ -373,6 +459,39 @@ mod tests {
         assert_eq!(overrides.apply(inventory(), true), inventory());
         // Choosing Protect's own name is no choice at all.
         assert_eq!(overrides.rename("protect:sensor:sen1", Some("Yard")).unwrap().name, None);
+    }
+
+    #[test]
+    fn recognition_sensors_are_chosen_for_every_camera_or_for_one() {
+        let cameras = || {
+            let mut front = def(Kind::Camera, "cam1", "Front Door");
+            front.features.detects = vec![Detection::Person, Detection::Package];
+            let mut yard = def(Kind::Camera, "cam2", "Yard");
+            yard.features.detects = vec![Detection::Person, Detection::Vehicle];
+            vec![front, yard]
+        };
+        let sensors = |overrides: &Overrides| -> Vec<Vec<Detection>> {
+            overrides.apply(cameras(), true).into_iter().map(|def| def.features.sensors).collect()
+        };
+        let overrides = Overrides::in_memory();
+        assert_eq!(sensors(&overrides), [vec![], vec![]], "none unless asked for");
+
+        assert_eq!(overrides.set_sensor(None, Detection::Person, true), Ok(None));
+        assert!(overrides.changed.swap(false, Ordering::Relaxed));
+        assert_eq!(overrides.sensors_everywhere(), [Detection::Person]);
+        assert_eq!(sensors(&overrides), [vec![Detection::Person], vec![Detection::Person]]);
+
+        // One camera's own choice adds to what every camera has.
+        assert_eq!(overrides.set_sensor(Some("protect:camera:cam1"), Detection::Package, true), Ok(Some("Front Door".into())));
+        assert_eq!(sensors(&overrides), [vec![Detection::Person, Detection::Package], vec![Detection::Person]]);
+        // A camera cannot have a sensor for what it does not recognise.
+        assert!(overrides.set_sensor(Some("protect:camera:cam2"), Detection::Package, true).is_err());
+        assert!(overrides.set_sensor(Some("protect:camera:nope"), Detection::Person, true).is_err());
+
+        overrides.set_sensor(None, Detection::Person, false).unwrap();
+        assert_eq!(sensors(&overrides), [vec![Detection::Package], vec![]]);
+        overrides.set_sensor(Some("protect:camera:cam1"), Detection::Package, false).unwrap();
+        assert_eq!(sensors(&overrides), [vec![], vec![]]);
     }
 
     #[test]

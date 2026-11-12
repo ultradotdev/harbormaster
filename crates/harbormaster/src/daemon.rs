@@ -324,6 +324,9 @@ impl Daemon {
             devices: devices(&database, &board, overrides::global().map(Overrides::list).unwrap_or_default(), &affix),
             name_prefix: affix.0.clone(),
             name_suffix: affix.1.clone(),
+            detect_everywhere: overrides::global()
+                .map(|o| o.sensors_everywhere().into_iter().map(|d| d.word().to_owned()).collect())
+                .unwrap_or_default(),
             name: self.name.clone(),
             version: VERSION.to_owned(),
             listen: self.bridge.local_addr.to_string(),
@@ -439,6 +442,16 @@ fn run_command(overrides: Option<&Overrides>, connected: bool, command: &Command
             let source = if text.is_some() { "as asked in the terminal" } else { "as config.toml says" };
             Ok(format!("names sent to HomeKit will read \"{prefix}<name>{suffix}\": {what} set {source}{when}"))
         }
+        Command::SetDetection { key, detection, on } => {
+            let kind = crate::protect_bridge::Detection::parse(detection)
+                .ok_or_else(|| format!("{detection} is not something cameras recognise"))?;
+            let whose = match overrides.set_sensor(key.as_deref(), kind, *on)? {
+                Some(name) => name,
+                None => "every camera that can tell".to_owned(),
+            };
+            let what = if *on { "will have" } else { "will no longer have" };
+            Ok(format!("{whose}: {what} a {} sensor in HomeKit, as asked in the terminal{when}", kind.word()))
+        }
         Command::Unlock { .. } => Err("a password is not a device setting".into()),
         Command::Rename { key, name } => {
             let entry = overrides.rename(key, name.as_deref())?;
@@ -553,6 +566,8 @@ fn devices(
             // Still published for the moment it takes the bridge to act.
             device.hidden = entry.hidden;
             device.protect_name = entry.name.as_ref().map(|_| entry.protect_name.clone());
+            device.detects = entry.detects.iter().map(|d| d.word().to_owned()).collect();
+            device.detect_here = entry.sensors.iter().map(|d| d.word().to_owned()).collect();
         }
         out.push(device);
     }
@@ -860,6 +875,12 @@ mod tests {
         assert!(run_command(Some(&choices), true, &reset).unwrap().contains("as config.toml says"));
         let long = Command::SetNameSuffix { text: Some("x".repeat(25)) };
         assert!(run_command(Some(&choices), true, &long).is_err());
+
+        let detect = |detection: &str| Command::SetDetection { key: None, detection: detection.into(), on: true };
+        let said = run_command(Some(&choices), true, &detect("person")).unwrap();
+        assert!(said.contains("every camera that can tell: will have a person sensor"), "{said}");
+        assert_eq!(choices.sensors_everywhere(), [crate::protect_bridge::Detection::Person]);
+        assert!(run_command(Some(&choices), true, &detect("unicorn")).is_err());
 
         let unknown = Command::SetShared { key: "protect:camera:nope".into(), shared: false };
         assert!(run_command(Some(&choices), true, &unknown).is_err());

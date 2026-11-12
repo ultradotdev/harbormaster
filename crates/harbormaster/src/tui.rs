@@ -28,6 +28,7 @@ use ratatui::Frame;
 use crate::clock;
 use crate::control::{self, Command, Device, LogLine, Message, State};
 use crate::password::Secret;
+use crate::protect_bridge::Detection;
 
 /// Longest device name that can be typed, matching what the daemon accepts.
 const MAX_NAME: usize = crate::overrides::MAX_NAME;
@@ -92,6 +93,8 @@ enum Action {
     Rename,
     Prefix,
     Suffix,
+    /// Switch a recognition sensor on or off for the selected device.
+    Detect(Detection),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,8 +336,29 @@ impl App {
         }
     }
 
+    /// Switches a recognition sensor: for the selected device, or from the
+    /// overview for every camera that can tell.
+    fn toggle_detection(&mut self, detection: Detection) {
+        let word = detection.word();
+        let listed = |list: &[String]| list.iter().any(|w| w == word);
+        let command = match (self.selected_device(), &self.state) {
+            (Some(d), _) => match &d.key {
+                Some(key) if listed(&d.detects) => {
+                    Some(Command::SetDetection { key: Some(key.clone()), detection: word.to_owned(), on: !listed(&d.detect_here) })
+                }
+                _ => None,
+            },
+            (None, Some(s)) if self.selected == 0 => {
+                Some(Command::SetDetection { key: None, detection: word.to_owned(), on: !listed(&s.detect_everywhere) })
+            }
+            _ => None,
+        };
+        self.outbox.extend(command);
+    }
+
     fn run(&mut self, action: Action) {
         match action {
+            Action::Detect(detection) => self.toggle_detection(detection),
             Action::ToggleShared => self.toggle_shared(),
             Action::Rename => self.start_rename(),
             Action::Prefix => self.edit_affix(Target::Prefix),
@@ -418,6 +442,7 @@ impl App {
                     KeyCode::Char('r') => self.start_rename(),
                     KeyCode::Char('P') => self.edit_affix(Target::Prefix),
                     KeyCode::Char('S') => self.edit_affix(Target::Suffix),
+                    KeyCode::Char(c @ '1'..='4') => self.toggle_detection(Detection::ALL[c as usize - '1' as usize]),
                     KeyCode::Char('w') => {
                         self.warnings_only = !self.warnings_only;
                         self.log_scroll = 0;
@@ -864,9 +889,23 @@ fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Ve
     }
     // The next two lines are the name settings.
     let actions = vec![(lines.len(), Action::Prefix), (lines.len() + 1, Action::Suffix)];
+    // Which recognition sensors every camera gets, switched by number.
+    // Two short lines, since the pane is narrow on a small terminal.
+    let sensors = |label: &str, shown: std::ops::Range<usize>| {
+        let mut line = vec![Span::styled(format!("{label:<12} "), DIM)];
+        for number in shown {
+            let detection = Detection::ALL[number];
+            let on = s.detect_everywhere.iter().any(|w| w == detection.word());
+            line.push(Span::styled(format!("{}", number + 1), Style::new().fg(Color::Cyan)));
+            line.push(Span::raw(format!("{}{:<9}", if on { "[x]" } else { "[ ]" }, detection.label())));
+        }
+        Line::from(line)
+    };
     lines.extend([
         affix_setting("Name prefix", "P", &s.name_prefix),
         affix_setting("Name suffix", "S", &s.name_suffix),
+        sensors("Sensors on", 0..2),
+        sensors("all cameras", 2..4),
         Line::raw(""),
         heading("Controllers"),
     ]);
@@ -929,6 +968,24 @@ fn device_lines(app: &App, d: &Device) -> (Vec<Line<'static>>, Vec<(usize, Actio
             name.push(Span::styled(format!("  (Protect: {own})"), DIM));
         }
         lines.push(Line::from(name));
+        // One occupancy sensor for each kind of thing the camera recognises.
+        let everywhere = app.state.as_ref().map_or(&[][..], |s| s.detect_everywhere.as_slice());
+        for (number, detection) in Detection::ALL.into_iter().enumerate() {
+            let listed = |list: &[String]| list.iter().any(|w| w == detection.word());
+            if !listed(&d.detects) {
+                continue;
+            }
+            actions.push((lines.len(), Action::Detect(detection)));
+            let (here, all) = (listed(&d.detect_here), listed(everywhere));
+            let mut line = vec![
+                key(&format!("{}", number + 1)),
+                Span::raw(format!("[{}] {} sensor", if here || all { "x" } else { " " }, detection.label())),
+            ];
+            if all {
+                line.push(Span::styled("  (on every camera)", DIM));
+            }
+            lines.push(Line::from(line));
+        }
     }
     (lines, actions)
 }
@@ -1194,6 +1251,7 @@ mod tests {
         };
         State {
             pid: 0,
+            detect_everywhere: Vec::new(),
             name: "Harbormaster 6C2C".into(),
             version: "0.1.0".into(),
             listen: "[::]:51826".into(),
@@ -1323,7 +1381,7 @@ mod tests {
                 "[::]:51826  configuration 12",
                 "Uptime       1h 02m",
                 "192.0.2.1 up, updated 2s ago",
-                "● Front Door doorbell recording 12s",
+                "Sensors on   1[ ]Person",
                 "192.0.2.236",
                 "AAAA1111 (admin)",
                 "1m 15s",
@@ -1610,6 +1668,38 @@ mod tests {
             ..Device::default()
         });
         state
+    }
+
+    #[test]
+    fn recognition_sensors_are_switched_by_number_or_by_clicking() {
+        let mut state = editable(sample_state(true));
+        state.detect_everywhere = vec!["vehicle".into()];
+        state.devices[0].detects = vec!["person".into(), "vehicle".into()];
+        state.devices[0].detect_here = vec!["person".into()];
+        let mut app = app_with(state);
+        // From the overview a number switches a sensor for every camera.
+        assert_shows(&render(&mut app), &["Sensors on   1[ ]Person   2[x]Vehicle", "all cameras  3[ ]Animal   4[ ]Package"]);
+        app.handle(key(KeyCode::Char('1')));
+        app.handle(key(KeyCode::Char('2')));
+        let everywhere = |detection: &str, on| Command::SetDetection { key: None, detection: detection.into(), on };
+        assert_eq!(app.outbox, [everywhere("person", true), everywhere("vehicle", false)]);
+        app.outbox.clear();
+
+        // On a device it switches that device's own, and only kinds the
+        // device can recognise are offered.
+        app.handle(key(KeyCode::Down));
+        let screen = render_at(&mut app, 100, 40);
+        assert_shows(&screen, &["1  [x] Person sensor", "2  [x] Vehicle sensor  (on every camera)"]);
+        assert!(!screen.contains("Animal sensor"), "{screen}");
+        app.handle(key(KeyCode::Char('1')));
+        app.handle(key(KeyCode::Char('3')));
+        let key_of = app.devices[0].key.clone();
+        assert_eq!(app.outbox, [Command::SetDetection { key: key_of.clone(), detection: "person".into(), on: false }]);
+        app.outbox.clear();
+        let row = app.actions.iter().find(|(_, action)| *action == Action::Detect(Detection::Vehicle)).unwrap().0;
+        let (x, y) = (app.detail_area.x + 3, app.detail_area.y + 1 + row as u16);
+        app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        assert_eq!(app.outbox, [Command::SetDetection { key: key_of, detection: "vehicle".into(), on: true }]);
     }
 
     #[test]

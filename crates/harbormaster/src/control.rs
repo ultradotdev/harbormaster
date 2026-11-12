@@ -43,6 +43,15 @@ pub enum Command {
         #[serde(default)]
         text: Option<String>,
     },
+    /// Publish an occupancy sensor for one kind of thing cameras recognise
+    /// ("person", "vehicle", "animal" or "package"), or stop. With a key
+    /// this is for that device; without, for every camera that can tell.
+    SetDetection {
+        #[serde(default)]
+        key: Option<String>,
+        detection: String,
+        on: bool,
+    },
 }
 
 /// Every struct here defaults its missing fields and ignores unknown ones,
@@ -73,6 +82,8 @@ pub struct State {
     /// names in this snapshot are plain: they never include it.
     pub name_prefix: String,
     pub name_suffix: String,
+    /// The kinds of thing recognised that every camera has a sensor for.
+    pub detect_everywhere: Vec<String>,
     /// Absent when no UniFi Protect console is configured.
     pub console: Option<Console>,
     pub devices: Vec<Device>,
@@ -152,6 +163,10 @@ pub struct Device {
     pub protect_name: Option<String>,
     /// "camera", "doorbell", "light" or "sensor".
     pub kind: String,
+    /// The kinds of thing this device can recognise.
+    pub detects: Vec<String>,
+    /// Those chosen to have a sensor on this device in particular.
+    pub detect_here: Vec<String>,
     pub name: String,
     pub model: String,
     pub serial_number: String,
