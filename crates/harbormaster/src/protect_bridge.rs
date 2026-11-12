@@ -620,6 +620,8 @@ pub struct Devices {
     video: Option<(Arc<Live>, PathBuf)>,
     /// The console connection that commands are sent over.
     live: Option<Arc<Live>>,
+    /// Text put before and after every name HomeKit is given.
+    affix: (String, String),
     /// Set when recordings can be made for HomeKit.
     recorder: Option<Arc<Recorder>>,
 }
@@ -637,7 +639,11 @@ impl Devices {
                 continue;
             }
             let aid = store.accessory_id(&def.store_key())?;
-            let (accessory, handles) = build_accessory(aid, def, self.video.is_some());
+            // HomeKit is given the name with the owner's prefix and suffix;
+            // everything else, the log included, uses the plain one.
+            let shown = DeviceDef { name: format!("{}{}{}", self.affix.0, def.name, self.affix.1), ..def.clone() };
+            let (accessory, mut handles) = build_accessory(aid, &shown, self.video.is_some());
+            handles.name = def.name.clone();
             db.replace(accessory);
             crate::status::global().device_kind(aid, def.kind.model_key(), &def.store_key());
             if let Some(live) = &self.live {
@@ -880,7 +886,13 @@ impl ProtectBridge {
         }
         let recorder = ffmpeg.as_deref().map(|path| Recorder::new(state_dir, path));
         let mut devices =
-            Devices { video: ffmpeg.map(|path| (live.clone(), path)), live: Some(live.clone()), recorder, ..Devices::default() };
+            Devices {
+                video: ffmpeg.map(|path| (live.clone(), path)),
+                live: Some(live.clone()),
+                affix: (config.name_prefix.clone(), config.name_suffix.clone()),
+                recorder,
+                ..Devices::default()
+            };
         let mut cached = load_cache(state_dir);
         cached.retain(|def| selected(def, config.devices.as_deref()));
         let cached = crate::overrides::apply(cached, false);
@@ -1414,6 +1426,22 @@ mod tests {
             assert!(waited < 100, "the light still shows on although the command failed");
         }
         assert_eq!(db.write(light, iid::LIGHTBULB + 2, &json!(250), &context), Err(harbormaster_hap::model::status::INVALID_VALUE));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn homekit_names_carry_the_owners_prefix_and_suffix() {
+        let dir = std::env::temp_dir().join(format!("hm-protect-{}-affix", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(dir.join("state.json")).unwrap());
+        let db = Database::new();
+        let mut devices = Devices { affix: ("UP ".into(), " HM".into()), ..Devices::default() };
+        devices.add(&definitions(&bootstrap()), &store, &db).unwrap();
+        let handles = &devices.handles[&("camera", "cam1".to_owned())];
+        // The name characteristic of the accessory information service.
+        assert_eq!(db.read(handles.aid, 5), Ok(json!("UP Front Door HM")));
+        assert_eq!(handles.name, "Front Door", "logs and the device list keep the plain name");
+        assert_eq!(devices.defs[0].name, "Front Door");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

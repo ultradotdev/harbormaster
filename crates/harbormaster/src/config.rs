@@ -15,6 +15,8 @@ host = \"192.0.2.10\"        # address of the console running UniFi Protect
 username = \"harbormaster\"  # a local-only account created for Harbormaster
 # fingerprint = \"...\"      # added after the first protect-check
 # devices = [\"Front Door\"] # publish only these (by name); omit for all
+# name_prefix = \"\"         # put before every name sent to HomeKit
+# name_suffix = \" HM\"      # put after every name sent to HomeKit
 ";
 
 #[derive(Debug, Default, Deserialize)]
@@ -36,6 +38,22 @@ pub struct Protect {
     /// If set, only these devices are published to HomeKit. Entries match a
     /// device's name (ignoring case), its Protect id or its MAC address.
     pub devices: Option<Vec<String>>,
+    /// Text put before and after every device name sent to HomeKit, to
+    /// tell these accessories apart from the same devices added another way.
+    #[serde(default)]
+    pub name_prefix: String,
+    #[serde(default)]
+    pub name_suffix: String,
+}
+
+impl Protect {
+    fn check(&self) -> Result<()> {
+        for (what, text) in [("name_prefix", &self.name_prefix), ("name_suffix", &self.name_suffix)] {
+            anyhow::ensure!(text.chars().count() <= 24, "{what} can be at most 24 characters");
+            anyhow::ensure!(!text.chars().any(char::is_control), "{what} cannot contain control characters");
+        }
+        Ok(())
+    }
 }
 
 fn https_port() -> u16 {
@@ -57,7 +75,11 @@ pub fn load(state_dir: &Path) -> Result<Config> {
 }
 
 fn parse(text: &str) -> Result<Config> {
-    Ok(toml::from_str(text)?)
+    let config: Config = toml::from_str(text)?;
+    if let Some(protect) = &config.protect {
+        protect.check()?;
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -72,6 +94,15 @@ mod tests {
         assert!(protect.fingerprint.is_none() && protect.devices.is_none());
         let filtered = parse("[protect]\nhost = \"h\"\nusername = \"u\"\ndevices = [\"Front Door\"]\n").unwrap();
         assert_eq!(filtered.protect.unwrap().devices.unwrap(), ["Front Door"]);
+
+        let plain = parse("[protect]\nhost = \"h\"\nusername = \"u\"\n").unwrap().protect.unwrap();
+        assert_eq!((plain.name_prefix.as_str(), plain.name_suffix.as_str()), ("", ""));
+        let named = parse("[protect]\nhost = \"h\"\nusername = \"u\"\nname_prefix = \"UP \"\nname_suffix = \" HM\"\n");
+        let named = named.unwrap().protect.unwrap();
+        assert_eq!((named.name_prefix.as_str(), named.name_suffix.as_str()), ("UP ", " HM"));
+        let long = format!("[protect]\nhost = \"h\"\nusername = \"u\"\nname_suffix = \"{}\"\n", "x".repeat(25));
+        assert!(parse(&long).is_err());
+        assert!(parse("[protect]\nhost = \"h\"\nusername = \"u\"\nname_prefix = \"a\\tb\"\n").is_err());
         assert!(parse("").unwrap().protect.is_none());
     }
 

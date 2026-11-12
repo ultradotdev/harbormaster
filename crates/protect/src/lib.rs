@@ -9,7 +9,7 @@ pub mod model;
 mod tls;
 mod updates;
 
-pub use client::{Client, Error};
+pub use client::{Client, Error, Talkback};
 pub use livestream::{Decoder, FeedError, FeedOptions, FrameCounts, Livestream, Segment};
 pub use tls::{fetch_fingerprint, BadFingerprint, Fingerprint};
 pub use updates::{decode_packet, DecodeError, Update, UpdateStream};
