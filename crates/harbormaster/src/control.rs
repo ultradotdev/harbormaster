@@ -27,6 +27,17 @@ pub enum Command {
         #[serde(default)]
         name: Option<String>,
     },
+    /// Put this text before every name sent to HomeKit. Absent means
+    /// whatever `config.toml` says.
+    SetNamePrefix {
+        #[serde(default)]
+        text: Option<String>,
+    },
+    /// The same, after every name.
+    SetNameSuffix {
+        #[serde(default)]
+        text: Option<String>,
+    },
 }
 
 /// Every struct here defaults its missing fields and ignores unknown ones,
@@ -51,6 +62,10 @@ pub struct State {
     pub time: u64,
     /// HomeKit's configuration number, which rises when accessories change.
     pub config_number: u32,
+    /// Text put before and after every device name sent to HomeKit. Device
+    /// names in this snapshot are plain: they never include it.
+    pub name_prefix: String,
+    pub name_suffix: String,
     /// Absent when no UniFi Protect console is configured.
     pub console: Option<Console>,
     pub devices: Vec<Device>,
@@ -238,6 +253,13 @@ mod tests {
         let rename: Command = serde_json::from_str(r#"{"type":"rename","key":"k","extra":1}"#).unwrap();
         assert_eq!(rename, Command::Rename { key: "k".into(), name: None });
         assert!(serde_json::from_str::<Command>(r#"{"type":"reboot"}"#).is_err());
+        // Spaces in a prefix are part of it and must survive the trip.
+        let prefix = Command::SetNamePrefix { text: Some("HM ".into()) };
+        let line = serde_json::to_string(&prefix).unwrap();
+        assert_eq!(line, r#"{"type":"set_name_prefix","text":"HM "}"#);
+        assert_eq!(serde_json::from_str::<Command>(&line).unwrap(), prefix);
+        let default: Command = serde_json::from_str(r#"{"type":"set_name_suffix"}"#).unwrap();
+        assert_eq!(default, Command::SetNameSuffix { text: None });
     }
 
     /// The fields a TUI from before the dashboard insists on must stay.
