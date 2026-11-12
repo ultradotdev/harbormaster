@@ -30,11 +30,14 @@ use crate::control::{self, Command, Device, LogLine, Message, State};
 
 /// Longest device name that can be typed, matching what the daemon accepts.
 const MAX_NAME: usize = crate::overrides::MAX_NAME;
+const MAX_AFFIX: usize = crate::overrides::MAX_AFFIX;
 
 /// Log lines kept in the TUI for scrolling back.
 const MAX_LOG_LINES: usize = 2000;
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
+/// The prefix and suffix HomeKit is given, set apart from the name itself.
+const AFFIX: Style = Style::new().fg(Color::White).bg(Color::DarkGray);
 const GOOD: Style = Style::new().fg(Color::Green);
 const WARN: Style = Style::new().fg(Color::Yellow);
 const BAD: Style = Style::new().fg(Color::Red);
@@ -53,8 +56,26 @@ enum Modal {
     Setup,
     /// Asking before a device is taken away from HomeKit.
     ConfirmUnshare { key: String, name: String },
-    /// Typing a device's new name.
-    Rename { key: String, input: String },
+    /// Typing a device's new name, or the prefix or suffix for all names.
+    Edit { target: Target, input: String },
+}
+
+/// What a line of typed text is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Target {
+    /// The name of the device with this key.
+    Device(String),
+    Prefix,
+    Suffix,
+}
+
+impl Target {
+    fn limit(&self) -> usize {
+        match self {
+            Target::Device(_) => MAX_NAME,
+            Target::Prefix | Target::Suffix => MAX_AFFIX,
+        }
+    }
 }
 
 /// Something a line of the device pane does when clicked.
@@ -62,6 +83,8 @@ enum Modal {
 enum Action {
     ToggleShared,
     Rename,
+    Prefix,
+    Suffix,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,14 +274,51 @@ impl App {
 
     fn start_rename(&mut self) {
         if let Some((key, name)) = self.selected_device().and_then(|d| Some((d.key.clone()?, d.name.clone()))) {
-            self.modal = Modal::Rename { key, input: name };
+            self.modal = Modal::Edit { target: Target::Device(key), input: name };
         }
+    }
+
+    /// The prefix and suffix on names sent to HomeKit.
+    fn affix(&self) -> (&str, &str) {
+        self.state.as_ref().map_or(("", ""), |s| (s.name_prefix.as_str(), s.name_suffix.as_str()))
+    }
+
+    fn edit_affix(&mut self, target: Target) {
+        if self.state.is_some() {
+            let (prefix, suffix) = self.affix();
+            let input = if target == Target::Prefix { prefix } else { suffix }.to_owned();
+            self.modal = Modal::Edit { target, input };
+        }
+    }
+
+    /// A device's name as HomeKit has it: prefix, plain name, suffix, with
+    /// the prefix and suffix set apart. If the whole does not fit in
+    /// `width` the plain name gives way first, down to a few letters, and
+    /// then the prefix and suffix.
+    fn homekit_name(&self, d: &Device, width: usize) -> Vec<Span<'static>> {
+        // Only shared Protect devices are published under the prefix and suffix.
+        let (prefix, suffix) = if d.hidden || d.key.is_none() { ("", "") } else { self.affix() };
+        let (prefix_len, suffix_len) = (prefix.chars().count(), suffix.chars().count());
+        let name = fit(&d.name, width.saturating_sub(prefix_len + suffix_len).max(4));
+        let room = width.saturating_sub(name.chars().count());
+        let suffix_room = suffix_len.min(room.saturating_sub(prefix_len).max(room / 2));
+        let mut spans = Vec::new();
+        if !prefix.is_empty() {
+            spans.push(Span::styled(fit(prefix, room - suffix_room), AFFIX));
+        }
+        spans.push(Span::raw(name));
+        if !suffix.is_empty() {
+            spans.push(Span::styled(fit(suffix, suffix_room), AFFIX));
+        }
+        spans
     }
 
     fn run(&mut self, action: Action) {
         match action {
             Action::ToggleShared => self.toggle_shared(),
             Action::Rename => self.start_rename(),
+            Action::Prefix => self.edit_affix(Target::Prefix),
+            Action::Suffix => self.edit_affix(Target::Suffix),
         }
     }
 
@@ -273,19 +333,23 @@ impl App {
                     self.outbox.push(Command::SetShared { key, shared: false });
                 }
             }
-            Modal::Rename { key, mut input } => match code {
-                KeyCode::Enter => {
-                    let name = Some(input.trim().to_owned()).filter(|n| !n.is_empty());
-                    self.outbox.push(Command::Rename { key, name });
-                }
+            Modal::Edit { target, mut input } => match code {
+                KeyCode::Enter => self.outbox.push(match target {
+                    Target::Device(key) => {
+                        Command::Rename { key, name: Some(input.trim().to_owned()).filter(|n| !n.is_empty()) }
+                    }
+                    // Sent exactly as typed: the spaces are what separate it from the name.
+                    Target::Prefix => Command::SetNamePrefix { text: Some(input) },
+                    Target::Suffix => Command::SetNameSuffix { text: Some(input) },
+                }),
                 KeyCode::Esc => {}
                 other => {
                     match other {
-                        KeyCode::Char(c) if input.chars().count() < MAX_NAME => input.push(c),
+                        KeyCode::Char(c) if input.chars().count() < target.limit() => input.push(c),
                         KeyCode::Backspace => drop(input.pop()),
                         _ => {}
                     }
-                    self.modal = Modal::Rename { key, input };
+                    self.modal = Modal::Edit { target, input };
                 }
             },
         }
@@ -329,6 +393,8 @@ impl App {
                     KeyCode::Char('p') => self.modal = Modal::Setup,
                     KeyCode::Char('s') => self.toggle_shared(),
                     KeyCode::Char('r') => self.start_rename(),
+                    KeyCode::Char('P') => self.edit_affix(Target::Prefix),
+                    KeyCode::Char('S') => self.edit_affix(Target::Suffix),
                     KeyCode::Char('w') => {
                         self.warnings_only = !self.warnings_only;
                         self.log_scroll = 0;
@@ -519,7 +585,8 @@ impl App {
         for part in self.summary(d) {
             let needed = part.content.chars().count() + if out.is_empty() { 0 } else { 3 };
             if used + needed > width {
-                break;
+                // A shorter fact further along may still fit.
+                continue;
             }
             if !out.is_empty() {
                 out.push(Span::styled(" · ", DIM));
@@ -550,7 +617,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let hints = if app.selected_device().is_some_and(|d| d.key.is_some()) {
         " ↑↓ select  Tab pane  s share  r rename  w warnings  f device log  q quit"
     } else {
-        " ↑↓ select  Tab pane  Enter open  w warnings  f device log  p pairing  q quit"
+        " ↑↓ select  Tab pane  P prefix  S suffix  w warnings  f log  p pair  q quit"
     };
     frame.render_widget(Paragraph::new(hints).style(DIM), footer);
     match &app.modal {
@@ -570,14 +637,34 @@ fn draw(frame: &mut Frame, app: &mut App) {
             // The Yes button is the start of the last line.
             app.yes_area = Rect { x: area.x + 2, y: area.bottom().saturating_sub(2), width: 24.min(area.width), height: 1 };
         }
-        Modal::Rename { input, .. } => {
+        Modal::Edit { target, input } => {
+            let cursor = Span::styled("▏", Style::new().fg(Color::Cyan));
+            let (title, typed, hints) = match target {
+                Target::Device(_) => (
+                    "Name to publish",
+                    Span::raw(input.clone()),
+                    [" Leave it empty to use Protect's own name.", " The prefix and suffix are added for you."],
+                ),
+                // Shown on a background so spaces at either end can be seen.
+                Target::Prefix => (
+                    "Prefix for every HomeKit name",
+                    Span::styled(input.clone(), AFFIX),
+                    [" Spaces count: end it with one to keep it", " apart from the name. Empty means none."],
+                ),
+                Target::Suffix => (
+                    "Suffix for every HomeKit name",
+                    Span::styled(input.clone(), AFFIX),
+                    [" Spaces count: start it with one to keep it", " apart from the name. Empty means none."],
+                ),
+            };
             let lines = vec![
-                Line::from(vec![Span::raw(format!(" {input}")), Span::styled("▏", Style::new().fg(Color::Cyan))]),
+                Line::from(vec![Span::raw(" "), typed, cursor]),
                 Line::raw(""),
                 Line::styled(" Enter saves · Esc cancels", DIM),
-                Line::styled(" Leave it empty to use Protect's own name.", DIM),
+                Line::styled(hints[0], DIM),
+                Line::styled(hints[1], DIM),
             ];
-            draw_box(frame, "Name to publish", lines);
+            draw_box(frame, title, lines);
         }
     }
 }
@@ -655,10 +742,11 @@ fn draw_devices(frame: &mut Frame, app: &mut App, area: Rect) {
         let mut spans = match row.checked_sub(1).and_then(|i| app.devices.get(i)) {
             None => vec![Span::raw("  Overview")],
             Some(d) => {
-                // The name keeps at least half the row; the rest is state.
-                let name = fit(&d.name, width.saturating_sub(3));
-                let room = width.saturating_sub(4 + name.chars().count());
-                let mut spans = vec![Span::raw(" "), dot(d.online), Span::raw(format!(" {name}"))];
+                // The name comes first; whatever room is left shows state.
+                let name = app.homekit_name(d, width.saturating_sub(3));
+                let room = width.saturating_sub(4 + name.iter().map(|s| s.content.chars().count()).sum::<usize>());
+                let mut spans = vec![Span::raw(" "), dot(d.online), Span::raw(" ")];
+                spans.extend(name);
                 let state = app.summary_line(d, room);
                 let used: usize = state.iter().map(|s| s.content.chars().count()).sum();
                 spans.push(Span::raw(" ".repeat(room.saturating_sub(used) + 1)));
@@ -686,7 +774,21 @@ fn heading(text: &str) -> Line<'static> {
     Line::styled(text.to_owned(), Style::new().add_modifier(Modifier::BOLD))
 }
 
-fn overview_lines(app: &App, s: &State, width: usize) -> Vec<Line<'static>> {
+/// How a prefix or suffix is shown as a setting.
+fn affix_setting(label: &str, key: &str, text: &str) -> Line<'static> {
+    let value = if text.is_empty() { Span::styled("none", DIM) } else { Span::styled(text.to_owned(), AFFIX) };
+    Line::from(vec![
+        Span::styled(format!("{label:<12} "), DIM),
+        value,
+        Span::styled(format!("  {key}"), Style::new().fg(Color::Cyan)),
+        Span::styled(" to change", DIM),
+    ])
+}
+
+/// The lines of the overview, and which of them can be clicked.
+fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Vec<(usize, Action)>) {
+    // The two lines after the first five fields are the name settings.
+    let actions = vec![(5, Action::Prefix), (6, Action::Suffix)];
     let mut lines = vec![
         field("Bridge", format!("{}  v{}", s.name, s.version)),
         field("Listening", format!("{}  configuration {}", s.listen, s.config_number)),
@@ -718,6 +820,8 @@ fn overview_lines(app: &App, s: &State, width: usize) -> Vec<Line<'static>> {
                 None => Span::styled("no UniFi Protect configured", DIM),
             },
         ),
+        affix_setting("Name prefix", "P", &s.name_prefix),
+        affix_setting("Name suffix", "S", &s.name_suffix),
         Line::raw(""),
         heading("Controllers"),
     ];
@@ -741,21 +845,22 @@ fn overview_lines(app: &App, s: &State, width: usize) -> Vec<Line<'static>> {
     }
     lines.push(Line::raw(""));
     lines.push(heading("Devices"));
-    let name_width = app.devices.iter().map(|d| d.name.chars().count()).max().unwrap_or(0).clamp(4, 22);
+    let affix = s.name_prefix.chars().count() + s.name_suffix.chars().count();
+    let name_width = app.devices.iter().map(|d| d.name.chars().count()).max().unwrap_or(0).clamp(4, 22) + affix;
     for d in &app.devices {
-        let mut spans = vec![
-            Span::raw("  "),
-            dot(d.online),
-            Span::raw(format!(" {:<name_width$} ", fit(&d.name, name_width))),
-            Span::styled(format!("{:<9}", d.kind), DIM),
-        ];
+        let name = app.homekit_name(d, name_width);
+        let used: usize = name.iter().map(|s| s.content.chars().count()).sum();
+        let mut spans = vec![Span::raw("  "), dot(d.online), Span::raw(" ")];
+        spans.extend(name);
+        spans.push(Span::raw(" ".repeat(name_width.saturating_sub(used) + 1)));
+        spans.push(Span::styled(format!("{:<9}", d.kind), DIM));
         spans.extend(app.summary_line(d, width.saturating_sub(name_width + 14)));
         lines.push(Line::from(spans));
     }
     if app.devices.is_empty() {
         lines.push(Line::styled("  none published", DIM));
     }
-    lines
+    (lines, actions)
 }
 
 /// The lines of a device's pane, and which of them can be clicked.
@@ -797,8 +902,13 @@ fn device_facts(app: &App, d: &Device) -> Vec<Line<'static>> {
         field("Status", status),
         field("Model", d.model.clone()),
         field("Serial", format!("{}  HomeKit id {}", d.serial_number, d.aid)),
-        Line::raw(""),
     ];
+    if app.affix() != ("", "") && d.key.is_some() && !d.hidden {
+        let mut name = vec![Span::styled(format!("{:<12} ", "In HomeKit"), DIM)];
+        name.extend(app.homekit_name(d, usize::MAX));
+        lines.push(Line::from(name));
+    }
+    lines.push(Line::raw(""));
     let yes_no = |on: bool, yes: &'static str, no: &'static str| if on { Span::styled(yes, WARN) } else { Span::raw(no) };
     if d.motion.is_some() || d.last_motion.is_some() {
         let last = d.last_motion.map_or("none since the bridge started".to_owned(), |at| format!("last {}", app.when(at)));
@@ -852,7 +962,10 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             let (lines, actions) = device_lines(app, d);
             (format!("{} · {}", d.name, d.kind), lines, actions)
         }
-        (Some(s), None) => ("Overview".to_owned(), overview_lines(app, s, width), Vec::new()),
+        (Some(s), None) => {
+            let (lines, actions) = overview_lines(app, s, width);
+            ("Overview".to_owned(), lines, actions)
+        }
         (None, _) => ("Overview".to_owned(), vec![Line::styled("waiting for the daemon", DIM)], Vec::new()),
     };
     app.actions = actions;
@@ -1050,6 +1163,8 @@ mod tests {
             }],
             accessories: Vec::new(),
             time: NOW,
+            name_prefix: String::new(),
+            name_suffix: String::new(),
             config_number: 12,
             console: Some(Console { host: "192.0.2.1".into(), connected: true, last_update: Some(NOW - 2) }),
             devices: vec![
@@ -1488,7 +1603,7 @@ mod tests {
         for _ in 0..100 {
             app.handle(key(KeyCode::Char('x')));
         }
-        assert!(matches!(&app.modal, Modal::Rename { input, .. } if input.chars().count() == MAX_NAME));
+        assert!(matches!(&app.modal, Modal::Edit { input, .. } if input.chars().count() == MAX_NAME));
     }
 
     #[test]
@@ -1499,7 +1614,7 @@ mod tests {
         let row = |text: &str| screen.lines().position(|l| l.contains(text)).unwrap() as u16;
         let x = app.detail_area.x + 8;
         app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, row("Name: Yard")));
-        assert!(matches!(app.modal, Modal::Rename { .. }));
+        assert!(matches!(app.modal, Modal::Edit { target: Target::Device(_), .. }));
         // A click outside the box closes it.
         app.handle(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
         assert_eq!(app.modal, Modal::None);
@@ -1516,6 +1631,130 @@ mod tests {
         render(&mut app);
         app.handle(mouse(MouseEventKind::Down(MouseButton::Left), app.yes_area.x + 3, yes));
         assert_eq!(app.outbox, [Command::SetShared { key: "protect:sensor:5".into(), shared: false }]);
+    }
+
+    fn with_affix(mut state: State) -> State {
+        state.name_prefix = "HM ".into();
+        state.name_suffix = " (UP)".into();
+        state
+    }
+
+    /// The text drawn on the affix background, row by row.
+    fn affix_cells(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .filter(|x| buffer[(*x, y)].bg == Color::DarkGray)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prefix_and_suffix_are_set_apart_from_the_name() {
+        let mut app = app_with(with_affix(editable(sample_state(true))));
+        let screen = render(&mut app);
+        // The whole HomeKit name reads naturally at 80 columns...
+        assert_shows(&screen, &["● HM Front Door (UP)", "● HM Garage (UP)", "Name prefix  HM   P to change", "Name suffix   (UP)  S to change"]);
+        // ...and only the prefix and suffix sit on the background.
+        let marked = affix_cells(&mut app, 80, 24);
+        let row = screen.lines().position(|l| l.contains("● HM Garage (UP)")).unwrap();
+        assert!(marked[row].starts_with("HM  (UP)"), "{:?}", marked[row]);
+        let wide = render_at(&mut app, 140, 40);
+        let table = wide.lines().position(|l| l.contains("HM Garage (UP)") && l.contains("camera   motion")).unwrap();
+        let marked_wide = affix_cells(&mut app, 140, 40);
+        assert!(marked_wide[table].ends_with("HM  (UP)"), "the overview table marks them too: {:?}", marked_wide[table]);
+        // A device that is not shared has no HomeKit name to decorate.
+        assert!(!screen.contains("HM Side Gate"));
+
+        // The device pane spells out what HomeKit is given.
+        app.select(2);
+        let screen = render(&mut app);
+        assert_shows(&screen, &["Garage · camera", "In HomeKit   HM Garage (UP)", "r  Name: Garage  (Protect: Garage Cam)"]);
+
+        // With neither set, nothing is marked and no line is spent on it.
+        let mut plain = app_with(editable(sample_state(true)));
+        plain.select(2);
+        assert!(!render(&mut plain).contains("In HomeKit"));
+        assert!(affix_cells(&mut plain, 80, 24).iter().all(String::is_empty));
+        plain.select(0);
+        assert_shows(&render(&mut plain), &["Name prefix  none  P to change"]);
+    }
+
+    #[test]
+    fn long_affixes_squeeze_the_name_not_themselves() {
+        let mut state = with_affix(editable(sample_state(true)));
+        state.name_prefix = "Harbormaster bridge ".into();
+        let mut app = app_with(state);
+        let screen = render(&mut app);
+        assert!(screen.contains("● Harbormaster brid…Fro… (UP)│"), "{screen}");
+        assert!(screen.lines().all(|l| l.chars().count() == 80));
+    }
+
+    #[test]
+    fn the_log_filter_and_selection_go_by_the_plain_name() {
+        let mut app = app_with(with_affix(editable(sample_state(true))));
+        app.handle(key(KeyCode::Down));
+        assert_eq!(app.selected_device().unwrap().name, "Front Door");
+        let screen = render(&mut app);
+        // The log knows devices by their plain names, so that is what is matched.
+        assert_shows(&screen, &["Log: Front Door (f for all)", "Front Door: motion event 36"]);
+        assert!(!screen.contains("nothing logged that matches") && !screen.contains("Garage: ffmpeg"), "{screen}");
+        // Renaming starts from the plain name: the affix is never typed.
+        app.handle(key(KeyCode::Char('r')));
+        assert_eq!(app.modal, Modal::Edit { target: Target::Device("protect:doorbell:2".into()), input: "Front Door".into() });
+        assert_shows(&render(&mut app), &["The prefix and suffix are added for you."]);
+    }
+
+    #[test]
+    fn prefix_and_suffix_are_edited_from_the_keyboard_or_by_clicking() {
+        let mut app = app_with(with_affix(editable(sample_state(true))));
+        render(&mut app);
+        app.handle(key(KeyCode::Char('P')));
+        let screen = render(&mut app);
+        assert_shows(&screen, &["Prefix for every HomeKit name", " HM ▏", "Spaces count"]);
+        // The typed text sits on the background, so its trailing space shows.
+        assert!(affix_cells(&mut app, 80, 24).iter().any(|row| row == "HM "));
+        for _ in 0..3 {
+            app.handle(key(KeyCode::Backspace));
+        }
+        for c in "UP: ".chars() {
+            app.handle(key(KeyCode::Char(c)));
+        }
+        app.handle(key(KeyCode::Enter));
+        assert_eq!(app.outbox, [Command::SetNamePrefix { text: Some("UP: ".into()) }], "sent exactly as typed");
+
+        // Emptying the suffix asks for none; the limit is the config's.
+        app.outbox.clear();
+        app.handle(key(KeyCode::Char('S')));
+        for _ in 0..9 {
+            app.handle(key(KeyCode::Backspace));
+        }
+        app.handle(key(KeyCode::Enter));
+        assert_eq!(app.outbox, [Command::SetNameSuffix { text: Some(String::new()) }]);
+        app.outbox.clear();
+        app.handle(key(KeyCode::Char('S')));
+        for _ in 0..40 {
+            app.handle(key(KeyCode::Char('x')));
+        }
+        assert!(matches!(&app.modal, Modal::Edit { input, .. } if input.chars().count() == MAX_AFFIX));
+        app.handle(key(KeyCode::Esc));
+        assert!(app.outbox.is_empty());
+
+        // Clicking the setting's line on the overview opens the same box.
+        let screen = render(&mut app);
+        let row = screen.lines().position(|l| l.contains("Name suffix")).unwrap() as u16;
+        app.handle(mouse(MouseEventKind::Down(MouseButton::Left), app.detail_area.x + 6, row));
+        assert_eq!(app.modal, Modal::Edit { target: Target::Suffix, input: " (UP)".into() });
+        app.handle(key(KeyCode::Esc));
+        // The keys work from a device's pane too.
+        app.select(3);
+        app.handle(key(KeyCode::Char('P')));
+        assert!(matches!(app.modal, Modal::Edit { target: Target::Prefix, .. }));
     }
 
     #[test]
