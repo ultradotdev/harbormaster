@@ -3,6 +3,7 @@
 //! `harbormaster daemon` runs the bridge. `harbormaster` (or `harbormaster
 //! tui`) attaches a terminal interface to a running daemon.
 
+mod clock;
 mod config;
 mod control;
 mod daemon;
