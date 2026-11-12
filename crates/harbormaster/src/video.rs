@@ -358,12 +358,15 @@ impl Stream {
             stream.run(&pending, &video, audio, feed, &mut stopped, &progress).await;
             // Whether video actually flowed, which other lines cannot say.
             tracing::info!(
-                "{}: stream to {viewer} stopped after {:.0} s: the camera supplied {} kB; ffmpeg sent {} frames, {} kB",
+                "{}: stream to {viewer} stopped after {:.0} s: the camera supplied {} kB; ffmpeg sent {} frames, {} kB; \
+                 the viewer sent back {} reports and {} packets of sound",
                 stream.name,
                 began.elapsed().as_secs_f64(),
                 progress.received.load(Ordering::Relaxed) / 1000,
                 progress.frames.load(Ordering::Relaxed),
-                progress.sent.load(Ordering::Relaxed) / 1000
+                progress.sent.load(Ordering::Relaxed) / 1000,
+                progress.reports.load(Ordering::Relaxed),
+                progress.voice.load(Ordering::Relaxed)
             );
             let mut state = stream.state.lock().unwrap();
             if state.running.as_ref().is_some_and(|r| r.session_id == session_id) {
@@ -434,18 +437,20 @@ impl Stream {
 
         // The viewer may talk back. Their sound arrives on the port this
         // stream reserved, and goes to the camera's speaker if it has one.
-        let talking = match (&audio, self.source.speaker_rate(), pending.socket.try_clone()) {
-            (Some(audio), Some(rate), Ok(socket)) => Some(tokio::spawn(talk_back(
+        // Whatever the viewer sends is also counted: its regular reports
+        // are the only sign from here that it is receiving the stream.
+        let talking = pending.socket.try_clone().ok().map(|socket| {
+            tokio::spawn(talk_back(
                 self.ffmpeg.clone(),
                 self.name.clone(),
                 socket,
                 pending.request.clone(),
                 audio.clone(),
-                rate,
+                self.source.speaker_rate().filter(|_| audio.is_some()),
                 self.source.clone(),
-            ))),
-            _ => None,
-        };
+                progress.clone(),
+            ))
+        });
 
         // Hand the camera's video to ffmpeg as it arrives. Closing ffmpeg's
         // input when the feed ends lets it finish cleanly.
@@ -533,19 +538,33 @@ fn talk_sdp(request: &SetupRequest, audio: &SelectedAudio, port: u16) -> String 
 /// handed to a second ffmpeg, which decrypts and re-encodes it for the
 /// camera. The speaker is opened when sound first arrives and closed again
 /// after a silence.
+#[allow(clippy::too_many_arguments)]
 async fn talk_back(
     ffmpeg: PathBuf,
     name: String,
     socket: UdpSocket,
     request: SetupRequest,
-    audio: SelectedAudio,
-    rate: u32,
+    audio: Option<SelectedAudio>,
+    rate: Option<u32>,
     source: Arc<dyn VideoSource>,
+    progress: Arc<Progress>,
 ) {
     use tokio::io::AsyncReadExt;
+    if socket.set_nonblocking(true).is_err() {
+        return;
+    }
+    let Ok(incoming) = tokio::net::UdpSocket::from_std(socket) else { return };
+    // With no speaker to talk through, only count what arrives.
+    let (Some(audio), Some(rate)) = (audio, rate) else {
+        let mut packet = [0u8; 2048];
+        while let Ok(n) = incoming.recv(&mut packet).await {
+            if n > 8 && (200..=204).contains(&packet[1]) {
+                progress.reports.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        return;
+    };
     let ready = async {
-        socket.set_nonblocking(true).ok()?;
-        let incoming = tokio::net::UdpSocket::from_std(socket).ok()?;
         // A free local port for ffmpeg to listen on.
         let port = tokio::net::UdpSocket::bind("127.0.0.1:0").await.ok()?.local_addr().ok()?.port();
         let rate = rate.to_string();
@@ -585,8 +604,13 @@ async fn talk_back(
         let mut packet = [0u8; 2048];
         loop {
             let Ok(n) = incoming.recv(&mut packet).await else { return };
-            let is_rtp = n > 12 && packet[0] >> 6 == 2 && !(200..=204).contains(&packet[1]);
+            if n > 8 && (200..=204).contains(&packet[1]) {
+                progress.reports.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let is_rtp = n > 12 && packet[0] >> 6 == 2;
             if is_rtp && packet[1] & 0x7f == audio.payload_type {
+                progress.voice.fetch_add(1, Ordering::Relaxed);
                 let _ = incoming.send_to(&packet[..n], target).await;
             }
         }
@@ -640,6 +664,10 @@ struct Progress {
     frames: AtomicU64,
     /// Bytes ffmpeg reports having sent.
     sent: AtomicU64,
+    /// Control packets the viewer sent back: its reports on what it received.
+    reports: AtomicU64,
+    /// Packets of the viewer's own sound, when talking back.
+    voice: AtomicU64,
 }
 
 impl Progress {
@@ -1120,7 +1148,16 @@ pub(crate) mod tests {
             SelectedAudio { codec: camera::OPUS, sample_rate_hz: 16000, payload_type: 110, max_bitrate_kbps: 24, packet_time_ms: 20 };
         let (speaker, mut heard) = mpsc::channel(64);
         let talking =
-            tokio::spawn(talk_back(ffmpeg.clone(), "Cam".into(), reserved, setup.clone(), audio, 22050, Arc::new(Speaker(speaker))));
+            tokio::spawn(talk_back(
+                ffmpeg.clone(),
+                "Cam".into(),
+                reserved,
+                setup.clone(),
+                Some(audio),
+                Some(22050),
+                Arc::new(Speaker(speaker)),
+                Arc::new(Progress::default()),
+            ));
 
         // Give the receiving side a moment to start listening.
         tokio::time::sleep(Duration::from_millis(700)).await;
