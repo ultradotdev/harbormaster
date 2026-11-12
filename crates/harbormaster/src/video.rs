@@ -359,13 +359,14 @@ impl Stream {
             // Whether video actually flowed, which other lines cannot say.
             tracing::info!(
                 "{}: stream to {viewer} stopped after {:.0} s: the camera supplied {} kB; ffmpeg sent {} frames, {} kB; \
-                 the viewer sent back {} reports and {} packets of sound",
+                 the viewer sent back {} reports ({}) and {} packets of sound",
                 stream.name,
                 began.elapsed().as_secs_f64(),
                 progress.received.load(Ordering::Relaxed) / 1000,
                 progress.frames.load(Ordering::Relaxed),
                 progress.sent.load(Ordering::Relaxed) / 1000,
                 progress.reports.load(Ordering::Relaxed),
+                progress.per_reporter(),
                 progress.voice.load(Ordering::Relaxed)
             );
             let mut state = stream.state.lock().unwrap();
@@ -559,7 +560,7 @@ async fn talk_back(
         let mut packet = [0u8; 2048];
         while let Ok(n) = incoming.recv(&mut packet).await {
             if n > 8 && (200..=204).contains(&packet[1]) {
-                progress.reports.fetch_add(1, Ordering::Relaxed);
+                progress.report(&packet[..n]);
             }
         }
         return;
@@ -605,7 +606,7 @@ async fn talk_back(
         loop {
             let Ok(n) = incoming.recv(&mut packet).await else { return };
             if n > 8 && (200..=204).contains(&packet[1]) {
-                progress.reports.fetch_add(1, Ordering::Relaxed);
+                progress.report(&packet[..n]);
                 continue;
             }
             let is_rtp = n > 12 && packet[0] >> 6 == 2;
@@ -666,11 +667,39 @@ struct Progress {
     sent: AtomicU64,
     /// Control packets the viewer sent back: its reports on what it received.
     reports: AtomicU64,
+    /// The same, counted per sender id. A viewer reports on picture and
+    /// sound under different ids, so this shows whether both arrived.
+    reporters: Mutex<Vec<(u32, u32)>>,
     /// Packets of the viewer's own sound, when talking back.
     voice: AtomicU64,
 }
 
 impl Progress {
+    /// Counts one control packet from the viewer. Its sender id sits in
+    /// the clear even though the rest is encrypted.
+    fn report(&self, packet: &[u8]) {
+        self.reports.fetch_add(1, Ordering::Relaxed);
+        let Some(id) = packet.get(4..8) else { return };
+        let id = u32::from_be_bytes([id[0], id[1], id[2], id[3]]);
+        let mut reporters = self.reporters.lock().unwrap();
+        if let Some(index) = reporters.iter().position(|(known, _)| *known == id) {
+            reporters[index].1 += 1;
+        } else if reporters.len() < 8 {
+            // A handful at most; anything beyond that is ignored.
+            reporters.push((id, 1));
+        }
+    }
+
+    /// How many reports each of the viewer's senders made, largest first.
+    fn per_reporter(&self) -> String {
+        let mut counts: Vec<u32> = self.reporters.lock().unwrap().iter().map(|(_, count)| *count).collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        match counts.len() {
+            0 => "none".to_owned(),
+            n => format!("{} from {n} sender{}", counts.iter().map(u32::to_string).collect::<Vec<_>>().join(" + "), if n == 1 { "" } else { "s" }),
+        }
+    }
+
     /// Takes a line of ffmpeg's output and says whether it was one of its
     /// periodic `key=value` progress reports rather than a complaint.
     fn note(&self, line: &str) -> bool {
@@ -899,6 +928,15 @@ pub(crate) mod tests {
         assert!(!progress.note("Conversion failed!"));
         assert_eq!(progress.frames.load(Ordering::Relaxed), 150);
         assert_eq!(progress.sent.load(Ordering::Relaxed), 204800);
+
+        // Reports are counted per sender.
+        assert_eq!(progress.per_reporter(), "none");
+        let from = |id: u32| [&[0x81, 201, 0, 7][..], &id.to_be_bytes()[..], &[0; 8][..]].concat();
+        for id in [7, 9, 7, 7] {
+            progress.report(&from(id));
+        }
+        assert_eq!(progress.reports.load(Ordering::Relaxed), 4);
+        assert_eq!(progress.per_reporter(), "3 + 1 from 2 senders");
     }
 
     #[test]
