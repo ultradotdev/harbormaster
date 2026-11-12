@@ -136,6 +136,23 @@ impl Bridge {
         self.shared.publish();
     }
 
+    /// Tells controllers to read every accessory again, whether or not the
+    /// set of accessories and services changed. For changes the database's
+    /// shape does not show, such as new names.
+    pub fn republish(&self) {
+        let store = &self.shared.store;
+        let bumped = match store.sync_layout(&self.shared.db.layout()) {
+            Ok(true) => Ok(store.config_number()),
+            Ok(false) => store.bump_config_number(),
+            Err(e) => Err(e),
+        };
+        match bumped {
+            Ok(number) => tracing::info!("accessories changed (configuration {number})"),
+            Err(e) => tracing::error!("could not save configuration number: {e}"),
+        }
+        self.shared.publish();
+    }
+
     /// Currently open controller connections, oldest first.
     pub fn connections(&self) -> Vec<ConnectionInfo> {
         self.shared.connections.lock().unwrap().values().cloned().collect()
