@@ -15,6 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 
 use crate::control::{self, Message, Reading, State};
+use crate::status;
 use crate::protect_bridge::ProtectBridge;
 use crate::config;
 use crate::logbuf::LogBuffer;
@@ -36,6 +37,8 @@ struct Daemon {
     db: Arc<Database>,
     bridge: Arc<Bridge>,
     logs: LogBuffer,
+    /// Where the UniFi Protect console is, if one is configured.
+    console_host: Option<String>,
 }
 
 pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
@@ -69,7 +72,10 @@ pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
     }
     // Publish known Protect devices before HomeKit can connect, so that a
     // restart never looks like the accessories were removed.
-    let protect = match config::load(&options.state_dir)?.protect {
+    status::watch(status::global(), &db);
+    let protect = config::load(&options.state_dir)?.protect;
+    let console_host = protect.as_ref().map(|p| p.host.clone());
+    let protect = match protect {
         Some(protect) => Some(ProtectBridge::prepare(&options.state_dir, protect, store.clone(), db.clone())?),
         None => None,
     };
@@ -91,7 +97,7 @@ pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
         tokio::spawn(protect.run(bridge.clone()));
     }
 
-    let daemon = Arc::new(Daemon { name, started: Instant::now(), store, db, bridge, logs });
+    let daemon = Arc::new(Daemon { name, started: Instant::now(), store, db, bridge, logs, console_host });
     let serving = daemon.clone();
     tokio::spawn(async move {
         loop {
@@ -220,14 +226,14 @@ impl Daemon {
         }
 
         let (backlog, mut live) = self.logs.attach();
-        send(&mut stream, &Message::State(self.state())).await?;
+        send(&mut stream, &Message::State(Box::new(self.state()))).await?;
         for line in backlog {
             send(&mut stream, &Message::Log(line)).await?;
         }
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
-                _ = tick.tick() => send(&mut stream, &Message::State(self.state())).await?,
+                _ = tick.tick() => send(&mut stream, &Message::State(Box::new(self.state()))).await?,
                 line = live.recv() => match line {
                     Ok(line) => send(&mut stream, &Message::Log(line)).await?,
                     // A slow TUI just misses some lines.
@@ -241,7 +247,17 @@ impl Daemon {
     fn state(&self) -> State {
         let paired = self.store.is_paired();
         let now = SystemTime::now();
+        let board = status::global().snapshot();
+        let database = self.db.to_json();
         State {
+            time: now.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+            config_number: self.store.config_number(),
+            console: self.console_host.as_ref().map(|host| control::Console {
+                host: host.clone(),
+                connected: board.console_connected,
+                last_update: board.console_last_update,
+            }),
+            devices: devices(&database, &board),
             name: self.name.clone(),
             version: VERSION.to_owned(),
             listen: self.bridge.local_addr.to_string(),
@@ -265,7 +281,7 @@ impl Daemon {
                     connected_secs: now.duration_since(c.connected_at).map_or(0, |d| d.as_secs()),
                 })
                 .collect(),
-            accessories: accessories(&self.db.to_json()),
+            accessories: accessories(&database),
         }
     }
 }
@@ -314,6 +330,94 @@ fn accessories(db: &Value) -> Vec<control::Accessory> {
             out
         })
         .collect()
+}
+
+/// Works out what each published device is and what it is doing, from the
+/// HomeKit database and the status board. The bridge itself is left out.
+fn devices(db: &Value, board: &status::Snapshot) -> Vec<control::Device> {
+    use harbormaster_hap::camera::kind::CAMERA_RTP_STREAM_MANAGEMENT;
+    use harbormaster_hap::recording::kind::{ACTIVE, CAMERA_RECORDING_MANAGEMENT};
+    fn list(v: &Value) -> &[Value] {
+        v.as_array().map_or(&[], Vec::as_slice)
+    }
+    let mut out = Vec::new();
+    for accessory in list(&db["accessories"]) {
+        let aid = accessory["aid"].as_u64().unwrap_or(0);
+        let mut device = control::Device { aid, ..control::Device::default() };
+        let (mut bridge, mut video, mut doorbell, mut light) = (false, false, false, false);
+        for service in list(&accessory["services"]) {
+            let service_kind = service["type"].as_str().unwrap_or("");
+            match service_kind {
+                kind::PROTOCOL_INFORMATION => bridge = true,
+                CAMERA_RTP_STREAM_MANAGEMENT => video = true,
+                kind::DOORBELL => doorbell = true,
+                kind::LIGHTBULB => light = true,
+                _ => {}
+            }
+            for c in list(&service["characteristics"]) {
+                let (ty, value) = (c["type"].as_str().unwrap_or(""), &c["value"]);
+                let text = || value.as_str().unwrap_or("").to_owned();
+                let flag = || value.as_bool().or_else(|| value.as_u64().map(|n| n != 0));
+                let percent = || value.as_f64().map(|n| n.clamp(0.0, 100.0).round() as u8);
+                match (service_kind, ty) {
+                    (kind::ACCESSORY_INFORMATION, kind::NAME) => device.name = text(),
+                    (kind::ACCESSORY_INFORMATION, kind::MODEL) => device.model = text(),
+                    (kind::ACCESSORY_INFORMATION, kind::SERIAL_NUMBER) => device.serial_number = text(),
+                    (kind::ACCESSORY_INFORMATION, _) => {}
+                    // Every sensor service repeats these; they always agree.
+                    (_, kind::STATUS_ACTIVE) => device.online = device.online.or(flag()),
+                    (_, kind::STATUS_TAMPERED) => {
+                        device.tampered = Some(device.tampered.unwrap_or(false) || flag().unwrap_or(false))
+                    }
+                    (_, kind::MOTION_DETECTED) => device.motion = flag(),
+                    (kind::LIGHTBULB, kind::ON) => device.light_on = flag(),
+                    (kind::LIGHTBULB, kind::BRIGHTNESS) => device.brightness = percent(),
+                    (_, kind::BATTERY_LEVEL) => device.battery = percent(),
+                    (_, kind::STATUS_LOW_BATTERY) => device.low_battery = flag(),
+                    (CAMERA_RECORDING_MANAGEMENT, ACTIVE) => {
+                        device.recording =
+                            Some(control::Recording { enabled: flag().unwrap_or(false), ..Default::default() })
+                    }
+                    (
+                        _,
+                        kind::CURRENT_TEMPERATURE
+                        | kind::CURRENT_RELATIVE_HUMIDITY
+                        | kind::CURRENT_AMBIENT_LIGHT_LEVEL
+                        | kind::CONTACT_SENSOR_STATE
+                        | kind::LEAK_DETECTED,
+                    ) if !value.is_null() => device.readings.push(reading(ty, value, c["unit"].as_str())),
+                    _ => {}
+                }
+            }
+        }
+        if bridge {
+            continue;
+        }
+        device.kind = match (doorbell, board.kinds.get(&aid).copied()) {
+            (true, _) => "doorbell",
+            (false, Some(kind)) => kind,
+            (false, None) if video => "camera",
+            (false, None) if light => "light",
+            (false, None) => "sensor",
+        }
+        .to_owned();
+        device.last_motion = board.last_motion.get(&aid).copied();
+        device.last_ring = board.last_ring.get(&aid).copied();
+        device.viewers = board
+            .viewers
+            .iter()
+            .filter(|v| v.aid == aid)
+            .map(|v| control::Viewer { peer: display_ip(v.peer), width: v.width, height: v.height, secs: v.secs })
+            .collect();
+        // Recordings report by camera name, which is all that code knows.
+        let (active, last) = (board.recording.get(&device.name), board.last_recording.get(&device.name));
+        if let Some(recording) = device.recording.as_mut() {
+            recording.active_secs = active.copied();
+            (recording.last_at, recording.last_secs) = (last.map(|l| l.0), last.map(|l| l.1));
+        }
+        out.push(device);
+    }
+    out
 }
 
 fn reading(ty: &str, value: &Value, unit: Option<&str>) -> Reading {
@@ -382,6 +486,88 @@ mod tests {
         assert_eq!(view[0].readings.len(), 1);
         assert_eq!(view[0].readings[0].label, "Temperature");
         assert_eq!(view[0].readings[0].value, "21.2 °C");
+    }
+
+    #[test]
+    fn devices_combine_the_database_with_the_status_board() {
+        use harbormaster_hap::camera::kind::CAMERA_RTP_STREAM_MANAGEMENT;
+        use harbormaster_hap::recording::kind::{ACTIVE, CAMERA_RECORDING_MANAGEMENT};
+        let db = Database::new();
+        let info = |name: &'static str| Info {
+            name,
+            manufacturer: "Ubiquiti",
+            model: "G4",
+            serial_number: "AA01",
+            firmware_revision: "1",
+        };
+        let mut bridge = Accessory::new(1, &info("Bridge"));
+        bridge.add_service(kind::PROTOCOL_INFORMATION, false, vec![Characteristic::text(kind::VERSION, "1.1.0")]);
+        db.add(bridge);
+
+        let mut door = Accessory::new(2, &info("Front Door"));
+        door.add_service(
+            kind::DOORBELL,
+            true,
+            vec![Characteristic::sensor(kind::PROGRAMMABLE_SWITCH_EVENT, Format::Uint8, Value::Null)],
+        );
+        door.add_service(
+            kind::MOTION_SENSOR,
+            false,
+            vec![
+                Characteristic::sensor(kind::MOTION_DETECTED, Format::Bool, json!(true)),
+                Characteristic::sensor(kind::STATUS_ACTIVE, Format::Bool, json!(true)),
+            ],
+        );
+        door.add_service(CAMERA_RTP_STREAM_MANAGEMENT, false, vec![]);
+        door.add_service(
+            CAMERA_RECORDING_MANAGEMENT,
+            false,
+            vec![Characteristic::sensor(ACTIVE, Format::Uint8, json!(1))],
+        );
+        db.add(door);
+
+        let mut yard = Accessory::new(3, &info("Yard"));
+        yard.add_service(
+            kind::TEMPERATURE_SENSOR,
+            true,
+            vec![
+                Characteristic::sensor(kind::CURRENT_TEMPERATURE, Format::Float, json!(17.17)).unit("celsius"),
+                Characteristic::sensor(kind::STATUS_ACTIVE, Format::Bool, json!(false)),
+                Characteristic::sensor(kind::STATUS_TAMPERED, Format::Uint8, json!(1)),
+            ],
+        );
+        yard.add_service(
+            kind::BATTERY,
+            false,
+            vec![
+                Characteristic::sensor(kind::BATTERY_LEVEL, Format::Uint8, json!(93)),
+                Characteristic::sensor(kind::STATUS_LOW_BATTERY, Format::Uint8, json!(0)),
+            ],
+        );
+        db.add(yard);
+
+        let board = status::Status::new();
+        board.device_kind(2, "camera");
+        board.device_kind(3, "sensor");
+        board.ring(2);
+        let _viewer = board.viewing(2, "::ffff:10.0.0.5".parse().unwrap(), 1280, 720);
+        let _recording = board.recording("Front Door");
+        let view = devices(&db.to_json(), &board.snapshot());
+
+        assert_eq!(view.len(), 2, "the bridge itself is not a device");
+        let door = &view[0];
+        assert_eq!((door.kind.as_str(), door.name.as_str()), ("doorbell", "Front Door"));
+        assert_eq!((door.online, door.motion), (Some(true), Some(true)));
+        assert!(door.last_ring.is_some() && door.last_motion.is_none());
+        assert_eq!((door.viewers[0].peer.as_str(), door.viewers[0].width), ("10.0.0.5", 1280));
+        let recording = door.recording.as_ref().unwrap();
+        assert!(recording.enabled && recording.active_secs.is_some() && recording.last_at.is_none());
+
+        let yard = &view[1];
+        assert_eq!((yard.kind.as_str(), yard.online, yard.tampered), ("sensor", Some(false), Some(true)));
+        assert_eq!((yard.battery, yard.low_battery), (Some(93), Some(false)));
+        assert_eq!(yard.readings[0].value, "17.2 °C");
+        assert!(yard.recording.is_none() && yard.viewers.is_empty());
     }
 
     #[test]
