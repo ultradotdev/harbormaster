@@ -105,13 +105,16 @@ pub fn supported_video(resolutions: &[(u16, u16, u8)]) -> Value {
     tlv_value(&Tlv::new().with(0x01, &codec.encode()))
 }
 
-/// Advertises AAC-ELD and Opus, each at 24 kHz and 16 kHz, variable bitrate,
-/// mono. HomeKit requires an audio offer even from a camera that sends no
-/// audio.
+/// Advertises Opus at 24 kHz and 16 kHz, variable bitrate, mono. HomeKit
+/// requires an audio offer even from a camera that sends no audio.
 pub fn supported_audio() -> Value {
     let mut out = Tlv::new();
     // Sample rates: 2 is 24 kHz, 1 is 16 kHz.
-    for (i, (kind, rate)) in [(AAC_ELD, 2u8), (AAC_ELD, 1), (OPUS, 2), (OPUS, 1)].iter().enumerate() {
+    // Opus only, for now. With AAC-ELD also on offer, Apple devices chose
+    // it, and about half of those streams were never shown; the streams
+    // known to have played for long were mostly Opus. AAC-ELD stays
+    // implemented so it can be offered again once that is understood.
+    for (i, (kind, rate)) in [(OPUS, 2u8), (OPUS, 1)].iter().enumerate() {
         if i > 0 {
             separator(&mut out);
         }

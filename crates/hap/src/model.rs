@@ -43,6 +43,8 @@ pub mod kind {
     pub const BATTERY: &str = "96";
     pub const DOORBELL: &str = "121";
     pub const LIGHTBULB: &str = "43";
+    pub const MICROPHONE: &str = "112";
+    pub const SPEAKER: &str = "113";
 
     pub const MOTION_DETECTED: &str = "22";
     pub const CONTACT_SENSOR_STATE: &str = "6A";
@@ -54,6 +56,7 @@ pub mod kind {
     pub const STATUS_ACTIVE: &str = "75";
     pub const STATUS_TAMPERED: &str = "7A";
     pub const ON: &str = "25";
+    pub const MUTE: &str = "11A";
     pub const BRIGHTNESS: &str = "8";
     pub const PROGRAMMABLE_SWITCH_EVENT: &str = "73";
 }
@@ -388,10 +391,10 @@ impl Database {
         }
     }
 
-    /// Takes an accessory out of the database, along with its write
-    /// handlers. Returns `false` if there was no such accessory.
+    /// Takes an accessory out of the database, with its write handlers.
+    /// Returns whether it was there.
     pub fn remove(&self, aid: u64) -> bool {
-        self.handlers.write().unwrap().retain(|(handler_aid, _), _| *handler_aid != aid);
+        self.handlers.write().unwrap().retain(|(owner, _), _| *owner != aid);
         let mut accessories = self.accessories.write().unwrap();
         let before = accessories.len();
         accessories.retain(|a| a.aid != aid);
@@ -705,6 +708,7 @@ mod tests {
         assert_eq!(db.read(2, iid), Ok(json!(20.0)));
         assert_eq!(db.read(2, 2), Err(status::WRITE_ONLY));
         assert_eq!(db.read(9, 1), Err(status::NOT_FOUND));
+        assert!(!db.remove(9), "nothing to remove");
         let ctx = context();
         assert_eq!(db.write(2, iid, &json!(5.0), &ctx), Err(status::READ_ONLY));
         assert_eq!(db.write(2, 2, &json!(1), &ctx), Ok(json!(true)));

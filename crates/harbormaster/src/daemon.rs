@@ -630,6 +630,7 @@ mod tests {
             firmware: String::new(),
             features: Default::default(),
             video: None,
+            lens: 0,
         };
         use crate::protect_bridge::Kind;
         choices.apply(
@@ -675,6 +676,7 @@ mod tests {
             firmware: String::new(),
             features: Default::default(),
             video: None,
+            lens: 0,
         };
         choices.apply(vec![def], true);
         let key = "protect:camera:cam1".to_owned();

@@ -49,6 +49,8 @@ mod iid {
     /// HomeKit expects a camera to handle two viewers at once.
     pub const STREAMS: [u64; 2] = [200, 210];
     pub const LIGHTBULB: u64 = 180;
+    pub const MICROPHONE: u64 = 220;
+    pub const SPEAKER: u64 = 230;
     /// Three services, ten ids apart: camera switches, recording, data stream.
     pub const RECORDING: u64 = 300;
 }
@@ -91,6 +93,8 @@ pub struct Features {
     pub light_level: bool,
     pub leak: bool,
     pub battery: bool,
+    /// A camera with a speaker that a viewer can talk through.
+    pub talk: bool,
 }
 
 /// Everything needed to publish one Protect device as an accessory.
@@ -106,12 +110,29 @@ pub struct DeviceDef {
     /// Size of the camera's best stream, if it has video to offer.
     #[serde(default)]
     pub video: Option<(u16, u16)>,
+    /// Which lens of the camera this accessory shows. 0 is the main one;
+    /// a doorbell's package camera is published separately under its own.
+    #[serde(default)]
+    pub lens: u8,
 }
 
 impl DeviceDef {
     /// Key under which the store keeps this device's stable accessory id.
     fn store_key(&self) -> String {
-        format!("protect:{}:{}", self.kind.model_key(), self.id)
+        match self.lens {
+            0 => format!("protect:{}:{}", self.kind.model_key(), self.id),
+            lens => format!("protect:{}:{}:lens{lens}", self.kind.model_key(), self.id),
+        }
+    }
+
+    /// Identifies this accessory among the published ones. Updates from
+    /// the console are addressed to the plain id, so they reach the main
+    /// accessory and not a second lens.
+    fn handle_id(&self) -> String {
+        match self.lens {
+            0 => self.id.clone(),
+            lens => format!("{}#lens{lens}", self.id),
+        }
     }
 }
 
@@ -132,6 +153,7 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
                 Kind::Camera => Features {
                     motion: true,
                     doorbell: device["featureFlags"]["isDoorbell"] == true,
+                    talk: speaker_rate(device).is_some(),
                     ..Features::default()
                 },
                 Kind::Light => Features { motion: true, ..Features::default() },
@@ -144,6 +166,7 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
                     light_level: enabled("lightSettings"),
                     battery: true,
                     doorbell: false,
+                    talk: false,
                 },
             };
             let name = [text("name"), text("marketName"), model.clone()]
@@ -162,10 +185,39 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
                 mac: text("mac"),
                 firmware: text("firmwareVersion"),
                 features,
+                lens: 0,
             });
+            // A doorbell's second lens looks down at the doorstep. It gets
+            // an accessory of its own, since HomeKit shows one picture each.
+            let package = device["channels"].as_array().into_iter().flatten().find(|c| c["name"] == "Package Camera");
+            if let (Kind::Camera, true, Some(channel)) =
+                (kind, device["featureFlags"]["hasPackageCamera"] == true, package)
+            {
+                let size = |key: &str| channel[key].as_u64().and_then(|n| u16::try_from(n).ok());
+                let main = out.last().expect("just pushed").clone();
+                out.push(DeviceDef {
+                    name: format!("{} Package Camera", main.name),
+                    // Serial numbers must differ between accessories.
+                    mac: format!("{}P", main.mac),
+                    // It has no sensor of its own, so it borrows the
+                    // doorbell's: what moves at the door is what it sees.
+                    features: Features { motion: true, ..Features::default() },
+                    video: size("width").zip(size("height")),
+                    lens: device["lenses"][1]["id"].as_u64().and_then(|n| u8::try_from(n).ok()).unwrap_or(2),
+                    ..main
+                });
+            }
         }
     }
     out
+}
+
+/// The sample rate a camera's speaker takes sound at, if it has a speaker
+/// and takes the one format Harbormaster produces.
+fn speaker_rate(camera: &Value) -> Option<u32> {
+    let settings = &camera["talkbackSettings"];
+    let usable = camera["featureFlags"]["hasSpeaker"] == true && settings["typeFmt"] == "aac";
+    settings["samplingRate"].as_u64().filter(|_| usable).and_then(|rate| u32::try_from(rate).ok())
 }
 
 /// One of a camera's video streams: the same picture at one quality.
@@ -210,19 +262,29 @@ struct LiveInner {
     /// Present while signed in.
     client: Option<Arc<Client>>,
     channels: HashMap<String, Vec<Channel>>,
-    /// Which camera each accessory is.
-    cameras: HashMap<u64, String>,
+    /// Which camera, and which of its lenses, each accessory is.
+    cameras: HashMap<u64, (String, u8)>,
+    /// Cameras the console cannot reach, which have no picture to give.
+    offline: std::collections::HashSet<String>,
+    names: HashMap<String, String>,
+    /// Cameras with a usable speaker, and the sample rate each wants.
+    speakers: HashMap<String, u32>,
 }
 
 impl Live {
     fn update(&self, client: Arc<Client>, bootstrap: &Value) {
         let mut inner = self.inner.write().unwrap();
         inner.client = Some(client);
-        inner.channels = bootstrap["cameras"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|c| Some((c["id"].as_str()?.to_owned(), channels(c))))
+        let cameras = || bootstrap["cameras"].as_array().into_iter().flatten();
+        inner.channels = cameras().filter_map(|c| Some((c["id"].as_str()?.to_owned(), channels(c)))).collect();
+        inner.offline = cameras()
+            .filter(|c| c["state"] != "CONNECTED")
+            .filter_map(|c| c["id"].as_str().map(str::to_owned))
+            .collect();
+        inner.speakers =
+            cameras().filter_map(|c| Some((c["id"].as_str()?.to_owned(), speaker_rate(c)?))).collect();
+        inner.names = cameras()
+            .filter_map(|c| Some((c["id"].as_str()?.to_owned(), c["name"].as_str()?.to_owned())))
             .collect();
     }
 
@@ -242,14 +304,25 @@ impl SnapshotSource for Live {
         _reason: SnapshotReason,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
         Box::pin(async move {
-            let (client, camera) = {
+            let (client, camera, lens, name) = {
                 let inner = self.inner.read().unwrap();
-                (inner.client.clone()?, inner.cameras.get(&aid)?.clone())
+                let (camera, lens) = inner.cameras.get(&aid)?.clone();
+                // An unreachable camera has no picture, and asking only
+                // earns an error from the console.
+                if inner.offline.contains(&camera) {
+                    return None;
+                }
+                let name = inner.names.get(&camera).cloned().unwrap_or_else(|| "a camera".to_owned());
+                (inner.client.clone()?, camera, lens, name)
             };
-            match client.snapshot(&camera, width, height).await {
+            let result = match lens {
+                0 => client.snapshot(&camera, width, height).await,
+                _ => client.package_snapshot(&camera, width, height).await,
+            };
+            match result {
                 Ok(jpeg) => Some(jpeg.to_vec()),
                 Err(e) => {
-                    tracing::warn!("snapshot failed: {e}");
+                    tracing::warn!("{name}: snapshot failed: {e}");
                     None
                 }
             }
@@ -285,6 +358,8 @@ impl SnapshotSource for Snapshots {
 struct ProtectVideo {
     live: Arc<Live>,
     camera: String,
+    /// 0 for the main lens.
+    lens: u8,
 }
 
 impl ProtectVideo {
@@ -293,6 +368,12 @@ impl ProtectVideo {
     /// the largest.
     fn choose(&self, width: u16) -> Option<(Arc<Client>, u8)> {
         let inner = self.live.inner.read().unwrap();
+        // A second lens has a single stream, which the console files
+        // under the first quality level.
+        if self.lens != 0 {
+            inner.channels.get(&self.camera)?;
+            return Some((inner.client.clone()?, 0));
+        }
         let mut available: Vec<&Channel> = inner.channels.get(&self.camera)?.iter().collect();
         available.sort_by_key(|c| c.width);
         let channel = available.iter().find(|c| c.width >= width).or(available.last())?;
@@ -307,12 +388,12 @@ impl VideoSource for ProtectVideo {
 
     fn open(&self, width: u16) -> Option<mpsc::Receiver<Bytes>> {
         let (client, channel) = self.choose(width)?;
-        let camera = self.camera.clone();
+        let (camera, lens) = (self.camera.clone(), self.lens);
         // A little slack so a brief stall in ffmpeg does not stall the
         // connection to the console; fragments are a tenth of a second.
         let (sender, receiver) = mpsc::channel(32);
         tokio::spawn(async move {
-            let options = FeedOptions { channel, ..FeedOptions::default() };
+            let options = FeedOptions { channel, lens, ..FeedOptions::default() };
             let mut feed = match client.livestream(&camera, options).await {
                 Ok(feed) => feed,
                 Err(e) => {
@@ -340,6 +421,35 @@ impl VideoSource for ProtectVideo {
             }
         });
         Some(receiver)
+    }
+
+    fn speaker_rate(&self) -> Option<u32> {
+        // The speaker belongs to the camera, not to its second lens.
+        let inner = self.live.inner.read().unwrap();
+        inner.speakers.get(&self.camera).copied().filter(|_| self.lens == 0 && inner.client.is_some())
+    }
+
+    fn speak(&self) -> Option<mpsc::Sender<Bytes>> {
+        let client = self.live.inner.read().unwrap().client.clone()?;
+        let camera = self.camera.clone();
+        let (sender, mut receiver) = mpsc::channel::<Bytes>(32);
+        tokio::spawn(async move {
+            let mut speaker = match client.talkback(&camera).await {
+                Ok(speaker) => speaker,
+                Err(e) => {
+                    tracing::warn!("could not open the camera's speaker: {e}");
+                    return;
+                }
+            };
+            // Ends when the sender is dropped, which closes the speaker.
+            while let Some(audio) = receiver.recv().await {
+                if let Err(e) = speaker.send(audio).await {
+                    tracing::warn!("the camera's speaker closed: {e}");
+                    return;
+                }
+            }
+        });
+        Some(sender)
     }
 }
 
@@ -473,6 +583,12 @@ fn build_accessory(aid: u64, def: &DeviceDef, with_video: bool) -> (Accessory, H
         );
         (handles.light_on, handles.brightness) = (Some(ids[0]), Some(ids[1]));
     }
+    if let (true, true, Some(_)) = (with_video, f.talk && def.lens == 0, def.video) {
+        // HomeKit offers a talk button on a camera that has both of these.
+        let mute = || Characteristic { writable: true, ..Characteristic::sensor(kind::MUTE, Format::Bool, json!(false)) };
+        accessory.add_service_at(iid::MICROPHONE, kind::MICROPHONE, false, vec![mute()]);
+        accessory.add_service_at(iid::SPEAKER, kind::SPEAKER, false, vec![mute()]);
+    }
     if let (true, Some((width, height))) = (with_video, def.video) {
         let offered = video::resolutions(width, height);
         handles.streams = iid::STREAMS.iter().map(|iid| video::add_stream_service(&mut accessory, *iid, &offered)).collect();
@@ -557,6 +673,8 @@ pub struct Devices {
     video: Option<(Arc<Live>, PathBuf)>,
     /// The console connection that commands are sent over.
     live: Option<Arc<Live>>,
+    /// Text put before and after every name HomeKit is given.
+    affix: (String, String),
     /// Set when recordings can be made for HomeKit.
     recorder: Option<Arc<Recorder>>,
 }
@@ -568,13 +686,17 @@ impl Devices {
     fn add(&mut self, defs: &[DeviceDef], store: &Store, db: &Arc<Database>) -> Result<usize> {
         let mut changed = 0;
         for def in defs {
-            let key = (def.kind.model_key(), def.id.clone());
-            let existing = self.defs.iter().position(|d| d.kind == def.kind && d.id == def.id);
+            let key = (def.kind.model_key(), def.handle_id());
+            let existing = self.defs.iter().position(|d| d.kind == def.kind && d.id == def.id && d.lens == def.lens);
             if existing.is_some_and(|i| self.defs[i] == *def) {
                 continue;
             }
             let aid = store.accessory_id(&def.store_key())?;
-            let (accessory, handles) = build_accessory(aid, def, self.video.is_some());
+            // HomeKit is given the name with the owner's prefix and suffix;
+            // everything else, the log included, uses the plain one.
+            let shown = DeviceDef { name: format!("{}{}{}", self.affix.0, def.name, self.affix.1), ..def.clone() };
+            let (accessory, mut handles) = build_accessory(aid, &shown, self.video.is_some());
+            handles.name = def.name.clone();
             db.replace(accessory);
             crate::status::global().device_kind(aid, def.kind.model_key(), &def.store_key());
             if let Some(live) = &self.live {
@@ -582,19 +704,19 @@ impl Devices {
             }
             if let Some((live, ffmpeg)) = &self.video {
                 for ids in &handles.streams {
-                    let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone() });
+                    let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone(), lens: def.lens });
                     let gate = self.recorder.clone().map(|recorder| -> video::Gate {
                         Arc::new(move || recorder.live_view_refusal(aid))
                     });
                     video::install(db, aid, *ids, &def.name, source, ffmpeg, gate);
                 }
                 if let (Some(ids), Some(recorder)) = (handles.recording, &self.recorder) {
-                    let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone() });
+                    let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone(), lens: def.lens });
                     let switches: Vec<u64> = handles.streams.iter().map(StreamIds::active).collect();
-                    recorder.install(db, aid, ids, &def.name, &def.id, source, &switches);
+                    recorder.install(db, aid, ids, &def.name, &def.handle_id(), source, &switches);
                 }
                 if def.kind == Kind::Camera {
-                    live.inner.write().unwrap().cameras.insert(aid, def.id.clone());
+                    live.inner.write().unwrap().cameras.insert(aid, (def.id.clone(), def.lens));
                 }
             }
             self.handles.insert(key, handles);
@@ -607,12 +729,39 @@ impl Devices {
         Ok(changed)
     }
 
+    /// Withdraws every published device the test selects, for one deleted
+    /// in Protect or no longer chosen in the config. Returns their names.
+    fn remove_where(&mut self, db: &Database, gone: impl Fn(&DeviceDef) -> bool) -> Vec<String> {
+        let (leaving, staying): (Vec<DeviceDef>, Vec<DeviceDef>) = std::mem::take(&mut self.defs).into_iter().partition(gone);
+        self.defs = staying;
+        for def in &leaving {
+            let Some(handles) = self.handles.remove(&(def.kind.model_key(), def.handle_id())) else { continue };
+            db.remove(handles.aid);
+            if let Some(recorder) = &self.recorder {
+                recorder.remove(handles.aid);
+            }
+            if let Some(live) = &self.live {
+                live.inner.write().unwrap().cameras.remove(&handles.aid);
+            }
+            crate::status::global().device_removed(handles.aid);
+        }
+        leaving.into_iter().map(|def| def.name).collect()
+    }
+
     /// Applies changed fields of one device. `live` is false when replaying
     /// a snapshot, where a past ring must not sound the doorbell again.
     fn apply(&self, db: &Database, model_key: &str, id: &str, data: &Value, live: bool) {
-        let Some((_, h)) = self.handles.iter().find(|((k, i), _)| *k == model_key && i == id) else {
-            return;
-        };
+        // A camera's second lens is a separate accessory fed by the same
+        // device, so it hears the same updates.
+        let second_lens = format!("{id}#");
+        for ((kind, key), h) in &self.handles {
+            if *kind == model_key && (key == id || key.starts_with(&second_lens)) {
+                self.apply_to(h, db, model_key, id, data, live);
+            }
+        }
+    }
+
+    fn apply_to(&self, h: &Handles, db: &Database, model_key: &str, id: &str, data: &Value, live: bool) {
         let set = |iid: Option<u64>, value: Value| {
             if let Some(iid) = iid {
                 db.set(h.aid, iid, value);
@@ -620,6 +769,14 @@ impl Devices {
         };
         if let Some(state) = data["state"].as_str() {
             let online = state == "CONNECTED";
+            if let (true, Some(live)) = (model_key == "camera", &self.live) {
+                let mut inner = live.inner.write().unwrap();
+                if online {
+                    inner.offline.remove(id);
+                } else {
+                    inner.offline.insert(id.to_owned());
+                }
+            }
             for iid in &h.active {
                 if db.set(h.aid, *iid, json!(online)) && live {
                     tracing::info!("{} is {}", h.name, if online { "online" } else { "offline" });
@@ -782,7 +939,13 @@ impl ProtectBridge {
         }
         let recorder = ffmpeg.as_deref().map(|path| Recorder::new(state_dir, path));
         let mut devices =
-            Devices { video: ffmpeg.map(|path| (live.clone(), path)), live: Some(live.clone()), recorder, ..Devices::default() };
+            Devices {
+                video: ffmpeg.map(|path| (live.clone(), path)),
+                live: Some(live.clone()),
+                affix: (config.name_prefix.clone(), config.name_suffix.clone()),
+                recorder,
+                ..Devices::default()
+            };
         let mut cached = load_cache(state_dir);
         cached.retain(|def| selected(def, config.devices.as_deref()));
         let cached = crate::overrides::apply(cached, false);
@@ -837,12 +1000,35 @@ impl ProtectBridge {
             }
         }
         let defs: Vec<DeviceDef> = all.into_iter().filter(|def| selected(def, filter)).collect();
+        // Sharing choices and names the owner set in the dashboard.
         let defs = crate::overrides::apply(defs, true);
+        // Whatever is published but no longer wanted is withdrawn: deleted
+        // in Protect, dropped from the filter, or unshared. A device in the
+        // middle of being adopted is kept, so HomeKit does not forget its
+        // room and automations.
+        let adopting: std::collections::HashSet<(&str, &str)> = [Kind::Camera, Kind::Sensor, Kind::Light]
+            .into_iter()
+            .flat_map(|kind| {
+                let devices = bootstrap[kind.section()].as_array().into_iter().flatten();
+                devices
+                    .filter(|device| device["isAdopted"] == false && device["isAdopting"] == true)
+                    .filter_map(move |device| Some((kind.model_key(), device["id"].as_str()?)))
+            })
+            .collect();
+        let removed = self.devices.remove_where(&self.db, |def| {
+            let wanted = defs.iter().any(|d| d.kind == def.kind && d.id == def.id && d.lens == def.lens);
+            !wanted && !adopting.contains(&(def.kind.model_key(), def.id.as_str()))
+        });
+        for name in &removed {
+            tracing::info!("{name} is no longer shared from UniFi Protect; removing it from HomeKit");
+        }
         let added = self.devices.add(&defs, &self.store, &self.db)?;
         let added = added + self.devices.drop_where(&self.db, crate::overrides::hidden);
         if added > 0 {
-            save_cache(&self.state_dir, &self.devices.defs);
             tracing::info!("added or updated {added} UniFi Protect devices");
+        }
+        if added > 0 || !removed.is_empty() {
+            save_cache(&self.state_dir, &self.devices.defs);
             bridge.config_changed();
         }
         self.devices.apply_snapshot(&self.db, &bootstrap);
@@ -864,6 +1050,19 @@ impl ProtectBridge {
             }
             match tokio::time::timeout(UPDATE_SILENCE, updates.next()).await {
                 Ok(update) => match update? {
+                    // A device deleted in Protect while connected.
+                    Some(update) if update.action == "remove" => {
+                        let removed = self
+                            .devices
+                            .remove_where(&self.db, |def| def.kind.model_key() == update.model_key && def.id == update.id);
+                        if !removed.is_empty() {
+                            for name in &removed {
+                                tracing::info!("{name} was deleted in UniFi Protect; removing it from HomeKit");
+                            }
+                            save_cache(&self.state_dir, &self.devices.defs);
+                            bridge.config_changed();
+                        }
+                    }
                     Some(update) => self.devices.apply_update(&self.db, &update),
                     None => return Ok(()),
                 },
@@ -877,22 +1076,11 @@ impl Devices {
     /// Stops publishing the devices `unwanted` picks out, such as those the
     /// owner chose not to share. Returns how many accessories were removed.
     fn drop_where(&mut self, db: &Database, unwanted: impl Fn(&DeviceDef) -> bool) -> usize {
-        let dropped: Vec<DeviceDef> = self.defs.iter().filter(|def| unwanted(def)).cloned().collect();
-        for def in &dropped {
-            if let Some(handles) = self.handles.remove(&(def.kind.model_key(), def.id.clone())) {
-                db.remove(handles.aid);
-                if let Some(recorder) = &self.recorder {
-                    recorder.remove(handles.aid);
-                }
-                if let Some((live, _)) = &self.video {
-                    live.inner.write().unwrap().cameras.remove(&handles.aid);
-                }
-                crate::status::global().device_removed(handles.aid);
-                tracing::info!("{} is no longer shared with HomeKit", handles.name);
-            }
+        let names = self.remove_where(db, unwanted);
+        for name in &names {
+            tracing::info!("{name} is no longer shared with HomeKit");
         }
-        self.defs.retain(|def| !unwanted(def));
-        dropped.len()
+        names.len()
     }
 }
 
@@ -931,6 +1119,7 @@ mod sharing_tests {
                 firmware: "1".into(),
                 features: Features::default(),
                 video: None,
+                lens: 0,
             };
             assert_eq!(crate::overrides::key(&def), def.store_key());
         }
@@ -1079,7 +1268,9 @@ mod tests {
         json!({
             "cameras": [{
                 "id": "cam1", "mac": "AA01", "name": "Front Door", "type": "UVC G4 Doorbell Pro", "state": "CONNECTED",
-                "featureFlags": {"isDoorbell": true},
+                "featureFlags": {"isDoorbell": true, "hasPackageCamera": true, "hasSpeaker": true},
+                "talkbackSettings": {"typeFmt": "aac", "samplingRate": 22050, "channels": 1},
+                "lenses": [{"id": 1}, {"id": 2}],
                 "channels": [
                     {"id": 0, "name": "High", "enabled": true, "width": 1600, "height": 1200},
                     {"id": 1, "name": "Medium", "enabled": true, "width": 960, "height": 720},
@@ -1099,7 +1290,7 @@ mod tests {
         assert_eq!(definitions(&super::tests::bootstrap())[0].video, None);
 
         let live = Arc::new(Live::default());
-        let source = ProtectVideo { live: live.clone(), camera: "cam1".into() };
+        let source = ProtectVideo { live: live.clone(), camera: "cam1".into(), lens: 0 };
         assert!(!source.available(), "nothing is available before the console is reached");
 
         let pin: Fingerprint = "00".repeat(32).parse().unwrap();
@@ -1113,8 +1304,35 @@ mod tests {
         // Never the switched-off stream (2) or the package camera (3).
         assert!((0..=2000).step_by(40).all(|width| channel(width) < 2));
 
+        // The package camera is a second accessory reading the second lens.
+        let package = defs.iter().find(|d| d.lens != 0).expect("a doorbell with a package camera has two accessories");
+        assert_eq!((package.name.as_str(), package.lens, package.video), ("Front Door Package Camera", 2, Some((1600, 1200))));
+        assert_ne!(package.mac, defs[0].mac, "serial numbers must differ");
+        assert_ne!(package.store_key(), defs[0].store_key());
+        assert_ne!(package.handle_id(), defs[0].handle_id());
+        assert!(package.features.motion && !package.features.doorbell);
+        let (accessory, handles) = build_accessory(9, package, true);
+        assert_eq!(handles.streams.len(), 2);
+        // It can record, started by the doorbell's motion, but never rings.
+        assert!(handles.recording.is_some() && handles.motion.is_some() && handles.ring.is_none());
+        drop(accessory);
+        let lens = ProtectVideo { live: live.clone(), camera: "cam1".into(), lens: 2 };
+        assert_eq!(lens.choose(640).map(|(_, channel)| channel), Some(0));
+
+        // The doorbell has a speaker to talk through; its second lens and
+        // cameras without one do not.
+        assert!(defs[0].features.talk && !package.features.talk);
+        assert_eq!((source.speaker_rate(), lens.speaker_rate()), (Some(22050), None));
+        let (doorbell, _) = build_accessory(8, &defs[0], true);
+        let db = Database::new();
+        db.add(doorbell);
+        assert_eq!(db.read(8, iid::SPEAKER + 1), Ok(json!(false)));
+        assert_eq!(db.read(8, iid::MICROPHONE + 1), Ok(json!(false)));
+        assert!(!definitions(&super::tests::bootstrap())[0].features.talk);
+
         live.disconnected();
         assert!(!source.available());
+        assert!(!lens.available());
     }
 
     #[tokio::test]
@@ -1129,19 +1347,22 @@ mod tests {
 
         // From the cache of an older run: the camera is known, but not its video.
         let mut cached = definitions(&doorbell_with_channels());
+        cached.truncate(1);
         cached[0].video = None;
         assert_eq!(devices.add(&cached, &store, &db).unwrap(), 1);
         let aid = devices.handles[&("camera", "cam1".to_owned())].aid;
         let before = db.layout();
         assert_eq!(db.read(aid, iid::STREAMS[0] + 3), Err(harbormaster_hap::model::status::NOT_FOUND));
 
-        // The console is reached and reports the camera's streams.
-        assert_eq!(devices.add(&definitions(&doorbell_with_channels()), &store, &db).unwrap(), 1);
+        // The console is reached and reports the camera's streams, and
+        // with them its package camera.
+        assert_eq!(devices.add(&definitions(&doorbell_with_channels()), &store, &db).unwrap(), 2);
+        assert_ne!(devices.handles[&("camera", "cam1#lens2".to_owned())].aid, aid, "the second lens is its own accessory");
         assert_eq!(devices.handles[&("camera", "cam1".to_owned())].aid, aid, "same accessory id");
         assert_ne!(db.layout(), before, "controllers must be told the accessory changed");
         assert_eq!(devices.handles[&("camera", "cam1".to_owned())].streams.len(), 2);
         assert!(db.read(aid, iid::STREAMS[0] + 3).is_ok() && db.read(aid, iid::STREAMS[1] + 3).is_ok());
-        assert_eq!(live.inner.read().unwrap().cameras.get(&aid).map(String::as_str), Some("cam1"));
+        assert_eq!(live.inner.read().unwrap().cameras.get(&aid), Some(&("cam1".to_owned(), 0)));
         // Unchanged definitions are left alone.
         assert_eq!(devices.add(&definitions(&doorbell_with_channels()), &store, &db).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1271,6 +1492,65 @@ mod tests {
         }
         assert_eq!(db.write(light, iid::LIGHTBULB + 2, &json!(250), &context), Err(harbormaster_hap::model::status::INVALID_VALUE));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn homekit_names_carry_the_owners_prefix_and_suffix() {
+        let dir = std::env::temp_dir().join(format!("hm-protect-{}-affix", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(dir.join("state.json")).unwrap());
+        let db = Database::new();
+        let mut devices = Devices { affix: ("UP ".into(), " HM".into()), ..Devices::default() };
+        devices.add(&definitions(&bootstrap()), &store, &db).unwrap();
+        let handles = &devices.handles[&("camera", "cam1".to_owned())];
+        // The name characteristic of the accessory information service.
+        assert_eq!(db.read(handles.aid, 5), Ok(json!("UP Front Door HM")));
+        assert_eq!(handles.name, "Front Door", "logs and the device list keep the plain name");
+        assert_eq!(devices.defs[0].name, "Front Door");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_devices_are_withdrawn_with_every_accessory_they_had() {
+        let store_dir = std::env::temp_dir().join(format!("hm-protect-{}-remove", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let store = Arc::new(Store::open(store_dir.join("state.json")).unwrap());
+        let db = Database::new();
+        let mut devices = Devices::default();
+        let mut all = definitions(&bootstrap());
+        all.extend(definitions(&doorbell_with_channels()).into_iter().filter(|d| d.lens != 0));
+        devices.add(&all, &store, &db).unwrap();
+        let before = devices.len();
+        let door = devices.handles[&("camera", "cam1".to_owned())].aid;
+        let package = devices.handles[&("camera", "cam1#lens2".to_owned())].aid;
+        let sensor = devices.handles[&("sensor", "sen1".to_owned())].aid;
+
+        // The package camera has no sensor of its own; it follows the doorbell's.
+        let update = Update {
+            action: "update".into(),
+            model_key: "camera".into(),
+            id: "cam1".into(),
+            new_update_id: None,
+            data: json!({"isSmartDetected": true, "lastRing": 5}),
+        };
+        let mut changes = db.subscribe_changes();
+        devices.apply_update(&db, &update);
+        assert_eq!(db.read(door, iid::MOTION + 1), Ok(json!(true)));
+        assert_eq!(db.read(package, iid::MOTION + 1), Ok(json!(true)));
+        let rings = std::iter::from_fn(|| changes.try_recv().ok()).filter(|c| c.iid == iid::DOORBELL + 1).count();
+        assert_eq!(rings, 1, "only the doorbell itself rings");
+
+        // Deleting the doorbell takes its package camera with it.
+        let removed = devices.remove_where(&db, |def| def.kind == Kind::Camera && def.id == "cam1");
+        assert_eq!(removed.len(), 2, "{removed:?}");
+        assert_eq!(devices.len(), before - 2);
+        assert!(!db.contains(door) && !db.contains(package) && db.contains(sensor));
+        assert!(devices.remove_where(&db, |def| def.id == "cam1").is_empty(), "already gone");
+
+        // Adopted again later, it comes back under the same accessory id.
+        devices.add(&all, &store, &db).unwrap();
+        assert_eq!(devices.handles[&("camera", "cam1".to_owned())].aid, door);
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     #[test]

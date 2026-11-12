@@ -183,6 +183,9 @@ impl Decoder {
 pub struct FeedOptions {
     /// 0 is the camera's best quality, higher numbers are smaller.
     pub channel: u8,
+    /// Which lens of a camera that has more than one, such as a doorbell's
+    /// downward-facing package camera. 0 is the main lens.
+    pub lens: u8,
     /// How much video each fragment holds, in milliseconds. Shorter means
     /// less delay.
     pub fragment_ms: u32,
@@ -190,7 +193,7 @@ pub struct FeedOptions {
 
 impl Default for FeedOptions {
     fn default() -> Self {
-        Self { channel: 0, fragment_ms: 100 }
+        Self { channel: 0, lens: 0, fragment_ms: 100 }
     }
 }
 
@@ -204,10 +207,11 @@ pub(crate) fn query(camera_id: &str, options: FeedOptions) -> String {
     // Parameters with no value are switches: fragments are sent as they
     // are produced, without waiting for a whole group of pictures.
     format!(
-        "allowPartialGOP=&camera={camera_id}&channel={}&chunkSize=4096&fragmentDurationMillis={}&lens=0\
+        "allowPartialGOP=&camera={camera_id}&channel={}&chunkSize=4096&fragmentDurationMillis={}&lens={}\
          &progressive=&rebaseTimestampsToZero=true&requestId={camera_id}-{}-{serial}&type=fmp4&useWallClock=false",
         options.channel,
         options.fragment_ms.max(100),
+        options.lens,
         options.channel
     )
 }
@@ -351,10 +355,11 @@ mod tests {
 
     #[test]
     fn builds_the_request_and_keeps_only_the_path_of_the_answer() {
-        let q = query("abc123", FeedOptions { channel: 1, fragment_ms: 20 });
+        let q = query("abc123", FeedOptions { channel: 1, lens: 2, fragment_ms: 20 });
+        assert!(q.contains("&lens=2&"), "{q}");
         assert!(q.starts_with("allowPartialGOP=&camera=abc123&channel=1&chunkSize=4096&fragmentDurationMillis=100&"), "{q}");
         assert!(q.contains("&requestId=abc123-1-") && q.ends_with("&type=fmp4&useWallClock=false"), "{q}");
-        assert_ne!(q, query("abc123", FeedOptions { channel: 1, fragment_ms: 20 }), "each request is labelled apart");
+        assert_ne!(q, query("abc123", FeedOptions { channel: 1, lens: 2, fragment_ms: 20 }), "each request is labelled apart");
         assert!(!q.contains(' '), "{q}");
 
         assert_eq!(path_of("wss://192.168.1.1:7443/ws/livestream?token=ab-c_d&x=1"), Some("/ws/livestream?token=ab-c_d&x=1"));

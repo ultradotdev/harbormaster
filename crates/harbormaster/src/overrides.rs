@@ -222,6 +222,7 @@ mod tests {
             firmware: "1".into(),
             features: Features::default(),
             video: None,
+            lens: 0,
         }
     }
 

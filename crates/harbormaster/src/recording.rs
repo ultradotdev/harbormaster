@@ -314,6 +314,15 @@ impl Recorder {
             }
     }
 
+    /// Forgets a camera that is no longer published and stops buffering it.
+    pub fn remove(&self, aid: u64) {
+        if let Some(camera) = self.cameras.lock().unwrap().remove(&aid) {
+            if let Some(task) = camera.task.lock().unwrap().take() {
+                task.abort();
+            }
+        }
+    }
+
     /// Notes that a camera has just begun to see motion or been rung, so
     /// that a recording asked for moments later can reach back to before it.
     pub fn event_started(&self, aid: u64) {
@@ -438,18 +447,6 @@ impl Recorder {
                 }))
             }),
         );
-    }
-}
-
-impl Recorder {
-    /// Forgets a camera that is no longer published and stops buffering
-    /// its video.
-    pub fn remove(&self, aid: u64) {
-        if let Some(camera) = self.cameras.lock().unwrap().remove(&aid) {
-            if let Some(task) = camera.task.lock().unwrap().take() {
-                task.abort();
-            }
-        }
     }
 }
 
@@ -619,7 +616,7 @@ fn ffmpeg_args(format: &SelectedRecording, audio: bool) -> Vec<String> {
     args.extend(fixed(&["-map", "0:v:0", "-sn", "-dn"]));
     args.extend([
         "-vf".into(),
-        format!("scale={}:{}", format.width, format.height),
+        crate::video::fit_filter(format.width, format.height),
         "-r".into(),
         fps.to_string(),
         "-codec:v".into(),
@@ -677,7 +674,8 @@ mod tests {
         let line = ffmpeg_args(&format(), true).join(" ");
         for expected in [
             "-f mp4 -i pipe:0",
-            "-vf scale=640:480 -r 30",
+            "-vf scale=640:480:force_original_aspect_ratio=decrease",
+            "setsar=1 -r 30",
             "-codec:v h264_videotoolbox",
             "-profile:v high -level:v 4.0 -b:v 800k",
             "-force_key_frames expr:gte(t,n_forced*4) -g 120",

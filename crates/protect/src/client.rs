@@ -51,6 +51,20 @@ struct Session {
     csrf_token: Option<String>,
 }
 
+/// An open channel to a camera's speaker.
+pub struct Talkback {
+    socket: WebSocketStream<TlsStream<TcpStream>>,
+}
+
+impl Talkback {
+    /// Sends the next piece of sound. The console answers nothing.
+    pub async fn send(&mut self, audio: Bytes) -> Result<(), Error> {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        self.socket.send(Message::Binary(audio)).await.map_err(|e| Error::Protocol(format!("talkback: {e}")))
+    }
+}
+
 pub struct Client {
     host: String,
     port: u16,
@@ -175,6 +189,15 @@ impl Client {
     /// A current still image from a camera, as JPEG. The console scales it
     /// to about the requested size.
     pub async fn snapshot(&self, camera_id: &str, width: u32, height: u32) -> Result<Bytes, Error> {
+        self.still(camera_id, "snapshot", width, height).await
+    }
+
+    /// A current still from a doorbell's downward-facing package camera.
+    pub async fn package_snapshot(&self, camera_id: &str, width: u32, height: u32) -> Result<Bytes, Error> {
+        self.still(camera_id, "package-snapshot", width, height).await
+    }
+
+    async fn still(&self, camera_id: &str, which: &str, width: u32, height: u32) -> Result<Bytes, Error> {
         if self.session.is_none() {
             return Err(Error::NotSignedIn);
         }
@@ -186,7 +209,7 @@ impl Client {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
         let path = format!(
-            "/proxy/protect/api/cameras/{camera_id}/snapshot?ts={now}&force=true&w={width}&h={height}"
+            "/proxy/protect/api/cameras/{camera_id}/{which}?ts={now}&force=true&w={width}&h={height}"
         );
         let response = self.send(self.request(Method::GET, &path, Bytes::new())).await?;
         match response.status() {
@@ -272,6 +295,34 @@ impl Client {
             .ok_or_else(|| Error::Protocol("live feed: the console gave no usable address".into()))?;
         let url = format!("wss://{}:{}/proxy/protect{minted}", self.host, self.port);
         Ok(Livestream::new(self.websocket(url, "live feed").await?))
+    }
+
+    /// Opens the channel that plays sound through a camera's speaker. What
+    /// is sent must already be in the format the camera asks for in its
+    /// talkback settings, normally AAC in an ADTS stream.
+    pub async fn talkback(&self, camera_id: &str) -> Result<Talkback, Error> {
+        if self.session.is_none() {
+            return Err(Error::NotSignedIn);
+        }
+        if camera_id.is_empty() || !camera_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(Error::Protocol("unexpected characters in camera id".into()));
+        }
+        let path = format!("/proxy/protect/api/ws/talkback?camera={camera_id}");
+        let response = self.send(self.request(Method::GET, &path, Bytes::new())).await?;
+        match response.status() {
+            StatusCode::OK => {}
+            StatusCode::UNAUTHORIZED => return Err(Error::NotSignedIn),
+            StatusCode::FORBIDDEN => return Err(Error::Forbidden),
+            status => return Err(Error::Status(status)),
+        }
+        let answer: serde_json::Value =
+            serde_json::from_slice(response.body()).map_err(|e| Error::Protocol(format!("talkback: {e}")))?;
+        let minted = answer["url"]
+            .as_str()
+            .and_then(livestream::path_of)
+            .ok_or_else(|| Error::Protocol("talkback: the console gave no usable address".into()))?;
+        let url = format!("wss://{}:{}/proxy/protect{minted}", self.host, self.port);
+        Ok(Talkback { socket: self.websocket(url, "talkback").await? })
     }
 
     /// Opens a WebSocket to the pinned console with the session attached.

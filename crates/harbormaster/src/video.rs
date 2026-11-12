@@ -32,6 +32,19 @@ pub trait VideoSource: Send + Sync {
     /// header first; the source stops reading when the receiver is dropped.
     /// Must be called from within the async runtime.
     fn open(&self, width: u16) -> Option<mpsc::Receiver<Bytes>>;
+
+    /// The sample rate the camera's speaker wants, if it has a speaker
+    /// that sound can be sent to.
+    fn speaker_rate(&self) -> Option<u32> {
+        None
+    }
+
+    /// Opens the camera's speaker. What is sent is AAC in an ADTS stream at
+    /// [`Self::speaker_rate`]; dropping the sender closes the speaker.
+    /// Must be called from within the async runtime.
+    fn speak(&self) -> Option<mpsc::Sender<Bytes>> {
+        None
+    }
 }
 
 /// How ffmpeg is told to read the stream handed to it on standard input.
@@ -323,12 +336,77 @@ impl Stream {
     }
 
     fn start(self: &Arc<Self>, pending: Pending, video: SelectedVideo, audio: Option<SelectedAudio>) {
-        let Some(mut feed) = self.source.open(video.width) else {
+        let Some(feed) = self.source.open(video.width) else {
             tracing::warn!("{}: the camera became unreachable before the stream started", self.name);
             return;
         };
-        let args =
-            ffmpeg_args(&input_args(), &pending.request, &video, pending.ssrc, audio.as_ref().map(|a| (a, pending.audio_ssrc)));
+        let (stop, mut stopped) = oneshot::channel::<()>();
+        let session_id = pending.request.session_id;
+        {
+            let mut state = self.state.lock().unwrap();
+            // Replacing a previous stream drops its sender, which stops it.
+            state.running = Some(Running { session_id, connection: pending.connection, _stop: stop });
+        }
+        self.set_status(camera::STATUS_IN_USE);
+
+        let stream = self.clone();
+        tokio::spawn(async move {
+            // The reserved port is kept for as long as the stream lives.
+            let viewer = pending.request.controller_ip;
+            let began = std::time::Instant::now();
+            let progress = Arc::new(Progress::default());
+            stream.run(&pending, &video, audio, feed, &mut stopped, &progress).await;
+            // Whether video actually flowed, which other lines cannot say.
+            tracing::info!(
+                "{}: stream to {viewer} stopped after {:.0} s: the camera supplied {} kB; ffmpeg sent {} frames, {} kB; \
+                 the viewer sent back {} reports ({}) and {} packets of sound",
+                stream.name,
+                began.elapsed().as_secs_f64(),
+                progress.received.load(Ordering::Relaxed) / 1000,
+                progress.frames.load(Ordering::Relaxed),
+                progress.sent.load(Ordering::Relaxed) / 1000,
+                progress.reports.load(Ordering::Relaxed),
+                progress.per_reporter(),
+                progress.voice.load(Ordering::Relaxed)
+            );
+            let mut state = stream.state.lock().unwrap();
+            if state.running.as_ref().is_some_and(|r| r.session_id == session_id) {
+                state.running = None;
+            }
+            if state.running.is_none() {
+                drop(state);
+                stream.set_status(camera::STATUS_AVAILABLE);
+            }
+        });
+    }
+
+    /// Runs one viewer's ffmpeg from the camera's first bytes until the
+    /// viewer leaves or the video ends.
+    async fn run(
+        &self,
+        pending: &Pending,
+        video: &SelectedVideo,
+        audio: Option<SelectedAudio>,
+        mut feed: mpsc::Receiver<Bytes>,
+        stopped: &mut oneshot::Receiver<()>,
+        progress: &Arc<Progress>,
+    ) {
+        let viewer = pending.request.controller_ip;
+        // The feed opens with a header naming its tracks.
+        let header = tokio::select! {
+            first = tokio::time::timeout(std::time::Duration::from_secs(10), feed.recv()) => match first {
+                Ok(Some(header)) => header,
+                _ => {
+                    tracing::warn!("{}: the camera sent no video for {viewer}", self.name);
+                    return;
+                }
+            },
+            _ = &mut *stopped => return,
+        };
+        // A camera whose microphone is off sends no sound track, and an
+        // ffmpeg told to send sound that is not there refuses to start.
+        let audio = audio.filter(|_| crate::fmp4::has_track(&header, b"soun"));
+        let args = ffmpeg_args(&input_args(), &pending.request, video, pending.ssrc, audio.as_ref().map(|a| (a, pending.audio_ssrc)));
         let mut command = tokio::process::Command::new(&self.ffmpeg);
         command.args(&args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut child = match command.spawn() {
@@ -339,7 +417,7 @@ impl Stream {
             }
         };
         tracing::info!(
-            "{}: streaming {}x{} at {} fps, {} kbps, {} to {}",
+            "{}: streaming {}x{} at {} fps, {} kbps, {} to {viewer}",
             self.name,
             video.width,
             video.height,
@@ -353,95 +431,229 @@ impl Stream {
                     a.max_bitrate_kbps
                 ),
                 None => "no sound".to_owned(),
-            },
-            pending.request.controller_ip
+            }
         );
 
-        let (stop, mut stopped) = oneshot::channel::<()>();
-        let session_id = pending.request.session_id;
-        {
-            let mut state = self.state.lock().unwrap();
-            // Replacing a previous stream drops its sender, which stops it.
-            state.running = Some(Running { session_id, connection: pending.connection, _stop: stop });
-        }
-        self.set_status(camera::STATUS_IN_USE);
+        let _viewing = crate::status::global().viewing(self.aid, viewer, video.width, video.height);
+
+        // The viewer may talk back. Their sound arrives on the port this
+        // stream reserved, and goes to the camera's speaker if it has one.
+        // Whatever the viewer sends is also counted: its regular reports
+        // are the only sign from here that it is receiving the stream.
+        let talking = pending.socket.try_clone().ok().map(|socket| {
+            tokio::spawn(talk_back(
+                self.ffmpeg.clone(),
+                self.name.clone(),
+                socket,
+                pending.request.clone(),
+                audio.clone(),
+                self.source.speaker_rate().filter(|_| audio.is_some()),
+                self.source.clone(),
+                progress.clone(),
+            ))
+        });
 
         // Hand the camera's video to ffmpeg as it arrives. Closing ffmpeg's
         // input when the feed ends lets it finish cleanly.
         let stdin = child.stdin.take();
-        let progress = Arc::new(Progress::default());
         let counting = progress.clone();
         let writer = tokio::spawn(async move {
             let Some(mut stdin) = stdin else { return };
-            while let Some(data) = feed.recv().await {
+            let mut next = Some(header);
+            while let Some(data) = next {
                 counting.received.fetch_add(data.len() as u64, Ordering::Relaxed);
                 if stdin.write_all(&data).await.is_err() {
                     break;
                 }
+                next = feed.recv().await;
             }
         });
-
-        let stream = self.clone();
-        let stderr = child.stderr.take();
-        let viewer = pending.request.controller_ip;
-        let began = std::time::Instant::now();
-        tokio::spawn(async move {
-            // Keep the reserved port for as long as the stream lives.
-            let _socket = pending.socket;
-            let _viewing = crate::status::global().viewing(stream.aid, viewer, video.width, video.height);
-            if let Some(stderr) = stderr {
-                let name = stream.name.clone();
-                let progress = progress.clone();
-                tokio::spawn(async move {
-                    // ffmpeg repeats a complaint for every frame it cannot
-                    // use, so each distinct one is logged once and counted.
-                    let mut seen = Repeats::default();
-                    let mut lines = BufReader::new(stderr).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        if progress.note(&line) {
-                            continue;
-                        }
-                        if seen.first(&line) {
-                            tracing::warn!("{name}: ffmpeg: {line}");
-                        }
+        if let Some(stderr) = child.stderr.take() {
+            let (name, progress) = (self.name.clone(), progress.clone());
+            tokio::spawn(async move {
+                // ffmpeg repeats a complaint for every frame it cannot
+                // use, so each distinct one is logged once and counted.
+                let mut seen = Repeats::default();
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if progress.note(&line) {
+                        continue;
                     }
-                    for (line, extra) in seen.repeated() {
-                        tracing::warn!("{name}: ffmpeg: {line} ({extra} more like this)");
+                    if seen.first(&line) {
+                        tracing::warn!("{name}: ffmpeg: {line}");
                     }
-                });
-            }
-            tokio::select! {
-                exit = child.wait() => match exit {
-                    Ok(code) if code.success() => tracing::info!("{}: stream to {viewer} ended", stream.name),
-                    Ok(code) => tracing::warn!("{}: ffmpeg stopped unexpectedly ({code})", stream.name),
-                    Err(e) => tracing::warn!("{}: lost track of ffmpeg: {e}", stream.name),
-                },
-                // Fires when the sender is dropped, however the stream was ended.
-                _ = &mut stopped => {
-                    let _ = child.kill().await;
                 }
+                for (line, extra) in seen.repeated() {
+                    tracing::warn!("{name}: ffmpeg: {line} ({extra} more like this)");
+                }
+            });
+        }
+        tokio::select! {
+            exit = child.wait() => match exit {
+                Ok(code) if code.success() => tracing::info!("{}: stream to {viewer} ended", self.name),
+                Ok(code) => tracing::warn!("{}: ffmpeg stopped unexpectedly ({code})", self.name),
+                Err(e) => tracing::warn!("{}: lost track of ffmpeg: {e}", self.name),
+            },
+            // Fires when the sender is dropped, however the stream was ended.
+            _ = &mut *stopped => {
+                let _ = child.kill().await;
             }
-            // Whether video actually flowed, which the lines above cannot say.
-            tracing::info!(
-                "{}: stream to {viewer} stopped after {:.0} s: the camera supplied {} kB; ffmpeg sent {} frames, {} kB",
-                stream.name,
-                began.elapsed().as_secs_f64(),
-                progress.received.load(Ordering::Relaxed) / 1000,
-                progress.frames.load(Ordering::Relaxed),
-                progress.sent.load(Ordering::Relaxed) / 1000
-            );
-            // Dropping the feed is what tells the source to stop reading.
-            writer.abort();
-            let mut state = stream.state.lock().unwrap();
-            if state.running.as_ref().is_some_and(|r| r.session_id == session_id) {
-                state.running = None;
-            }
-            if state.running.is_none() {
-                drop(state);
-                stream.set_status(camera::STATUS_AVAILABLE);
-            }
-        });
+        }
+        // Dropping the feed is what tells the source to stop reading.
+        writer.abort();
+        if let Some(talking) = talking {
+            talking.abort();
+        }
     }
+}
+
+/// How long the speaker stays open after the viewer stops talking.
+const SPEAKER_IDLE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// What ffmpeg needs to know to receive the viewer's sound: where it will
+/// arrive, how it is encoded and the key to decrypt it.
+fn talk_sdp(request: &SetupRequest, audio: &SelectedAudio, port: u16) -> String {
+    let pt = audio.payload_type;
+    let rate = audio.sample_rate_hz;
+    let format = if audio.codec == camera::OPUS {
+        format!("a=rtpmap:{pt} opus/{rate}/1\r\n")
+    } else {
+        // The codec settings HomeKit devices use for AAC-ELD at each rate.
+        let config = if rate == 24000 { "F8EC212C00BC00" } else { "F8F0212C00BC00" };
+        format!(
+            "a=rtpmap:{pt} MPEG4-GENERIC/{rate}/1\r\n\
+             a=fmtp:{pt} profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3; config={config}\r\n"
+        )
+    };
+    format!(
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Talkback\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP {pt}\r\nb=AS:24\r\n{format}\
+         a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}\r\n",
+        request.audio_srtp.key_material()
+    )
+}
+
+/// Carries the viewer's voice to the camera's speaker for as long as the
+/// stream lives. The viewer's device sends encrypted sound, mixed with
+/// control traffic, to the port this stream reserved. The sound alone is
+/// handed to a second ffmpeg, which decrypts and re-encodes it for the
+/// camera. The speaker is opened when sound first arrives and closed again
+/// after a silence.
+#[allow(clippy::too_many_arguments)]
+async fn talk_back(
+    ffmpeg: PathBuf,
+    name: String,
+    socket: UdpSocket,
+    request: SetupRequest,
+    audio: Option<SelectedAudio>,
+    rate: Option<u32>,
+    source: Arc<dyn VideoSource>,
+    progress: Arc<Progress>,
+) {
+    use tokio::io::AsyncReadExt;
+    if socket.set_nonblocking(true).is_err() {
+        return;
+    }
+    let Ok(incoming) = tokio::net::UdpSocket::from_std(socket) else { return };
+    // With no speaker to talk through, only count what arrives.
+    let (Some(audio), Some(rate)) = (audio, rate) else {
+        let mut packet = [0u8; 2048];
+        while let Ok(n) = incoming.recv(&mut packet).await {
+            if n > 8 && (200..=204).contains(&packet[1]) {
+                progress.report(&packet[..n]);
+            }
+        }
+        return;
+    };
+    let ready = async {
+        // A free local port for ffmpeg to listen on.
+        let port = tokio::net::UdpSocket::bind("127.0.0.1:0").await.ok()?.local_addr().ok()?.port();
+        let rate = rate.to_string();
+        let args = [
+            "-hide_banner", "-loglevel", "error",
+            "-protocol_whitelist", "pipe,udp,rtp,file,crypto",
+            "-probesize", "32", "-analyzeduration", "0",
+            "-f", "sdp", "-i", "pipe:0",
+            "-map", "0:a:0", "-codec:a", "aac_at", "-ar", rate.as_str(), "-ac", "1", "-b:a", "32k",
+            "-flush_packets", "1", "-f", "adts", "pipe:1",
+        ];
+        let mut child = tokio::process::Command::new(&ffmpeg)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        stdin.write_all(talk_sdp(&request, &audio, port).as_bytes()).await.ok()?;
+        drop(stdin);
+        let stdout = child.stdout.take()?;
+        // The reserved port may be an IPv6 one, which reaches the local
+        // IPv4 address only in its mapped form.
+        let local = if incoming.local_addr().ok()?.is_ipv6() { "::ffff:127.0.0.1" } else { "127.0.0.1" };
+        let target = std::net::SocketAddr::new(local.parse().ok()?, port);
+        Some((incoming, target, child, stdout))
+    };
+    let Some((incoming, target, _child, mut stdout)) = ready.await else {
+        tracing::warn!("{name}: could not set up talking back to the camera");
+        return;
+    };
+
+    // Pass on the viewer's sound and nothing else that arrives on the port.
+    let forward = async {
+        let mut packet = [0u8; 2048];
+        loop {
+            let Ok(n) = incoming.recv(&mut packet).await else { return };
+            if n > 8 && (200..=204).contains(&packet[1]) {
+                progress.report(&packet[..n]);
+                continue;
+            }
+            let is_rtp = n > 12 && packet[0] >> 6 == 2;
+            if is_rtp && packet[1] & 0x7f == audio.payload_type {
+                progress.voice.fetch_add(1, Ordering::Relaxed);
+                let _ = incoming.send_to(&packet[..n], target).await;
+            }
+        }
+    };
+    let speak = async {
+        let mut speaker: Option<mpsc::Sender<Bytes>> = None;
+        let mut chunk = vec![0u8; 4096];
+        loop {
+            match tokio::time::timeout(SPEAKER_IDLE, stdout.read(&mut chunk)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => return,
+                Ok(Ok(n)) => {
+                    if speaker.is_none() {
+                        tracing::info!("{name}: {} is talking through the camera", request.controller_ip);
+                        speaker = source.speak();
+                    }
+                    let sent = match &speaker {
+                        Some(open) => open.send(Bytes::copy_from_slice(&chunk[..n])).await.is_ok(),
+                        None => false,
+                    };
+                    if !sent {
+                        speaker = None;
+                    }
+                }
+                // Quiet for a while: let the camera have its speaker back.
+                Err(_) => speaker = None,
+            }
+        }
+    };
+    tokio::select! {
+        _ = forward => {}
+        _ = speak => {}
+    }
+}
+
+/// The ffmpeg filter that fits a camera's picture into the size HomeKit
+/// asked for. A camera whose shape differs (a square fisheye, say) is
+/// scaled to fit and given black bars rather than being stretched.
+pub(crate) fn fit_filter(width: u16, height: u16) -> String {
+    format!(
+        "scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,\
+         pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+    )
 }
 
 /// How much video went into and came out of one ffmpeg.
@@ -453,9 +665,41 @@ struct Progress {
     frames: AtomicU64,
     /// Bytes ffmpeg reports having sent.
     sent: AtomicU64,
+    /// Control packets the viewer sent back: its reports on what it received.
+    reports: AtomicU64,
+    /// The same, counted per sender id. A viewer reports on picture and
+    /// sound under different ids, so this shows whether both arrived.
+    reporters: Mutex<Vec<(u32, u32)>>,
+    /// Packets of the viewer's own sound, when talking back.
+    voice: AtomicU64,
 }
 
 impl Progress {
+    /// Counts one control packet from the viewer. Its sender id sits in
+    /// the clear even though the rest is encrypted.
+    fn report(&self, packet: &[u8]) {
+        self.reports.fetch_add(1, Ordering::Relaxed);
+        let Some(id) = packet.get(4..8) else { return };
+        let id = u32::from_be_bytes([id[0], id[1], id[2], id[3]]);
+        let mut reporters = self.reporters.lock().unwrap();
+        if let Some(index) = reporters.iter().position(|(known, _)| *known == id) {
+            reporters[index].1 += 1;
+        } else if reporters.len() < 8 {
+            // A handful at most; anything beyond that is ignored.
+            reporters.push((id, 1));
+        }
+    }
+
+    /// How many reports each of the viewer's senders made, largest first.
+    fn per_reporter(&self) -> String {
+        let mut counts: Vec<u32> = self.reporters.lock().unwrap().iter().map(|(_, count)| *count).collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        match counts.len() {
+            0 => "none".to_owned(),
+            n => format!("{} from {n} sender{}", counts.iter().map(u32::to_string).collect::<Vec<_>>().join(" + "), if n == 1 { "" } else { "s" }),
+        }
+    }
+
     /// Takes a line of ffmpeg's output and says whether it was one of its
     /// periodic `key=value` progress reports rather than a complaint.
     fn note(&self, line: &str) -> bool {
@@ -522,7 +766,7 @@ fn ffmpeg_args(
     args.extend(fixed(&["-map", "0:v:0", "-an", "-sn", "-dn"]));
     args.extend([
         "-vf".into(),
-        format!("scale={}:{}", video.width, video.height),
+        fit_filter(video.width, video.height),
         "-r".into(),
         fps.to_string(),
         "-codec:v".into(),
@@ -684,6 +928,15 @@ pub(crate) mod tests {
         assert!(!progress.note("Conversion failed!"));
         assert_eq!(progress.frames.load(Ordering::Relaxed), 150);
         assert_eq!(progress.sent.load(Ordering::Relaxed), 204800);
+
+        // Reports are counted per sender.
+        assert_eq!(progress.per_reporter(), "none");
+        let from = |id: u32| [&[0x81, 201, 0, 7][..], &id.to_be_bytes()[..], &[0; 8][..]].concat();
+        for id in [7, 9, 7, 7] {
+            progress.report(&from(id));
+        }
+        assert_eq!(progress.reports.load(Ordering::Relaxed), 4);
+        assert_eq!(progress.per_reporter(), "3 + 1 from 2 senders");
     }
 
     #[test]
@@ -724,7 +977,7 @@ pub(crate) mod tests {
         assert!(!line.contains("aac_at"), "no sound was selected: {line}");
         for expected in [
             "-probesize 200000 -f mp4 -i pipe:0",
-            "-vf scale=1280:720",
+            "-vf scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1",
             "-r 30",
             "-codec:v h264_videotoolbox",
             "-profile:v main",
@@ -893,6 +1146,92 @@ pub(crate) mod tests {
                 return packet[1] & 0x7f;
             }
         }
+    }
+
+    /// A stand-in camera with a speaker; what it is told to play comes out
+    /// of the channel the test holds.
+    struct Speaker(mpsc::Sender<Bytes>);
+
+    impl VideoSource for Speaker {
+        fn available(&self) -> bool {
+            true
+        }
+
+        fn open(&self, _width: u16) -> Option<mpsc::Receiver<Bytes>> {
+            None
+        }
+
+        fn speaker_rate(&self) -> Option<u32> {
+            Some(22050)
+        }
+
+        fn speak(&self) -> Option<mpsc::Sender<Bytes>> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// Plays the part of a viewer's device: sends an encrypted tone to the
+    /// port a stream reserved, and checks it comes out re-encoded for the
+    /// camera's speaker. Skipped where ffmpeg is not installed.
+    #[tokio::test]
+    async fn a_viewers_voice_reaches_the_cameras_speaker() {
+        let Some(ffmpeg) = find_ffmpeg() else {
+            eprintln!("ffmpeg not installed; skipping");
+            return;
+        };
+        let reserved = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        let setup = request("127.0.0.1", 50000);
+        let audio =
+            SelectedAudio { codec: camera::OPUS, sample_rate_hz: 16000, payload_type: 110, max_bitrate_kbps: 24, packet_time_ms: 20 };
+        let (speaker, mut heard) = mpsc::channel(64);
+        let talking =
+            tokio::spawn(talk_back(
+                ffmpeg.clone(),
+                "Cam".into(),
+                reserved,
+                setup.clone(),
+                Some(audio),
+                Some(22050),
+                Arc::new(Speaker(speaker)),
+                Arc::new(Progress::default()),
+            ));
+
+        // Give the receiving side a moment to start listening.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let key = setup.audio_srtp.key_material();
+        let destination = format!("srtp://127.0.0.1:{port}?pkt_size=188");
+        let _viewer = tokio::process::Command::new(&ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-re", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:sample_rate=48000:duration=20")
+            .args(["-codec:a", "libopus", "-ar", "16000", "-ac", "1", "-b:a", "24k", "-payload_type", "110"])
+            .args(["-f", "rtp", "-srtp_out_suite", "AES_CM_128_HMAC_SHA1_80", "-srtp_out_params", &key, &destination])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(20), heard.recv())
+            .await
+            .expect("nothing reached the speaker")
+            .expect("the speaker was closed");
+        // AAC in an ADTS stream begins every frame with twelve set bits.
+        assert!(first.len() > 7 && first[0] == 0xFF && first[1] & 0xF0 == 0xF0, "{:02x?}", &first[..first.len().min(8)]);
+        talking.abort();
+    }
+
+    #[test]
+    fn the_viewers_sound_is_described_to_ffmpeg_with_its_key() {
+        let setup = request("10.0.0.9", 50000);
+        let eld = SelectedAudio { codec: camera::AAC_ELD, sample_rate_hz: 24000, payload_type: 110, max_bitrate_kbps: 24, packet_time_ms: 30 };
+        let sdp = talk_sdp(&setup, &eld, 40000);
+        assert!(sdp.contains("m=audio 40000 RTP/AVP 110\r\n"), "{sdp}");
+        assert!(sdp.contains("a=rtpmap:110 MPEG4-GENERIC/24000/1\r\n") && sdp.contains("config=F8EC212C00BC00"), "{sdp}");
+        assert!(sdp.contains(&format!("inline:{}", setup.audio_srtp.key_material())), "{sdp}");
+        let opus = SelectedAudio { codec: camera::OPUS, sample_rate_hz: 16000, ..eld };
+        assert!(talk_sdp(&setup, &opus, 40000).contains("a=rtpmap:110 opus/16000/1\r\n"));
     }
 
     /// Runs a real ffmpeg with a test pattern and tone and checks encrypted
