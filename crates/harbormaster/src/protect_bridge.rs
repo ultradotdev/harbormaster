@@ -632,6 +632,9 @@ fn build_accessory(aid: u64, def: &DeviceDef, with_video: bool) -> (Accessory, H
     }
     for detection in f.sensors.iter().filter(|_| def.kind == Kind::Camera) {
         // Named, so that a list of sensors in HomeKit says which is which.
+        // The Home app takes a service's name from the configured name,
+        // which it may also write to, and ignores the plain one.
+        let name = format!("{} {}", def.name, detection.label());
         let ids = accessory.add_service_at(
             detection.iid(),
             kind::OCCUPANCY_SENSOR,
@@ -639,7 +642,8 @@ fn build_accessory(aid: u64, def: &DeviceDef, with_video: bool) -> (Accessory, H
             vec![
                 Characteristic::sensor(kind::OCCUPANCY_DETECTED, Format::Uint8, json!(0)).range(0.0, 1.0, 1.0),
                 status_active(),
-                Characteristic::constant(kind::NAME, Format::String, json!(format!("{} {}", def.name, detection.label()))),
+                Characteristic::constant(kind::NAME, Format::String, json!(name)),
+                Characteristic { writable: true, ..Characteristic::sensor(kind::CONFIGURED_NAME, Format::String, json!(name)) },
             ],
         );
         handles.detections.push((*detection, ids[0]));
@@ -1718,6 +1722,7 @@ mod tests {
         let seen = |f: &Fixture| (f.db.read(aid, person).unwrap(), f.db.read(aid, vehicle).unwrap());
         assert_eq!(seen(&f), (json!(0), json!(0)));
         assert_eq!(f.db.read(aid, person + 2), Ok(json!("Front Door Person")), "named for lists in HomeKit");
+        assert_eq!(f.db.read(aid, person + 3), Ok(json!("Front Door Person")), "and under the name Home reads");
         assert_eq!(f.db.read(aid, Detection::Animal.iid() + 1), Err(harbormaster_hap::model::status::NOT_FOUND));
 
         let event = |f: &Fixture, action: &str, id: &str, data: Value| {

@@ -30,6 +30,8 @@ pub mod kind {
     pub const MANUFACTURER: &str = "20";
     pub const MODEL: &str = "21";
     pub const NAME: &str = "23";
+    /// The name a controller shows for one service among several alike.
+    pub const CONFIGURED_NAME: &str = "E3";
     pub const SERIAL_NUMBER: &str = "30";
     pub const FIRMWARE_REVISION: &str = "52";
     pub const VERSION: &str = "37";
