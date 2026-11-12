@@ -443,6 +443,16 @@ impl Stream {
     }
 }
 
+/// The ffmpeg filter that fits a camera's picture into the size HomeKit
+/// asked for. A camera whose shape differs (a square fisheye, say) is
+/// scaled to fit and given black bars rather than being stretched.
+pub(crate) fn fit_filter(width: u16, height: u16) -> String {
+    format!(
+        "scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,\
+         pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+    )
+}
+
 /// How much video went into and came out of one ffmpeg.
 #[derive(Default)]
 struct Progress {
@@ -521,7 +531,7 @@ fn ffmpeg_args(
     args.extend(fixed(&["-map", "0:v:0", "-an", "-sn", "-dn"]));
     args.extend([
         "-vf".into(),
-        format!("scale={}:{}", video.width, video.height),
+        fit_filter(video.width, video.height),
         "-r".into(),
         fps.to_string(),
         "-codec:v".into(),
@@ -723,7 +733,7 @@ pub(crate) mod tests {
         assert!(!line.contains("aac_at"), "no sound was selected: {line}");
         for expected in [
             "-probesize 200000 -f mp4 -i pipe:0",
-            "-vf scale=1280:720",
+            "-vf scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1",
             "-r 30",
             "-codec:v h264_videotoolbox",
             "-profile:v main",

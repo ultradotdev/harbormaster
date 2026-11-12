@@ -171,7 +171,7 @@ pub async fn capture(state_dir: &Path, seconds: u64) -> Result<()> {
 
 /// `harbormaster protect-feed`: records a few seconds of a camera's native
 /// live feed to a playable file and reports how the feed behaved.
-pub async fn feed(state_dir: &Path, camera: Option<&str>, channel: u8, seconds: u64) -> Result<()> {
+pub async fn feed(state_dir: &Path, camera: Option<&str>, channel: u8, lens: u8, seconds: u64) -> Result<()> {
     use harbormaster_protect::{FeedOptions, Segment};
     use std::io::Write;
     let Some((client, protect)) = sign_in(state_dir).await? else { return Ok(()) };
@@ -192,12 +192,12 @@ pub async fn feed(state_dir: &Path, camera: Option<&str>, channel: u8, seconds: 
 
     let dir = state_dir.join("protect-capture");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let path = dir.join(format!("feed-{channel}.mp4"));
+    let path = dir.join(format!("feed-{channel}-lens{lens}.mp4"));
     let mut file = std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
 
     let started = std::time::Instant::now();
-    let mut stream = client.livestream(&found.device.id, FeedOptions { channel, ..Default::default() }).await?;
-    println!("{name}: feed for channel {channel} opened after {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+    let mut stream = client.livestream(&found.device.id, FeedOptions { channel, lens, ..Default::default() }).await?;
+    println!("{name}: feed for channel {channel}, lens {lens} opened after {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
     let (mut fragments, mut bytes, mut largest) = (0u64, 0u64, 0usize);
     let (mut first, mut last) = (None, started);

@@ -45,7 +45,8 @@ Options:
   --verbose         daemon: also log each event sent to a controller
   --seconds N       protect-capture, protect-feed: how long to record (default 120)
   --camera NAME     protect-feed: which camera (default: the first in `devices`)
-  --channel N       protect-feed: which quality, 0 being the best (default 0)";
+  --channel N       protect-feed: which quality, 0 being the best (default 0)
+  --lens N          protect-feed: which lens of a multi-lens camera (default 0)";
 
 enum Command {
     Tui,
@@ -64,6 +65,7 @@ struct Args {
     seconds: u64,
     camera: Option<String>,
     channel: u8,
+    lens: u8,
 }
 
 fn default_state_dir() -> Result<PathBuf> {
@@ -81,6 +83,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
         seconds: 120,
         camera: None,
         channel: 0,
+        lens: 0,
     };
     let mut input = input.into_iter();
     while let Some(arg) = input.next() {
@@ -92,6 +95,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
             "protect-capture" => args.command = Command::ProtectCapture,
             "protect-feed" => args.command = Command::ProtectFeed,
             "--camera" => args.camera = Some(value()?),
+            "--lens" => args.lens = value()?.parse().context("--lens expects a small number")?,
             "--channel" => args.channel = value()?.parse().context("--channel expects a small number")?,
             "--seconds" => args.seconds = value()?.parse().context("--seconds expects a number")?,
             "--state-dir" => args.state_dir = value()?.into(),
@@ -125,6 +129,7 @@ fn main() -> Result<()> {
             &args.state_dir,
             args.camera.as_deref(),
             args.channel,
+            args.lens,
             args.seconds,
         )),
         Command::Daemon => {
