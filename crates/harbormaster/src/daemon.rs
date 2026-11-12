@@ -20,6 +20,7 @@ use crate::status;
 use crate::protect_bridge::ProtectBridge;
 use crate::config;
 use crate::logbuf::LogBuffer;
+use crate::password::{Outcome, Secret, Vault};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// HomeKit accessory category for a bridge.
@@ -40,6 +41,8 @@ struct Daemon {
     logs: LogBuffer,
     /// Where the UniFi Protect console is, if one is configured.
     console_host: Option<String>,
+    /// Holds the Protect password. Absent when no console is configured.
+    vault: Option<Arc<Vault>>,
 }
 
 pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
@@ -80,9 +83,14 @@ pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
     // With no real console, the demo brings a pretend one.
     let fleet = if options.demo && protect.is_none() { crate::demo::Fleet::publish(&store, &db)? } else { None };
     let console_host = console_host.or(fleet.as_ref().map(|_| crate::demo::CONSOLE.to_owned()));
-    let protect = match protect {
-        Some(protect) => Some(ProtectBridge::prepare(&options.state_dir, protect, store.clone(), db.clone())?),
-        None => None,
+    // The password is looked for once, here. With none to be found the
+    // bridge still starts and waits for `harbormaster unlock`.
+    let vault = protect.as_ref().map(|p| Vault::new(crate::secrets::at_start(&options.state_dir, &p.username)));
+    let protect = match (protect, &vault) {
+        (Some(protect), Some(vault)) => {
+            Some(ProtectBridge::prepare(&options.state_dir, protect, store.clone(), db.clone(), vault.clone())?)
+        }
+        _ => None,
     };
 
     let config =
@@ -105,7 +113,7 @@ pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
         tokio::spawn(fleet.run(bridge.clone()));
     }
 
-    let daemon = Arc::new(Daemon { name, started: Instant::now(), store, db, bridge, logs, console_host });
+    let daemon = Arc::new(Daemon { name, started: Instant::now(), store, db, bridge, logs, console_host, vault });
     let serving = daemon.clone();
     tokio::spawn(async move {
         loop {
@@ -244,8 +252,16 @@ impl Daemon {
             send(&mut stream, &Message::Log(line)).await?;
         }
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        // Set while this client waits to hear how its unlock went.
+        let mut unlocking: Option<tokio::sync::oneshot::Receiver<Outcome>> = None;
         loop {
             tokio::select! {
+                outcome = async { unlocking.as_mut().expect("guarded").await }, if unlocking.is_some() => {
+                    unlocking = None;
+                    let outcome = outcome.unwrap_or_else(|_| Outcome::Failed("the daemon gave no answer".into()));
+                    send(&mut stream, &Message::Unlock(unlock_reply(outcome))).await?;
+                    send(&mut stream, &Message::State(Box::new(self.state()))).await?;
+                },
                 _ = tick.tick() => send(&mut stream, &Message::State(Box::new(self.state()))).await?,
                 line = live.recv() => match line {
                     Ok(line) => send(&mut stream, &Message::Log(line)).await?,
@@ -254,9 +270,14 @@ impl Daemon {
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 },
                 request = requests.next_line() => match request? {
-                    Some(line) => {
+                    Some(mut line) => {
                         // A request this build does not know is ignored.
-                        if let Ok(command) = serde_json::from_str::<Command>(&line) {
+                        let command = serde_json::from_str::<Command>(&line);
+                        // The line may carry a password; do not leave it lying about.
+                        zeroize::Zeroize::zeroize(&mut line);
+                        if let Ok(Command::Unlock { password }) = command {
+                            unlocking = Some(self.unlock(password));
+                        } else if let Ok(command) = command {
                             let connected = status::global().snapshot().console_connected;
                             match run_command(overrides::global(), connected, &command) {
                                 Ok(done) => tracing::info!("{done}"),
@@ -271,6 +292,22 @@ impl Daemon {
         }
     }
 
+    /// Takes a password handed over by the owner. The receiver hears how
+    /// the sign-in went.
+    fn unlock(&self, password: Secret) -> tokio::sync::oneshot::Receiver<Outcome> {
+        match &self.vault {
+            Some(vault) => {
+                tracing::info!("the Protect password was handed over from a terminal");
+                vault.offer(password)
+            }
+            None => {
+                let (answer, outcome) = tokio::sync::oneshot::channel();
+                let _ = answer.send(Outcome::Failed("no UniFi Protect console is configured".into()));
+                outcome
+            }
+        }
+    }
+
     fn state(&self) -> State {
         let paired = self.store.is_paired();
         let now = SystemTime::now();
@@ -280,10 +317,9 @@ impl Daemon {
         State {
             time: now.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
             config_number: self.store.config_number(),
-            console: self.console_host.as_ref().map(|host| control::Console {
-                host: host.clone(),
-                connected: board.console_connected,
-                last_update: board.console_last_update,
+            pid: std::process::id(),
+            console: self.console_host.as_ref().map(|host| {
+                console(host, &board, self.vault.as_ref().map(|vault| vault.view()).unwrap_or_default())
             }),
             devices: devices(&database, &board, overrides::global().map(Overrides::list).unwrap_or_default(), &affix),
             name_prefix: affix.0.clone(),
@@ -313,6 +349,26 @@ impl Daemon {
                 .collect(),
             accessories: accessories(&database),
         }
+    }
+}
+
+/// The console's line in a snapshot. The password itself is never in it,
+/// only whether the daemon has one.
+fn console(host: &str, board: &status::Snapshot, password: crate::password::View) -> control::Console {
+    control::Console {
+        host: host.to_owned(),
+        connected: board.console_connected,
+        last_update: board.console_last_update,
+        waiting_for_password: password.waiting,
+        problem: if board.console_connected { None } else { password.problem },
+    }
+}
+
+fn unlock_reply(outcome: Outcome) -> control::UnlockReply {
+    match outcome {
+        Outcome::SignedIn { devices } => control::UnlockReply { signed_in: true, devices, ..Default::default() },
+        Outcome::Rejected(detail) => control::UnlockReply { detail, ..Default::default() },
+        Outcome::Failed(detail) => control::UnlockReply { detail, kept: true, ..Default::default() },
     }
 }
 
@@ -383,6 +439,7 @@ fn run_command(overrides: Option<&Overrides>, connected: bool, command: &Command
             let source = if text.is_some() { "as asked in the terminal" } else { "as config.toml says" };
             Ok(format!("names sent to HomeKit will read \"{prefix}<name>{suffix}\": {what} set {source}{when}"))
         }
+        Command::Unlock { .. } => Err("a password is not a device setting".into()),
         Command::Rename { key, name } => {
             let entry = overrides.rename(key, name.as_deref())?;
             Ok(match &entry.name {

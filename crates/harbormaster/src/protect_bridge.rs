@@ -24,7 +24,8 @@ use serde_json::{json, Value};
 use crate::recording::{self, Recorder, RecordingIds};
 use crate::video::{self, StreamIds, VideoSource};
 use harbormaster_hap::recording::{TRIGGER_DOORBELL, TRIGGER_MOTION};
-use crate::{config, secrets};
+use crate::config;
+use crate::password::{Secret, Vault};
 
 /// Remembers the devices last seen, so the same accessories can be published
 /// while the console is unreachable. Without this, HomeKit would see them
@@ -915,7 +916,13 @@ pub struct ProtectBridge {
     store: Arc<Store>,
     db: Arc<Database>,
     devices: Devices,
+    /// The password for every sign-in, once there is one.
+    vault: Arc<Vault>,
 }
+
+/// How long to leave the console alone after it refuses to let this
+/// account sign in for a reason a quick retry cannot fix.
+const REFUSED_DELAY: Duration = Duration::from_secs(300);
 
 impl ProtectBridge {
     /// Publishes the devices known from the last run, so HomeKit sees a
@@ -925,6 +932,7 @@ impl ProtectBridge {
         config: config::Protect,
         store: Arc<Store>,
         db: Arc<Database>,
+        vault: Arc<Vault>,
     ) -> Result<Self> {
         let pin = config
             .fingerprint
@@ -954,7 +962,7 @@ impl ProtectBridge {
         if !cached.is_empty() {
             tracing::info!("publishing {} UniFi Protect devices from the last run", cached.len());
         }
-        Ok(Self { live, state_dir: state_dir.to_owned(), config, pin, store, db, devices })
+        Ok(Self { live, state_dir: state_dir.to_owned(), config, pin, store, db, devices, vault })
     }
 
     /// Where the HomeKit server gets camera snapshots.
@@ -963,32 +971,70 @@ impl ProtectBridge {
     }
 
     /// Stays connected to the console forever, reconnecting as needed.
+    /// Without a password it waits for one, and the devices published from
+    /// the last run stay in HomeKit, shown as not responding.
     pub async fn run(mut self, bridge: Arc<Bridge>) {
+        use harbormaster_protect::Error;
         let mut delay = Duration::from_secs(1);
         loop {
-            let started = std::time::Instant::now();
-            match self.session(&bridge).await {
-                Ok(()) => tracing::warn!("UniFi Protect closed the update stream; reconnecting"),
-                Err(e) => tracing::warn!("UniFi Protect connection lost: {e:#}"),
+            if self.vault.view().waiting {
+                tracing::info!(
+                    "waiting for the Protect password: devices show as offline in HomeKit until `harbormaster unlock` is run"
+                );
             }
+            let password = self.vault.password().await;
+            let started = std::time::Instant::now();
+            let result = self.session(&bridge, &password).await;
             self.devices.mark_offline(&self.db);
             self.live.disconnected();
             crate::status::global().console_disconnected();
+            let mut wait = delay;
+            match result {
+                Ok(()) => {
+                    tracing::warn!("UniFi Protect closed the update stream; reconnecting");
+                    self.vault.failed(&password, "the console closed the connection; reconnecting");
+                }
+                Err(e) => match e.downcast_ref::<Error>() {
+                    // Trying a refused password again only gets the account
+                    // locked out, so it is dropped and the wait starts over.
+                    Some(Error::BadCredentials) => {
+                        tracing::warn!(
+                            "UniFi Protect rejected the password for \"{}\"; it has been discarded",
+                            self.config.username
+                        );
+                        self.vault.rejected(&password, &Error::BadCredentials.to_string());
+                        continue;
+                    }
+                    Some(refused @ (Error::RateLimited | Error::TwoFactorRequired)) => {
+                        wait = REFUSED_DELAY;
+                        tracing::warn!("UniFi Protect sign-in refused: {refused}; trying again in {} minutes", wait.as_secs() / 60);
+                        self.vault.failed(&password, &refused.to_string());
+                    }
+                    _ => {
+                        tracing::warn!("UniFi Protect connection lost: {e:#}");
+                        self.vault.failed(&password, &format!("{e:#}"));
+                    }
+                },
+            }
+            drop(password);
             // A session that lasted a while was healthy, so start over quickly.
             if started.elapsed() > Duration::from_secs(60) {
                 delay = Duration::from_secs(1);
+                wait = wait.min(delay);
             }
-            tokio::time::sleep(delay).await;
+            // A password handed over meanwhile is tried at once.
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = self.vault.arrival() => {}
+            }
             delay = (delay * 2).min(Duration::from_secs(60));
         }
     }
 
     /// One sign-in, inventory read and update stream, until it ends.
-    async fn session(&mut self, bridge: &Bridge) -> Result<()> {
-        let password = secrets::protect_password(&self.state_dir, &self.config.username)?;
+    async fn session(&mut self, bridge: &Bridge, password: &Secret) -> Result<()> {
         let mut client = Client::new(&self.config.host, self.config.port, self.pin);
-        client.login(&self.config.username, &password).await?;
-        drop(password);
+        client.login(&self.config.username, password.expose()).await?;
         let client = Arc::new(client);
 
         let bootstrap = client.bootstrap_raw().await?;
@@ -1042,6 +1088,7 @@ impl ProtectBridge {
             self.config.host,
             self.devices.len()
         );
+        self.vault.signed_in(self.devices.len());
 
         let mut updates = client.updates(bootstrap["lastUpdateId"].as_str()).await?;
         // A busy site sends several updates a second and even a quiet one
@@ -1248,7 +1295,7 @@ mod sharing_tests {
 mod tests {
     use super::*;
 
-    fn bootstrap() -> Value {
+    pub(super) fn bootstrap() -> Value {
         json!({
             "cameras": [
                 {"id": "cam1", "mac": "AA01", "name": "Front Door", "type": "UVC G4 Doorbell Pro",
@@ -1686,5 +1733,188 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&state);
         assert!(defs.len() > 1);
+    }
+}
+
+/// The whole path from a daemon with no password to a signed-in bridge,
+/// against a local stand-in for the console with a real TLS handshake.
+#[cfg(test)]
+mod unlock_tests {
+    use super::*;
+    use crate::logbuf::LogBuffer;
+    use crate::password::Outcome;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    const PASSWORD: &str = "correct horse";
+
+    struct Console {
+        port: u16,
+        fingerprint: Fingerprint,
+        /// Sign-in attempts that reached the stand-in.
+        logins: Arc<AtomicUsize>,
+    }
+
+    fn reply(status: &str, headers: &str, body: &str) -> String {
+        format!("HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+    }
+
+    fn answer(request: &str, logins: &AtomicUsize) -> String {
+        let (head, body) = request.split_once("\r\n\r\n").unwrap_or((request, ""));
+        let signed_in = head.lines().any(|l| l.eq_ignore_ascii_case("cookie: TOKEN=session-1"));
+        match head.lines().next().unwrap_or("") {
+            "POST /api/auth/login HTTP/1.1" => {
+                logins.fetch_add(1, Ordering::SeqCst);
+                let json: Value = serde_json::from_str(body).unwrap_or_default();
+                if json["username"] == "harbormaster" && json["password"] == PASSWORD {
+                    reply("200 OK", "Set-Cookie: TOKEN=session-1; Path=/; HttpOnly\r\nX-CSRF-Token: csrf-1\r\n", "{}")
+                } else {
+                    reply("401 Unauthorized", "", "{}")
+                }
+            }
+            "GET /proxy/protect/api/bootstrap HTTP/1.1" if signed_in => reply(
+                "200 OK",
+                "Content-Type: application/json; charset=utf-8\r\n",
+                &super::tests::bootstrap().to_string(),
+            ),
+            // Including the update stream, so each session ends at once.
+            _ => reply("404 Not Found", "", "{}"),
+        }
+    }
+
+    async fn start() -> Console {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let certificate: CertificateDer<'static> = cert.der().clone();
+        let fingerprint = Fingerprint::of(&certificate);
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let logins = Arc::new(AtomicUsize::new(0));
+        let seen = logins.clone();
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let (acceptor, seen) = (acceptor.clone(), seen.clone());
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(tcp).await else { return };
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let Ok(n) = stream.read(&mut chunk).await else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&request);
+                        let Some((head, body)) = text.split_once("\r\n\r\n") else { continue };
+                        let expected: usize = head
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                            .unwrap_or(0);
+                        if body.len() >= expected {
+                            break;
+                        }
+                    }
+                    let response = answer(&String::from_utf8_lossy(&request), &seen);
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        Console { port, fingerprint, logins }
+    }
+
+    #[tokio::test]
+    async fn waits_for_the_password_signs_in_when_it_comes_and_waits_again_when_it_is_refused() {
+        let logs = LogBuffer::new();
+        let _logging = tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        let console = start().await;
+        let dir = std::env::temp_dir().join(format!("hm-protect-{}-unlock", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The devices the last run knew about.
+        let known = definitions(&super::tests::bootstrap());
+        save_cache(&dir, &known);
+
+        let store = Arc::new(Store::open(dir.join("state.json")).unwrap());
+        let db = Database::new();
+        let vault = Vault::new(None);
+        let config = config::Protect {
+            host: "localhost".into(),
+            port: console.port,
+            username: "harbormaster".into(),
+            fingerprint: Some(console.fingerprint.to_string()),
+            devices: None,
+            name_prefix: String::new(),
+            name_suffix: String::new(),
+        };
+        let protect = ProtectBridge::prepare(&dir, config, store.clone(), db.clone(), vault.clone()).unwrap();
+        let hap = harbormaster_hap::Config {
+            name: "Test".into(),
+            model: "Test".into(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            advertise: false,
+            snapshots: None,
+        };
+        let bridge = Arc::new(Bridge::start(hap, store, db.clone()).await.unwrap());
+        let running = tokio::spawn(protect.run(bridge));
+
+        // No password: the known devices are published, all of them
+        // offline, and the console is left alone.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let published = db.to_json();
+        let published = published["accessories"].as_array().unwrap();
+        assert_eq!(published.len(), known.len());
+        assert!(!online(published), "nothing may look online");
+        assert!(vault.view().waiting);
+        assert_eq!(console.logins.load(Ordering::SeqCst), 0);
+
+        // A wrong password is tried once, discarded, and the wait resumes.
+        let outcome = vault.offer(Secret::new("wrong horse".into())).await.unwrap();
+        assert!(matches!(&outcome, Outcome::Rejected(why) if why.contains("rejected")), "{outcome:?}");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(console.logins.load(Ordering::SeqCst), 1, "a refused password must not be retried");
+        let view = vault.view();
+        assert!(view.waiting && view.problem.as_deref().unwrap().contains("rejected"), "{view:?}");
+
+        // The right one signs in at once.
+        let outcome = vault.offer(Secret::new(PASSWORD.into())).await.unwrap();
+        assert_eq!(outcome, Outcome::SignedIn { devices: known.len() });
+        assert_eq!(console.logins.load(Ordering::SeqCst), 2);
+        assert!(!vault.view().waiting);
+        running.abort();
+
+        // What the dashboard and the log were told, and what they were not.
+        let (lines, _) = logs.attach();
+        let said = |text: &str| lines.iter().any(|l| l.message.contains(text));
+        assert!(said("waiting for the Protect password"), "{lines:?}");
+        assert!(said("rejected the password"), "{lines:?}");
+        assert!(said("connected to UniFi Protect"), "{lines:?}");
+        let everything = format!("{lines:?} {:?} {:?}", vault.view(), outcome);
+        assert!(!everything.contains("horse"), "a password leaked: {everything}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether any accessory reports itself reachable.
+    fn online(accessories: &[Value]) -> bool {
+        accessories.iter().any(|accessory| {
+            accessory["services"].as_array().into_iter().flatten().any(|service| {
+                service["characteristics"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|c| c["type"] == kind::STATUS_ACTIVE && c["value"] == true)
+            })
+        })
     }
 }

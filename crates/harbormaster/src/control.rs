@@ -12,6 +12,8 @@ pub enum Message {
     /// A full status snapshot, sent on connect and then once a second.
     State(Box<State>),
     Log(LogLine),
+    /// The answer to `Command::Unlock`, sent only to whoever asked.
+    Unlock(UnlockReply),
 }
 
 /// What an attached TUI may ask of the daemon, one JSON object per line.
@@ -19,6 +21,9 @@ pub enum Message {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
+    /// Hand the daemon the UniFi Protect password, which it keeps in
+    /// memory only. It answers with `Message::Unlock`.
+    Unlock { password: crate::password::Secret },
     /// Share a device with HomeKit, or stop sharing it.
     SetShared { key: String, shared: bool },
     /// Publish a device under a new name, or under its own again if absent.
@@ -60,6 +65,8 @@ pub struct State {
     /// The daemon's clock when this was taken, in seconds since the Unix
     /// epoch. Ages are worked out against this, not the TUI's own clock.
     pub time: u64,
+    /// The daemon's process id, for whoever needs to restart it.
+    pub pid: u32,
     /// HomeKit's configuration number, which rises when accessories change.
     pub config_number: u32,
     /// Text put before and after every device name sent to HomeKit. Device
@@ -112,6 +119,23 @@ pub struct Console {
     pub connected: bool,
     /// When the console last sent anything, in seconds since the Unix epoch.
     pub last_update: Option<u64>,
+    /// The daemon has no Protect password and is waiting to be given one.
+    pub waiting_for_password: bool,
+    /// Why the console is not connected, in plain words, when that is known.
+    pub problem: Option<String>,
+}
+
+/// How a sign-in with a handed-over password went.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UnlockReply {
+    pub signed_in: bool,
+    /// How many devices are published, when signed in.
+    pub devices: usize,
+    /// The daemon still holds the password and will keep trying it.
+    pub kept: bool,
+    /// Why not, when not signed in.
+    pub detail: String,
 }
 
 /// One published device and what it is doing. Times are seconds since the
@@ -207,7 +231,12 @@ mod tests {
             name: "Harbormaster".into(),
             time: 1_800_000_000,
             config_number: 7,
-            console: Some(Console { host: "10.0.0.1".into(), connected: true, last_update: Some(1_799_999_998) }),
+            console: Some(Console {
+                host: "10.0.0.1".into(),
+                connected: true,
+                last_update: Some(1_799_999_998),
+                ..Console::default()
+            }),
             devices: vec![Device {
                 aid: 3,
                 kind: "doorbell".into(),
@@ -260,6 +289,15 @@ mod tests {
         assert_eq!(serde_json::from_str::<Command>(&line).unwrap(), prefix);
         let default: Command = serde_json::from_str(r#"{"type":"set_name_suffix"}"#).unwrap();
         assert_eq!(default, Command::SetNameSuffix { text: None });
+        let unlock: Command = serde_json::from_str(r#"{"type":"unlock","password":"correct horse"}"#).unwrap();
+        let Command::Unlock { password } = &unlock else { panic!("not an unlock") };
+        assert_eq!(password.expose(), "correct horse");
+        assert!(!format!("{unlock:?}").contains("horse"), "a command must be safe to print");
+        let reply = Message::Unlock(UnlockReply { signed_in: true, devices: 18, ..UnlockReply::default() });
+        assert_eq!(
+            serde_json::to_string(&reply).unwrap(),
+            r#"{"type":"unlock","signed_in":true,"devices":18,"kept":false,"detail":""}"#
+        );
     }
 
     /// The fields a TUI from before the dashboard insists on must stay.
