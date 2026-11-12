@@ -49,6 +49,8 @@ mod iid {
     /// HomeKit expects a camera to handle two viewers at once.
     pub const STREAMS: [u64; 2] = [200, 210];
     pub const LIGHTBULB: u64 = 180;
+    pub const MICROPHONE: u64 = 220;
+    pub const SPEAKER: u64 = 230;
     /// Three services, ten ids apart: camera switches, recording, data stream.
     pub const RECORDING: u64 = 300;
 }
@@ -91,6 +93,8 @@ pub struct Features {
     pub light_level: bool,
     pub leak: bool,
     pub battery: bool,
+    /// A camera with a speaker that a viewer can talk through.
+    pub talk: bool,
 }
 
 /// Everything needed to publish one Protect device as an accessory.
@@ -149,6 +153,7 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
                 Kind::Camera => Features {
                     motion: true,
                     doorbell: device["featureFlags"]["isDoorbell"] == true,
+                    talk: speaker_rate(device).is_some(),
                     ..Features::default()
                 },
                 Kind::Light => Features { motion: true, ..Features::default() },
@@ -161,6 +166,7 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
                     light_level: enabled("lightSettings"),
                     battery: true,
                     doorbell: false,
+                    talk: false,
                 },
             };
             let name = [text("name"), text("marketName"), model.clone()]
@@ -204,6 +210,14 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
         }
     }
     out
+}
+
+/// The sample rate a camera's speaker takes sound at, if it has a speaker
+/// and takes the one format Harbormaster produces.
+fn speaker_rate(camera: &Value) -> Option<u32> {
+    let settings = &camera["talkbackSettings"];
+    let usable = camera["featureFlags"]["hasSpeaker"] == true && settings["typeFmt"] == "aac";
+    settings["samplingRate"].as_u64().filter(|_| usable).and_then(|rate| u32::try_from(rate).ok())
 }
 
 /// One of a camera's video streams: the same picture at one quality.
@@ -253,6 +267,8 @@ struct LiveInner {
     /// Cameras the console cannot reach, which have no picture to give.
     offline: std::collections::HashSet<String>,
     names: HashMap<String, String>,
+    /// Cameras with a usable speaker, and the sample rate each wants.
+    speakers: HashMap<String, u32>,
 }
 
 impl Live {
@@ -265,6 +281,8 @@ impl Live {
             .filter(|c| c["state"] != "CONNECTED")
             .filter_map(|c| c["id"].as_str().map(str::to_owned))
             .collect();
+        inner.speakers =
+            cameras().filter_map(|c| Some((c["id"].as_str()?.to_owned(), speaker_rate(c)?))).collect();
         inner.names = cameras()
             .filter_map(|c| Some((c["id"].as_str()?.to_owned(), c["name"].as_str()?.to_owned())))
             .collect();
@@ -404,6 +422,35 @@ impl VideoSource for ProtectVideo {
         });
         Some(receiver)
     }
+
+    fn speaker_rate(&self) -> Option<u32> {
+        // The speaker belongs to the camera, not to its second lens.
+        let inner = self.live.inner.read().unwrap();
+        inner.speakers.get(&self.camera).copied().filter(|_| self.lens == 0 && inner.client.is_some())
+    }
+
+    fn speak(&self) -> Option<mpsc::Sender<Bytes>> {
+        let client = self.live.inner.read().unwrap().client.clone()?;
+        let camera = self.camera.clone();
+        let (sender, mut receiver) = mpsc::channel::<Bytes>(32);
+        tokio::spawn(async move {
+            let mut speaker = match client.talkback(&camera).await {
+                Ok(speaker) => speaker,
+                Err(e) => {
+                    tracing::warn!("could not open the camera's speaker: {e}");
+                    return;
+                }
+            };
+            // Ends when the sender is dropped, which closes the speaker.
+            while let Some(audio) = receiver.recv().await {
+                if let Err(e) = speaker.send(audio).await {
+                    tracing::warn!("the camera's speaker closed: {e}");
+                    return;
+                }
+            }
+        });
+        Some(sender)
+    }
 }
 
 /// Whether the `devices` filter in the config selects this device.
@@ -535,6 +582,12 @@ fn build_accessory(aid: u64, def: &DeviceDef, with_video: bool) -> (Accessory, H
             ],
         );
         (handles.light_on, handles.brightness) = (Some(ids[0]), Some(ids[1]));
+    }
+    if let (true, true, Some(_)) = (with_video, f.talk && def.lens == 0, def.video) {
+        // HomeKit offers a talk button on a camera that has both of these.
+        let mute = || Characteristic { writable: true, ..Characteristic::sensor(kind::MUTE, Format::Bool, json!(false)) };
+        accessory.add_service_at(iid::MICROPHONE, kind::MICROPHONE, false, vec![mute()]);
+        accessory.add_service_at(iid::SPEAKER, kind::SPEAKER, false, vec![mute()]);
     }
     if let (true, Some((width, height))) = (with_video, def.video) {
         let offered = video::resolutions(width, height);
@@ -1215,7 +1268,8 @@ mod tests {
         json!({
             "cameras": [{
                 "id": "cam1", "mac": "AA01", "name": "Front Door", "type": "UVC G4 Doorbell Pro", "state": "CONNECTED",
-                "featureFlags": {"isDoorbell": true, "hasPackageCamera": true},
+                "featureFlags": {"isDoorbell": true, "hasPackageCamera": true, "hasSpeaker": true},
+                "talkbackSettings": {"typeFmt": "aac", "samplingRate": 22050, "channels": 1},
                 "lenses": [{"id": 1}, {"id": 2}],
                 "channels": [
                     {"id": 0, "name": "High", "enabled": true, "width": 1600, "height": 1200},
@@ -1264,6 +1318,17 @@ mod tests {
         drop(accessory);
         let lens = ProtectVideo { live: live.clone(), camera: "cam1".into(), lens: 2 };
         assert_eq!(lens.choose(640).map(|(_, channel)| channel), Some(0));
+
+        // The doorbell has a speaker to talk through; its second lens and
+        // cameras without one do not.
+        assert!(defs[0].features.talk && !package.features.talk);
+        assert_eq!((source.speaker_rate(), lens.speaker_rate()), (Some(22050), None));
+        let (doorbell, _) = build_accessory(8, &defs[0], true);
+        let db = Database::new();
+        db.add(doorbell);
+        assert_eq!(db.read(8, iid::SPEAKER + 1), Ok(json!(false)));
+        assert_eq!(db.read(8, iid::MICROPHONE + 1), Ok(json!(false)));
+        assert!(!definitions(&super::tests::bootstrap())[0].features.talk);
 
         live.disconnected();
         assert!(!source.available());

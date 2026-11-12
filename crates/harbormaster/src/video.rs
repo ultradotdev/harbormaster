@@ -32,6 +32,19 @@ pub trait VideoSource: Send + Sync {
     /// header first; the source stops reading when the receiver is dropped.
     /// Must be called from within the async runtime.
     fn open(&self, width: u16) -> Option<mpsc::Receiver<Bytes>>;
+
+    /// The sample rate the camera's speaker wants, if it has a speaker
+    /// that sound can be sent to.
+    fn speaker_rate(&self) -> Option<u32> {
+        None
+    }
+
+    /// Opens the camera's speaker. What is sent is AAC in an ADTS stream at
+    /// [`Self::speaker_rate`]; dropping the sender closes the speaker.
+    /// Must be called from within the async runtime.
+    fn speak(&self) -> Option<mpsc::Sender<Bytes>> {
+        None
+    }
 }
 
 /// How ffmpeg is told to read the stream handed to it on standard input.
@@ -126,7 +139,7 @@ struct Pending {
     audio_ssrc: u32,
     connection: u64,
     /// Held so the port reported to the controller stays reserved.
-    _socket: UdpSocket,
+    socket: UdpSocket,
 }
 
 struct Running {
@@ -260,7 +273,7 @@ impl Stream {
             audio_ssrc,
         }
         .encode();
-        self.state.lock().unwrap().pending = Some(Pending { request, ssrc, audio_ssrc, connection, _socket: socket });
+        self.state.lock().unwrap().pending = Some(Pending { request, ssrc, audio_ssrc, connection, socket });
         Ok(Some(response))
     }
 
@@ -419,6 +432,21 @@ impl Stream {
 
         let _viewing = crate::status::global().viewing(self.aid, viewer, video.width, video.height);
 
+        // The viewer may talk back. Their sound arrives on the port this
+        // stream reserved, and goes to the camera's speaker if it has one.
+        let talking = match (&audio, self.source.speaker_rate(), pending.socket.try_clone()) {
+            (Some(audio), Some(rate), Ok(socket)) => Some(tokio::spawn(talk_back(
+                self.ffmpeg.clone(),
+                self.name.clone(),
+                socket,
+                pending.request.clone(),
+                audio.clone(),
+                rate,
+                self.source.clone(),
+            ))),
+            _ => None,
+        };
+
         // Hand the camera's video to ffmpeg as it arrives. Closing ffmpeg's
         // input when the feed ends lets it finish cleanly.
         let stdin = child.stdin.take();
@@ -467,6 +495,129 @@ impl Stream {
         }
         // Dropping the feed is what tells the source to stop reading.
         writer.abort();
+        if let Some(talking) = talking {
+            talking.abort();
+        }
+    }
+}
+
+/// How long the speaker stays open after the viewer stops talking.
+const SPEAKER_IDLE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// What ffmpeg needs to know to receive the viewer's sound: where it will
+/// arrive, how it is encoded and the key to decrypt it.
+fn talk_sdp(request: &SetupRequest, audio: &SelectedAudio, port: u16) -> String {
+    let pt = audio.payload_type;
+    let rate = audio.sample_rate_hz;
+    let format = if audio.codec == camera::OPUS {
+        format!("a=rtpmap:{pt} opus/{rate}/1\r\n")
+    } else {
+        // The codec settings HomeKit devices use for AAC-ELD at each rate.
+        let config = if rate == 24000 { "F8EC212C00BC00" } else { "F8F0212C00BC00" };
+        format!(
+            "a=rtpmap:{pt} MPEG4-GENERIC/{rate}/1\r\n\
+             a=fmtp:{pt} profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3; config={config}\r\n"
+        )
+    };
+    format!(
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Talkback\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP {pt}\r\nb=AS:24\r\n{format}\
+         a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}\r\n",
+        request.audio_srtp.key_material()
+    )
+}
+
+/// Carries the viewer's voice to the camera's speaker for as long as the
+/// stream lives. The viewer's device sends encrypted sound, mixed with
+/// control traffic, to the port this stream reserved. The sound alone is
+/// handed to a second ffmpeg, which decrypts and re-encodes it for the
+/// camera. The speaker is opened when sound first arrives and closed again
+/// after a silence.
+async fn talk_back(
+    ffmpeg: PathBuf,
+    name: String,
+    socket: UdpSocket,
+    request: SetupRequest,
+    audio: SelectedAudio,
+    rate: u32,
+    source: Arc<dyn VideoSource>,
+) {
+    use tokio::io::AsyncReadExt;
+    let ready = async {
+        socket.set_nonblocking(true).ok()?;
+        let incoming = tokio::net::UdpSocket::from_std(socket).ok()?;
+        // A free local port for ffmpeg to listen on.
+        let port = tokio::net::UdpSocket::bind("127.0.0.1:0").await.ok()?.local_addr().ok()?.port();
+        let rate = rate.to_string();
+        let args = [
+            "-hide_banner", "-loglevel", "error",
+            "-protocol_whitelist", "pipe,udp,rtp,file,crypto",
+            "-probesize", "32", "-analyzeduration", "0",
+            "-f", "sdp", "-i", "pipe:0",
+            "-map", "0:a:0", "-codec:a", "aac_at", "-ar", rate.as_str(), "-ac", "1", "-b:a", "32k",
+            "-flush_packets", "1", "-f", "adts", "pipe:1",
+        ];
+        let mut child = tokio::process::Command::new(&ffmpeg)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        stdin.write_all(talk_sdp(&request, &audio, port).as_bytes()).await.ok()?;
+        drop(stdin);
+        let stdout = child.stdout.take()?;
+        // The reserved port may be an IPv6 one, which reaches the local
+        // IPv4 address only in its mapped form.
+        let local = if incoming.local_addr().ok()?.is_ipv6() { "::ffff:127.0.0.1" } else { "127.0.0.1" };
+        let target = std::net::SocketAddr::new(local.parse().ok()?, port);
+        Some((incoming, target, child, stdout))
+    };
+    let Some((incoming, target, _child, mut stdout)) = ready.await else {
+        tracing::warn!("{name}: could not set up talking back to the camera");
+        return;
+    };
+
+    // Pass on the viewer's sound and nothing else that arrives on the port.
+    let forward = async {
+        let mut packet = [0u8; 2048];
+        loop {
+            let Ok(n) = incoming.recv(&mut packet).await else { return };
+            let is_rtp = n > 12 && packet[0] >> 6 == 2 && !(200..=204).contains(&packet[1]);
+            if is_rtp && packet[1] & 0x7f == audio.payload_type {
+                let _ = incoming.send_to(&packet[..n], target).await;
+            }
+        }
+    };
+    let speak = async {
+        let mut speaker: Option<mpsc::Sender<Bytes>> = None;
+        let mut chunk = vec![0u8; 4096];
+        loop {
+            match tokio::time::timeout(SPEAKER_IDLE, stdout.read(&mut chunk)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => return,
+                Ok(Ok(n)) => {
+                    if speaker.is_none() {
+                        tracing::info!("{name}: {} is talking through the camera", request.controller_ip);
+                        speaker = source.speak();
+                    }
+                    let sent = match &speaker {
+                        Some(open) => open.send(Bytes::copy_from_slice(&chunk[..n])).await.is_ok(),
+                        None => false,
+                    };
+                    if !sent {
+                        speaker = None;
+                    }
+                }
+                // Quiet for a while: let the camera have its speaker back.
+                Err(_) => speaker = None,
+            }
+        }
+    };
+    tokio::select! {
+        _ = forward => {}
+        _ = speak => {}
     }
 }
 
@@ -929,6 +1080,83 @@ pub(crate) mod tests {
                 return packet[1] & 0x7f;
             }
         }
+    }
+
+    /// A stand-in camera with a speaker; what it is told to play comes out
+    /// of the channel the test holds.
+    struct Speaker(mpsc::Sender<Bytes>);
+
+    impl VideoSource for Speaker {
+        fn available(&self) -> bool {
+            true
+        }
+
+        fn open(&self, _width: u16) -> Option<mpsc::Receiver<Bytes>> {
+            None
+        }
+
+        fn speaker_rate(&self) -> Option<u32> {
+            Some(22050)
+        }
+
+        fn speak(&self) -> Option<mpsc::Sender<Bytes>> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// Plays the part of a viewer's device: sends an encrypted tone to the
+    /// port a stream reserved, and checks it comes out re-encoded for the
+    /// camera's speaker. Skipped where ffmpeg is not installed.
+    #[tokio::test]
+    async fn a_viewers_voice_reaches_the_cameras_speaker() {
+        let Some(ffmpeg) = find_ffmpeg() else {
+            eprintln!("ffmpeg not installed; skipping");
+            return;
+        };
+        let reserved = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        let setup = request("127.0.0.1", 50000);
+        let audio =
+            SelectedAudio { codec: camera::OPUS, sample_rate_hz: 16000, payload_type: 110, max_bitrate_kbps: 24, packet_time_ms: 20 };
+        let (speaker, mut heard) = mpsc::channel(64);
+        let talking =
+            tokio::spawn(talk_back(ffmpeg.clone(), "Cam".into(), reserved, setup.clone(), audio, 22050, Arc::new(Speaker(speaker))));
+
+        // Give the receiving side a moment to start listening.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let key = setup.audio_srtp.key_material();
+        let destination = format!("srtp://127.0.0.1:{port}?pkt_size=188");
+        let _viewer = tokio::process::Command::new(&ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-re", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:sample_rate=48000:duration=20")
+            .args(["-codec:a", "libopus", "-ar", "16000", "-ac", "1", "-b:a", "24k", "-payload_type", "110"])
+            .args(["-f", "rtp", "-srtp_out_suite", "AES_CM_128_HMAC_SHA1_80", "-srtp_out_params", &key, &destination])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(20), heard.recv())
+            .await
+            .expect("nothing reached the speaker")
+            .expect("the speaker was closed");
+        // AAC in an ADTS stream begins every frame with twelve set bits.
+        assert!(first.len() > 7 && first[0] == 0xFF && first[1] & 0xF0 == 0xF0, "{:02x?}", &first[..first.len().min(8)]);
+        talking.abort();
+    }
+
+    #[test]
+    fn the_viewers_sound_is_described_to_ffmpeg_with_its_key() {
+        let setup = request("10.0.0.9", 50000);
+        let eld = SelectedAudio { codec: camera::AAC_ELD, sample_rate_hz: 24000, payload_type: 110, max_bitrate_kbps: 24, packet_time_ms: 30 };
+        let sdp = talk_sdp(&setup, &eld, 40000);
+        assert!(sdp.contains("m=audio 40000 RTP/AVP 110\r\n"), "{sdp}");
+        assert!(sdp.contains("a=rtpmap:110 MPEG4-GENERIC/24000/1\r\n") && sdp.contains("config=F8EC212C00BC00"), "{sdp}");
+        assert!(sdp.contains(&format!("inline:{}", setup.audio_srtp.key_material())), "{sdp}");
+        let opus = SelectedAudio { codec: camera::OPUS, sample_rate_hz: 16000, ..eld };
+        assert!(talk_sdp(&setup, &opus, 40000).contains("a=rtpmap:110 opus/16000/1\r\n"));
     }
 
     /// Runs a real ffmpeg with a test pattern and tone and checks encrypted
