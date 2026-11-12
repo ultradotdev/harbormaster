@@ -260,7 +260,8 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
                     mac: format!("{}P", main.mac),
                     // It has no sensor of its own, so it borrows the
                     // doorbell's: what moves at the door is what it sees.
-                    features: Features { motion: true, ..Features::default() },
+                    // The same goes for what the doorbell recognises.
+                    features: Features { motion: true, detects: main.features.detects.clone(), ..Features::default() },
                     video: size("width").zip(size("height")),
                     lens: device["lenses"][1]["id"].as_u64().and_then(|n| u8::try_from(n).ok()).unwrap_or(2),
                     ..main
@@ -980,9 +981,13 @@ impl Devices {
                 _ => None,
             }
         };
-        let handles = camera.as_ref().and_then(|camera| self.handles.get(&("camera", camera.clone())));
-        if let (Some(camera), Some(h)) = (&camera, handles) {
-            self.show_detections(h, db, camera, &events, true);
+        let Some(camera) = camera else { return };
+        // A second lens is an accessory of its own that sees the same things.
+        let second_lens = format!("{camera}#");
+        for ((kind, key), h) in &self.handles {
+            if *kind == "camera" && (*key == camera || key.starts_with(&second_lens)) {
+                self.show_detections(h, db, &camera, &events, true);
+            }
         }
     }
 
@@ -993,7 +998,9 @@ impl Devices {
         events.clear();
         for ((kind, id), h) in &self.handles {
             if *kind == "camera" {
-                self.show_detections(h, db, id, &events, false);
+                // A second lens goes by its camera's id.
+                let camera = id.split('#').next().unwrap_or(id);
+                self.show_detections(h, db, camera, &events, false);
             }
         }
         drop(events);
@@ -1716,7 +1723,12 @@ mod tests {
         let mut defs = f.devices.defs.clone();
         let camera = defs.iter_mut().find(|def| def.id == "cam1" && def.lens == 0).unwrap();
         camera.features.sensors = vec![Detection::Person, Detection::Vehicle];
-        assert_eq!(f.devices.add(&defs, &f.store, &f.db).unwrap(), 1, "only the changed camera is rebuilt");
+        // The package camera is the same doorbell looking down.
+        let mut lens = camera.clone();
+        (lens.lens, lens.mac, lens.features.sensors) = (2, format!("{}P", lens.mac), vec![Detection::Person]);
+        defs.push(lens);
+        assert_eq!(f.devices.add(&defs, &f.store, &f.db).unwrap(), 2, "only the changed camera and the new lens are built");
+        let package = f.aid("camera", "cam1#lens2");
         let aid = f.aid("camera", "cam1");
         let (person, vehicle) = (Detection::Person.iid() + 1, Detection::Vehicle.iid() + 1);
         let seen = |f: &Fixture| (f.db.read(aid, person).unwrap(), f.db.read(aid, vehicle).unwrap());
@@ -1732,6 +1744,7 @@ mod tests {
         let start = json!({"camera": "cam1", "type": "smartDetectZone", "smartDetectTypes": ["person"], "start": 1});
         event(&f, "add", "ev1", start);
         assert_eq!(seen(&f), (json!(1), json!(0)));
+        assert_eq!(f.db.read(package, person), Ok(json!(1)), "the second lens sees what the first does");
         // Updates that say nothing of the kinds change nothing; one that
         // names more adds them.
         event(&f, "update", "ev1", json!({"labels": []}));
@@ -1742,6 +1755,7 @@ mod tests {
         event(&f, "add", "ev2", json!({"camera": "cam1", "smartDetectTypes": ["vehicle"], "start": 2}));
         event(&f, "update", "ev1", json!({"end": 3, "score": 90}));
         assert_eq!(seen(&f), (json!(0), json!(1)));
+        assert_eq!(f.db.read(package, person), Ok(json!(0)));
         // What follows an ending repeats it and must not start it again.
         event(&f, "update", "ev1", json!({"camera": "cam1", "smartDetectTypes": ["person"], "start": 1, "end": 3}));
         assert_eq!(seen(&f), (json!(0), json!(1)));
@@ -1756,9 +1770,9 @@ mod tests {
         assert_eq!(seen(&f), (json!(0), json!(0)));
         // So does reading the whole inventory again after a lost connection.
         event(&f, "add", "ev6", json!({"camera": "cam1", "smartDetectTypes": ["person"], "start": 5}));
-        assert_eq!(seen(&f), (json!(1), json!(0)));
+        assert_eq!((seen(&f), f.db.read(package, person)), ((json!(1), json!(0)), Ok(json!(1))));
         f.devices.apply_snapshot(&f.db, &bootstrap());
-        assert_eq!(seen(&f), (json!(0), json!(0)));
+        assert_eq!((seen(&f), f.db.read(package, person)), ((json!(0), json!(0)), Ok(json!(0))));
     }
 
     #[test]

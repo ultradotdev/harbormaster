@@ -121,6 +121,26 @@ fn obtain(platform: &mut dyn Platform, username: &str) -> Result<Secret> {
     }
 }
 
+/// How long to wait for the daemon's own retries after a failed sign-in.
+const RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Watches the daemon until it is signed in or `wait` has passed. Returns
+/// how many devices are published once it is.
+fn wait_for_retry(wait: std::time::Duration, mut state: impl FnMut() -> Option<crate::control::State>) -> Option<usize> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if let Some(state) = state() {
+            if state.console.as_ref().is_some_and(|console| console.connected) {
+                return Some(state.devices.len());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
 pub fn run(state_dir: &Path, from_stdin: bool) -> Result<()> {
     let protect = config::load(state_dir)?
         .protect
@@ -139,6 +159,15 @@ pub fn run(state_dir: &Path, from_stdin: bool) -> Result<()> {
         return Ok(());
     }
     if reply.kept {
+        // The daemon tries again within seconds, and a first attempt that
+        // fails is often followed by one that works: macOS turns away a
+        // new build's first connection while it checks its permission.
+        println!("The first attempt did not get through ({}). Waiting for the daemon to try again...", reply.detail);
+        let retried = wait_for_retry(RETRY_WAIT, || client::state(state_dir).ok());
+        if let Some(devices) = retried {
+            println!("Signed in. {devices} devices are published to HomeKit.");
+            return Ok(());
+        }
         bail!(
             "not signed in: {}\nThe daemon kept the password and keeps trying; there is no need to unlock again.",
             reply.detail
@@ -150,6 +179,24 @@ pub fn run(state_dir: &Path, from_stdin: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_first_attempt_is_given_time_to_come_good() {
+        use crate::control::{Console, Device, State};
+        let state = |connected| State {
+            console: Some(Console { connected, ..Console::default() }),
+            devices: vec![Device::default(); 3],
+            ..State::default()
+        };
+        let mut asked = 0;
+        let signed_in = wait_for_retry(std::time::Duration::from_secs(5), || {
+            asked += 1;
+            // No answer, then still failing, then through.
+            [None, Some(state(false)), Some(state(true))][asked - 1].clone()
+        });
+        assert_eq!((signed_in, asked), (Some(3), 3));
+        assert_eq!(wait_for_retry(std::time::Duration::ZERO, || Some(state(false))), None, "it gives up in the end");
+    }
 
     /// A system whose store answers from a script, recording what was done.
     struct Scripted {
