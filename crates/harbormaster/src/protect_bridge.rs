@@ -1012,7 +1012,8 @@ impl ProtectBridge {
                     }
                     _ => {
                         tracing::warn!("UniFi Protect connection lost: {e:#}");
-                        self.vault.failed(&password, &format!("{e:#}"));
+                        // The outermost message alone: the chain repeats itself.
+                        self.vault.failed(&password, &e.to_string());
                     }
                 },
             }
