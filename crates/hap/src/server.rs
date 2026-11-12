@@ -506,7 +506,15 @@ impl Connection {
                 self.shared.pairings_changed();
                 response(200, TLV, &body)
             }
-            ("GET", "/accessories", Some(_)) => json_response(200, &self.shared.db.to_json()),
+            ("GET", "/accessories", Some(_)) => {
+                let list = self.shared.db.to_json();
+                tracing::info!(
+                    "{} read the accessory list ({} accessories)",
+                    self.peer.ip().to_canonical(),
+                    list["accessories"].as_array().map_or(0, Vec::len)
+                );
+                json_response(200, &list)
+            }
             ("GET", "/characteristics", Some(_)) => self.read_characteristics(&request.query),
             ("PUT", "/characteristics", Some(_)) => self.write_characteristics(&request.body),
             // Timed writes are acknowledged; no characteristic requires them yet.

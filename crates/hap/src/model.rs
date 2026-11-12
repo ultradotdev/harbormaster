@@ -165,9 +165,15 @@ impl Characteristic {
             out.insert("unit".into(), json!(unit));
         }
         if let Some((min, max, step)) = self.range {
-            out.insert("minValue".into(), json!(min));
-            out.insert("maxValue".into(), json!(max));
-            out.insert("minStep".into(), json!(step));
+            // Whole-number formats state their limits as whole numbers;
+            // a controller may refuse "100.0" as the limit of an integer.
+            let number = |n: f64| match self.format {
+                Format::Float => json!(n),
+                _ => json!(n as i64),
+            };
+            out.insert("minValue".into(), number(min));
+            out.insert("maxValue".into(), number(max));
+            out.insert("minStep".into(), number(step));
         }
         Value::Object(out)
     }
@@ -445,7 +451,8 @@ impl Database {
             for s in &a.services {
                 shape.push_str(&format!("s{}:{}:{:?}", s.iid, s.kind, s.linked));
                 for c in &s.characteristics {
-                    shape.push_str(&format!("c{}:{}", c.iid, c.kind));
+                    // Format and limits are part of what a controller remembers.
+                    shape.push_str(&format!("c{}:{}:{}:{:?}", c.iid, c.kind, c.format.name(), c.range));
                     // Fixed structured values, such as the codecs a camera
                     // offers, are part of what a controller remembers.
                     if matches!(c.format, Format::Tlv8) && !c.writable && !c.notifies {
