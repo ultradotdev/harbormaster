@@ -12,6 +12,7 @@ mod demo;
 mod fmp4;
 mod keychain;
 mod logbuf;
+mod logfile;
 mod overrides;
 mod password;
 mod protect_bridge;
@@ -54,6 +55,8 @@ Options:
   --demo            daemon: publish simulated devices, to try the dashboard
                     without a UniFi Protect console
   --verbose         daemon: also log each event sent to a controller
+  --detached        daemon: log to the file in the state directory only, not
+                    to the terminal as well (the installed service uses this)
   --stdin           unlock: read the password from standard input instead
   --seconds N       protect-capture, protect-feed: how long to record (default 120)
   --camera NAME     protect-feed: which camera (default: the first in `devices`)
@@ -75,6 +78,7 @@ struct Args {
     listen: SocketAddr,
     demo: bool,
     verbose: bool,
+    detached: bool,
     stdin: bool,
     seconds: u64,
     camera: Option<String>,
@@ -94,6 +98,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
         listen: "0.0.0.0:51826".parse()?,
         demo: false,
         verbose: false,
+        detached: false,
         stdin: false,
         seconds: 120,
         camera: None,
@@ -119,6 +124,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
             "--demo" => args.demo = true,
             "--verbose" => args.verbose = true,
             "--stdin" => args.stdin = true,
+            "--detached" => args.detached = true,
             "--help" | "-h" => {
                 println!("harbormaster {}\n\n{HELP}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -152,8 +158,17 @@ fn main() -> Result<()> {
         )),
         Command::Daemon => {
             let logs = logbuf::LogBuffer::new();
+            // The log file lives in the state directory, which holds
+            // pairing keys and is the owner's alone.
+            daemon::create_private_dir(&args.state_dir)?;
+            // In the foreground the terminal gets every line as well. A
+            // detached daemon's stderr is a file nothing rotates, so only
+            // what cannot go through the log (a panic, a failed start)
+            // ends up there.
+            let stderr = (!args.detached).then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
             tracing_subscriber::registry()
-                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .with(stderr)
+                .with(logfile::LogFile::open(&args.state_dir)?)
                 .with(if args.verbose {
                     tracing_subscriber::filter::LevelFilter::DEBUG
                 } else {

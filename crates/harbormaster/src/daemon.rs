@@ -151,7 +151,7 @@ async fn wait_for_shutdown() -> Result<()> {
 }
 
 /// The state directory holds pairing keys, so only the owner may enter it.
-fn create_private_dir(dir: &Path) -> Result<()> {
+pub fn create_private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
