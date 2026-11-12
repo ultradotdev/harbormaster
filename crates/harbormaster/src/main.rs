@@ -14,6 +14,7 @@ mod protect_check;
 mod qr;
 mod recording;
 mod secrets;
+mod status;
 mod tui;
 mod video;
 

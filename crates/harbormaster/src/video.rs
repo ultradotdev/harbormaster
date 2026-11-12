@@ -388,6 +388,7 @@ impl Stream {
         tokio::spawn(async move {
             // Keep the reserved port for as long as the stream lives.
             let _socket = pending.socket;
+            let _viewing = crate::status::global().viewing(stream.aid, viewer, video.width, video.height);
             if let Some(stderr) = stderr {
                 let name = stream.name.clone();
                 let progress = progress.clone();

@@ -576,6 +576,7 @@ impl Devices {
             let aid = store.accessory_id(&def.store_key())?;
             let (accessory, handles) = build_accessory(aid, def, self.video.is_some());
             db.replace(accessory);
+            crate::status::global().device_kind(aid, def.kind.model_key());
             if let Some(live) = &self.live {
                 install_light_control(db, live, aid, &handles, &def.id);
             }
@@ -702,6 +703,7 @@ impl Devices {
     }
 
     fn apply_update(&self, db: &Database, update: &Update) {
+        crate::status::global().console_update();
         if update.action == "update" {
             self.apply(db, &update.model_key, &update.id, &update.data, true);
         }
@@ -806,6 +808,7 @@ impl ProtectBridge {
             }
             self.devices.mark_offline(&self.db);
             self.live.disconnected();
+            crate::status::global().console_disconnected();
             // A session that lasted a while was healthy, so start over quickly.
             if started.elapsed() > Duration::from_secs(60) {
                 delay = Duration::from_secs(1);
@@ -840,6 +843,7 @@ impl ProtectBridge {
             bridge.config_changed();
         }
         self.devices.apply_snapshot(&self.db, &bootstrap);
+        crate::status::global().console_update();
         tracing::info!(
             "connected to UniFi Protect at {} ({} devices)",
             self.config.host,
