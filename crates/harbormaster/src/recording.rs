@@ -553,6 +553,7 @@ async fn run(
 
     let started = Instant::now();
     let mut fragments = 0u32;
+    let _recording = crate::status::global().recording(&name);
     let forward = async {
         let Some(mut stdout) = stdout else { return "ffmpeg has no output" };
         let mut splitter = Splitter::default();

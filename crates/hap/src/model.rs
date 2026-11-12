@@ -624,6 +624,16 @@ mod tests {
     }
 
     #[test]
+    fn removing_an_accessory_drops_it_and_its_handlers() {
+        let (db, iid) = sample();
+        db.on_write(2, iid, Arc::new(|_, _| Ok(None)));
+        assert!(db.remove(2));
+        assert!(!db.contains(2) && !db.remove(2));
+        assert_eq!(db.read(2, iid), Err(status::NOT_FOUND));
+        assert!(db.handlers.read().unwrap().is_empty());
+    }
+
+    #[test]
     fn instance_ids_are_sequential_and_unique() {
         let (db, temperature) = sample();
         // Information service is iid 1 with six characteristics (2..=7),

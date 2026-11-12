@@ -417,6 +417,8 @@ impl Stream {
             }
         );
 
+        let _viewing = crate::status::global().viewing(self.aid, viewer, video.width, video.height);
+
         // Hand the camera's video to ffmpeg as it arrives. Closing ffmpeg's
         // input when the feed ends lets it finish cleanly.
         let stdin = child.stdin.take();
