@@ -193,7 +193,9 @@ pub fn definitions(bootstrap: &Value) -> Vec<DeviceDef> {
                     name: format!("{} Package Camera", main.name),
                     // Serial numbers must differ between accessories.
                     mac: format!("{}P", main.mac),
-                    features: Features::default(),
+                    // It has no sensor of its own, so it borrows the
+                    // doorbell's: what moves at the door is what it sees.
+                    features: Features { motion: true, ..Features::default() },
                     video: size("width").zip(size("height")),
                     lens: device["lenses"][1]["id"].as_u64().and_then(|n| u8::try_from(n).ok()).unwrap_or(2),
                     ..main
@@ -537,13 +539,10 @@ fn build_accessory(aid: u64, def: &DeviceDef, with_video: bool) -> (Accessory, H
     if let (true, Some((width, height))) = (with_video, def.video) {
         let offered = video::resolutions(width, height);
         handles.streams = iid::STREAMS.iter().map(|iid| video::add_stream_service(&mut accessory, *iid, &offered)).collect();
-        // A second lens has no sensor of its own to start a recording.
-        if def.lens == 0 {
-            let triggers = TRIGGER_MOTION | if f.doorbell { TRIGGER_DOORBELL } else { 0 };
-            let motion_service = handles.motion.is_some().then_some(iid::MOTION);
-            handles.recording =
-                Some(recording::add_services(&mut accessory, iid::RECORDING, &offered, triggers, motion_service));
-        }
+        let triggers = TRIGGER_MOTION | if f.doorbell { TRIGGER_DOORBELL } else { 0 };
+        let motion_service = handles.motion.is_some().then_some(iid::MOTION);
+        handles.recording =
+            Some(recording::add_services(&mut accessory, iid::RECORDING, &offered, triggers, motion_service));
     }
     if f.battery {
         let ids = accessory.add_service_at(
@@ -654,7 +653,7 @@ impl Devices {
                 if let (Some(ids), Some(recorder)) = (handles.recording, &self.recorder) {
                     let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone(), lens: def.lens });
                     let switches: Vec<u64> = handles.streams.iter().map(StreamIds::active).collect();
-                    recorder.install(db, aid, ids, &def.name, &def.id, source, &switches);
+                    recorder.install(db, aid, ids, &def.name, &def.handle_id(), source, &switches);
                 }
                 if def.kind == Kind::Camera {
                     live.inner.write().unwrap().cameras.insert(aid, (def.id.clone(), def.lens));
@@ -691,9 +690,17 @@ impl Devices {
     /// Applies changed fields of one device. `live` is false when replaying
     /// a snapshot, where a past ring must not sound the doorbell again.
     fn apply(&self, db: &Database, model_key: &str, id: &str, data: &Value, live: bool) {
-        let Some((_, h)) = self.handles.iter().find(|((k, i), _)| *k == model_key && i == id) else {
-            return;
-        };
+        // A camera's second lens is a separate accessory fed by the same
+        // device, so it hears the same updates.
+        let second_lens = format!("{id}#");
+        for ((kind, key), h) in &self.handles {
+            if *kind == model_key && (key == id || key.starts_with(&second_lens)) {
+                self.apply_to(h, db, model_key, id, data, live);
+            }
+        }
+    }
+
+    fn apply_to(&self, h: &Handles, db: &Database, model_key: &str, id: &str, data: &Value, live: bool) {
         let set = |iid: Option<u64>, value: Value| {
             if let Some(iid) = iid {
                 db.set(h.aid, iid, value);
@@ -923,14 +930,16 @@ impl ProtectBridge {
             }
         }
         let defs: Vec<DeviceDef> = all.into_iter().filter(|def| selected(def, filter)).collect();
-        // A device the console no longer lists at all was deleted there. One
-        // that is merely being re-adopted is still listed, and is kept so
+        // A device the console no longer lists, or lists as not adopted,
+        // was removed there. One in the middle of being adopted is kept so
         // HomeKit does not forget its room and automations.
         let listed: std::collections::HashSet<(&str, &str)> = [Kind::Camera, Kind::Sensor, Kind::Light]
             .into_iter()
             .flat_map(|kind| {
-                let ids = bootstrap[kind.section()].as_array().into_iter().flatten();
-                ids.filter_map(move |device| Some((kind.model_key(), device["id"].as_str()?)))
+                let devices = bootstrap[kind.section()].as_array().into_iter().flatten();
+                devices
+                    .filter(|device| device["isAdopted"] != false || device["isAdopting"] == true)
+                    .filter_map(move |device| Some((kind.model_key(), device["id"].as_str()?)))
             })
             .collect();
         let removed = self
@@ -1120,10 +1129,11 @@ mod tests {
         assert_ne!(package.mac, defs[0].mac, "serial numbers must differ");
         assert_ne!(package.store_key(), defs[0].store_key());
         assert_ne!(package.handle_id(), defs[0].handle_id());
-        assert!(!package.features.motion && !package.features.doorbell);
+        assert!(package.features.motion && !package.features.doorbell);
         let (accessory, handles) = build_accessory(9, package, true);
         assert_eq!(handles.streams.len(), 2);
-        assert!(handles.recording.is_none() && handles.motion.is_none() && handles.ring.is_none());
+        // It can record, started by the doorbell's motion, but never rings.
+        assert!(handles.recording.is_some() && handles.motion.is_some() && handles.ring.is_none());
         drop(accessory);
         let lens = ProtectVideo { live: live.clone(), camera: "cam1".into(), lens: 2 };
         assert_eq!(lens.choose(640).map(|(_, channel)| channel), Some(0));
@@ -1306,6 +1316,21 @@ mod tests {
         let door = devices.handles[&("camera", "cam1".to_owned())].aid;
         let package = devices.handles[&("camera", "cam1#lens2".to_owned())].aid;
         let sensor = devices.handles[&("sensor", "sen1".to_owned())].aid;
+
+        // The package camera has no sensor of its own; it follows the doorbell's.
+        let update = Update {
+            action: "update".into(),
+            model_key: "camera".into(),
+            id: "cam1".into(),
+            new_update_id: None,
+            data: json!({"isSmartDetected": true, "lastRing": 5}),
+        };
+        let mut changes = db.subscribe_changes();
+        devices.apply_update(&db, &update);
+        assert_eq!(db.read(door, iid::MOTION + 1), Ok(json!(true)));
+        assert_eq!(db.read(package, iid::MOTION + 1), Ok(json!(true)));
+        let rings = std::iter::from_fn(|| changes.try_recv().ok()).filter(|c| c.iid == iid::DOORBELL + 1).count();
+        assert_eq!(rings, 1, "only the doorbell itself rings");
 
         // Deleting the doorbell takes its package camera with it.
         let removed = devices.remove_where(&db, |def| def.kind == Kind::Camera && def.id == "cam1");
