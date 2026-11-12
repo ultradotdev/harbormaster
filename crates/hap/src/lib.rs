@@ -19,5 +19,5 @@ pub mod store;
 mod tlv;
 
 pub use model::{Accessory, Characteristic, Database, Format, Info};
-pub use server::{Bridge, Config, ConnectionInfo, Error, SnapshotSource};
+pub use server::{Bridge, Config, ConnectionInfo, Error, SnapshotReason, SnapshotSource};
 pub use store::Store;

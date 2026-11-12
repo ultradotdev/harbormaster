@@ -89,6 +89,9 @@ pub fn resolutions(max_width: u16, max_height: u16) -> Vec<(u16, u16, u8)> {
     out
 }
 
+/// Says why a camera may not be watched right now, or `None` if it may.
+pub type Gate = Arc<dyn Fn() -> Option<&'static str> + Send + Sync>;
+
 /// Instance ids of one stream management service.
 #[derive(Clone, Copy, Debug)]
 pub struct StreamIds {
@@ -107,6 +110,13 @@ pub fn add_stream_service(accessory: &mut Accessory, iid: u64, offered: &[(u16, 
         camera::stream_characteristics(offered),
     );
     StreamIds { selected: ids[0], setup: ids[1], status: ids[2], active: ids[6] }
+}
+
+impl StreamIds {
+    /// The characteristic HomeKit uses to switch this stream on and off.
+    pub fn active(&self) -> u64 {
+        self.active
+    }
 }
 
 /// A stream the controller has set up but not yet started.
@@ -139,6 +149,7 @@ struct Stream {
     db: Arc<Database>,
     source: Arc<dyn VideoSource>,
     ffmpeg: PathBuf,
+    gate: Option<Gate>,
     state: Mutex<State>,
 }
 
@@ -151,6 +162,7 @@ pub fn install(
     name: &str,
     source: Arc<dyn VideoSource>,
     ffmpeg: &Path,
+    gate: Option<Gate>,
 ) {
     let stream = Arc::new(Stream {
         name: name.to_owned(),
@@ -159,6 +171,7 @@ pub fn install(
         db: db.clone(),
         source,
         ffmpeg: ffmpeg.to_owned(),
+        gate,
         state: Mutex::new(State::default()),
     });
     let s = stream.clone();
@@ -171,19 +184,41 @@ pub fn install(
     let mut closed = db.subscribe_connection_closed();
     let weak = Arc::downgrade(&stream);
     tokio::spawn(async move {
+        // Also look every couple of seconds for the camera having been
+        // switched off in HomeKit while someone is watching.
+        let mut check = tokio::time::interval(std::time::Duration::from_secs(2));
         loop {
-            let connection = match closed.recv().await {
-                Ok(connection) => connection,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => return,
-            };
-            let Some(stream) = weak.upgrade() else { return };
-            stream.connection_closed(connection);
+            tokio::select! {
+                closed = closed.recv() => {
+                    let connection = match closed {
+                        Ok(connection) => connection,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => return,
+                    };
+                    let Some(stream) = weak.upgrade() else { return };
+                    stream.connection_closed(connection);
+                }
+                _ = check.tick() => {
+                    let Some(stream) = weak.upgrade() else { return };
+                    if let Some(why) = stream.refusal() {
+                        let watching = stream.state.lock().unwrap().running.is_some();
+                        if watching {
+                            tracing::info!("{}: ending live view: {why}", stream.name);
+                            stream.stop_if(|_| true);
+                        }
+                    }
+                }
+            }
         }
     });
 }
 
 impl Stream {
+    /// Why HomeKit's own switches forbid watching right now, if they do.
+    fn refusal(&self) -> Option<&'static str> {
+        self.gate.as_ref().and_then(|gate| gate())
+    }
+
     fn set_status(&self, status: u8) {
         self.db.set(self.aid, self.ids.status, camera::streaming_status(status));
     }
@@ -199,6 +234,9 @@ impl Stream {
         }
         if self.db.read(self.aid, self.ids.active) == Ok(serde_json::json!(0)) {
             return unavailable("streaming is switched off for this camera in HomeKit");
+        }
+        if let Some(why) = self.refusal() {
+            return unavailable(why);
         }
         if !self.source.available() {
             return unavailable("the camera is not reachable");
@@ -801,7 +839,7 @@ pub(crate) mod tests {
         let ids = add_stream_service(&mut accessory, 200, &resolutions(640, 480));
         let db = Database::new();
         db.add(accessory);
-        install(&db, 2, ids, "Cam", source, ffmpeg);
+        install(&db, 2, ids, "Cam", source, ffmpeg, None);
         (db, ids)
     }
 

@@ -18,7 +18,7 @@ use bytes::Bytes;
 use harbormaster_hap::datastream::{DataStreams, RecordingSource, Refusal};
 use harbormaster_hap::model::status;
 use harbormaster_hap::recording::{self, kind, SelectedRecording};
-use harbormaster_hap::{Accessory, Database};
+use harbormaster_hap::{Accessory, Database, SnapshotReason};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -100,6 +100,8 @@ struct Settings {
     camera_on: bool,
     event_snapshots: bool,
     periodic_snapshots: bool,
+    /// Whether live view is allowed, as Home's streaming choice sets it.
+    streaming: bool,
     /// The hub's chosen recording format, as it wrote it.
     selected: String,
 }
@@ -112,6 +114,7 @@ impl Default for Settings {
             camera_on: true,
             event_snapshots: true,
             periodic_snapshots: true,
+            streaming: true,
             selected: String::new(),
         }
     }
@@ -283,6 +286,34 @@ impl Recorder {
         }
     }
 
+    fn settings_for(&self, aid: u64) -> Option<Settings> {
+        let key = self.cameras.lock().unwrap().get(&aid)?.key.clone();
+        Some(self.settings.lock().unwrap().get(&key).cloned().unwrap_or_default())
+    }
+
+    /// Why HomeKit's switches forbid watching this camera live, if they do.
+    pub fn live_view_refusal(&self, aid: u64) -> Option<&'static str> {
+        let settings = self.settings_for(aid)?;
+        if !settings.camera_on {
+            Some("the camera is switched off in HomeKit")
+        } else if !settings.streaming {
+            Some("streaming is switched off for this camera in HomeKit")
+        } else {
+            None
+        }
+    }
+
+    /// Whether HomeKit's switches allow a still image for this purpose.
+    pub fn snapshot_allowed(&self, aid: u64, reason: SnapshotReason) -> bool {
+        let Some(settings) = self.settings_for(aid) else { return true };
+        settings.camera_on
+            && match reason {
+                SnapshotReason::Periodic => settings.periodic_snapshots,
+                SnapshotReason::Event => settings.event_snapshots,
+                SnapshotReason::Unspecified => true,
+            }
+    }
+
     /// Notes that a camera has just begun to see motion or been rung, so
     /// that a recording asked for moments later can reach back to before it.
     pub fn event_started(&self, aid: u64) {
@@ -294,6 +325,7 @@ impl Recorder {
     /// Connects a camera's recording services to its video. `key` names the
     /// camera in the settings file. Must be called from within the async
     /// runtime, after the accessory is in the database.
+    #[allow(clippy::too_many_arguments)]
     pub fn install(
         self: &Arc<Self>,
         db: &Arc<Database>,
@@ -302,6 +334,7 @@ impl Recorder {
         name: &str,
         key: &str,
         source: Arc<dyn VideoSource>,
+        stream_switches: &[u64],
     ) {
         let camera = Arc::new(Camera {
             name: name.to_owned(),
@@ -326,6 +359,9 @@ impl Recorder {
         db.set(aid, ids.active, on(settings.active));
         db.set(aid, ids.audio, on(settings.audio));
         db.set(aid, ids.selected, json!(settings.selected));
+        for iid in stream_switches {
+            db.set(aid, *iid, on(settings.streaming));
+        }
         camera.refresh(&settings);
         tracing::info!(
             "{name}: HomeKit recording is {}",
@@ -369,6 +405,10 @@ impl Recorder {
         handle(ids.camera_on, |s, v| v.as_u64().map(|n| s.camera_on = n != 0).is_some());
         handle(ids.active, |s, v| v.as_u64().map(|n| s.active = n != 0).is_some());
         handle(ids.audio, |s, v| v.as_u64().map(|n| s.audio = n != 0).is_some());
+        // Home sets every stream of a camera together, so one flag serves.
+        for iid in stream_switches {
+            handle(*iid, |s, v| v.as_u64().map(|n| s.streaming = n != 0).is_some());
+        }
         handle(ids.selected, |s, v| {
             // An unusable choice is refused rather than stored.
             let usable = recording::parse_selected(v).is_some();
@@ -741,7 +781,7 @@ mod tests {
         };
         let recorder = Recorder::new(&dir, &ffmpeg);
         let source = Arc::new(crate::video::tests::TestPattern(ffmpeg.clone()));
-        recorder.install(&db, 2, ids, "Cam", "cam1", source);
+        recorder.install(&db, 2, ids, "Cam", "cam1", source, &[]);
         db.write(2, ids.selected, &selected_value(640, 480, 30, 800, 5), &context).unwrap();
         db.write(2, ids.audio, &json!(1), &context).unwrap();
         db.write(2, ids.active, &json!(1), &context).unwrap();
@@ -806,6 +846,12 @@ mod tests {
             let info = Info { name: "Cam", manufacturer: "m", model: "m", serial_number: "s", firmware_revision: "1" };
             let mut accessory = Accessory::new(2, &info);
             let ids = add_services(&mut accessory, 300, &[(640, 480, 30)], recording::TRIGGER_MOTION, None);
+            // Stands in for a stream service's on/off switch, at id 400.
+            let switch = harbormaster_hap::Characteristic {
+                writable: true,
+                ..harbormaster_hap::Characteristic::sensor("B0", harbormaster_hap::Format::Uint8, json!(1))
+            };
+            assert_eq!(accessory.add_service_at(399, "110", false, vec![switch]), [400]);
             let db = Database::new();
             db.add(accessory);
             (db, ids)
@@ -819,7 +865,7 @@ mod tests {
 
         let (db, ids) = build();
         let recorder = Recorder::new(&dir, Path::new("/nonexistent/ffmpeg"));
-        recorder.install(&db, 2, ids, "Cam", "cam1", Arc::new(Idle));
+        recorder.install(&db, 2, ids, "Cam", "cam1", Arc::new(Idle), &[400]);
         assert_eq!(db.read(2, ids.active), Ok(json!(0)));
         assert!(matches!(recorder.open(2), Err(Refusal::NotAllowed)));
 
@@ -838,14 +884,37 @@ mod tests {
         let no_session = WriteContext { shared_secret: None, ..context };
         assert!(db.write(2, ids.transport_setup, &transport_setup_value(&[5; 32]), &no_session).is_err());
 
+        // Home's switches decide what may be seen. 400 stands in for a
+        // stream's own on/off switch.
+        assert_eq!(recorder.live_view_refusal(2), None);
+        assert!(recorder.snapshot_allowed(2, SnapshotReason::Periodic));
+        db.write(2, ids.periodic_snapshots, &json!(0), &context).unwrap();
+        assert!(!recorder.snapshot_allowed(2, SnapshotReason::Periodic));
+        assert!(recorder.snapshot_allowed(2, SnapshotReason::Event));
+        assert!(recorder.snapshot_allowed(2, SnapshotReason::Unspecified));
+        db.write(2, ids.event_snapshots, &json!(0), &context).unwrap();
+        assert!(!recorder.snapshot_allowed(2, SnapshotReason::Event));
+        db.write(2, 400, &json!(0), &context).unwrap();
+        assert!(recorder.live_view_refusal(2).is_some_and(|why| why.contains("streaming")));
+        db.write(2, 400, &json!(1), &context).unwrap();
+        db.write(2, ids.camera_on, &json!(0), &context).unwrap();
+        assert!(recorder.live_view_refusal(2).is_some_and(|why| why.contains("camera")));
+        assert!(!recorder.snapshot_allowed(2, SnapshotReason::Unspecified));
+        assert!(matches!(recorder.open(2), Err(Refusal::NotAllowed)), "a camera that is off records nothing");
+        db.write(2, 400, &json!(0), &context).unwrap();
+        // An accessory the recorder does not know is not its to forbid.
+        assert_eq!(recorder.live_view_refusal(9), None);
+        assert!(recorder.snapshot_allowed(9, SnapshotReason::Periodic));
+
         // After a restart the same choices are shown again.
         let (db, ids) = build();
         let recorder = Recorder::new(&dir, Path::new("/nonexistent/ffmpeg"));
-        recorder.install(&db, 2, ids, "Cam", "cam1", Arc::new(Idle));
+        recorder.install(&db, 2, ids, "Cam", "cam1", Arc::new(Idle), &[400]);
+        assert_eq!(db.read(2, 400), Ok(json!(0)), "the streaming switch is remembered");
         assert_eq!(db.read(2, ids.active), Ok(json!(1)));
         assert_eq!(db.read(2, ids.audio), Ok(json!(1)));
         assert_eq!(db.read(2, ids.selected), Ok(selected_value(640, 480, 30, 800, 5)));
-        assert_eq!(db.read(2, ids.camera_on), Ok(json!(1)));
+        assert_eq!(db.read(2, ids.camera_on), Ok(json!(0)));
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(dir.join(STATE_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
     }

@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use harbormaster_hap::model::kind;
-use harbormaster_hap::{Accessory, Bridge, Characteristic, Database, Format, Info, SnapshotSource, Store};
+use harbormaster_hap::{
+    Accessory, Bridge, Characteristic, Database, Format, Info, SnapshotReason, SnapshotSource, Store,
+};
 use bytes::Bytes;
 use harbormaster_protect::{Client, FeedOptions, Fingerprint, Segment, Update};
 use tokio::sync::mpsc;
@@ -236,6 +238,7 @@ impl SnapshotSource for Live {
         aid: u64,
         width: u32,
         height: u32,
+        _reason: SnapshotReason,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
         Box::pin(async move {
             let (client, camera) = {
@@ -249,6 +252,30 @@ impl SnapshotSource for Live {
                     None
                 }
             }
+        })
+    }
+}
+
+/// Camera stills, withheld when HomeKit's switches for the camera say so.
+struct Snapshots {
+    live: Arc<Live>,
+    recorder: Option<Arc<Recorder>>,
+}
+
+impl SnapshotSource for Snapshots {
+    fn snapshot(
+        &self,
+        aid: u64,
+        width: u32,
+        height: u32,
+        reason: SnapshotReason,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
+        Box::pin(async move {
+            if self.recorder.as_ref().is_some_and(|r| !r.snapshot_allowed(aid, reason)) {
+                tracing::debug!("withholding a snapshot of accessory {aid}: switched off in HomeKit");
+                return None;
+            }
+            self.live.snapshot(aid, width, height, reason).await
         })
     }
 }
@@ -475,11 +502,15 @@ impl Devices {
             if let Some((live, ffmpeg)) = &self.video {
                 for ids in &handles.streams {
                     let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone() });
-                    video::install(db, aid, *ids, &def.name, source, ffmpeg);
+                    let gate = self.recorder.clone().map(|recorder| -> video::Gate {
+                        Arc::new(move || recorder.live_view_refusal(aid))
+                    });
+                    video::install(db, aid, *ids, &def.name, source, ffmpeg, gate);
                 }
                 if let (Some(ids), Some(recorder)) = (handles.recording, &self.recorder) {
                     let source = Arc::new(ProtectVideo { live: live.clone(), camera: def.id.clone() });
-                    recorder.install(db, aid, ids, &def.name, &def.id, source);
+                    let switches: Vec<u64> = handles.streams.iter().map(StreamIds::active).collect();
+                    recorder.install(db, aid, ids, &def.name, &def.id, source, &switches);
                 }
                 if def.kind == Kind::Camera {
                     live.inner.write().unwrap().cameras.insert(aid, def.id.clone());
@@ -669,7 +700,7 @@ impl ProtectBridge {
 
     /// Where the HomeKit server gets camera snapshots.
     pub fn snapshots(&self) -> Arc<dyn SnapshotSource> {
-        self.live.clone()
+        Arc::new(Snapshots { live: self.live.clone(), recorder: self.devices.recorder.clone() })
     }
 
     /// Stays connected to the console forever, reconnecting as needed.

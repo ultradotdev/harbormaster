@@ -51,6 +51,17 @@ pub struct Config {
     pub snapshots: Option<Arc<dyn SnapshotSource>>,
 }
 
+/// Why a controller wants a still image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotReason {
+    /// A routine refresh of the picture shown in the Home app.
+    Periodic,
+    /// Something happened, such as motion or a doorbell press.
+    Event,
+    /// The controller did not say.
+    Unspecified,
+}
+
 /// Supplies still images for camera accessories.
 pub trait SnapshotSource: Send + Sync {
     /// A JPEG of roughly the requested size for the accessory, or `None`
@@ -60,6 +71,7 @@ pub trait SnapshotSource: Send + Sync {
         aid: u64,
         width: u32,
         height: u32,
+        reason: SnapshotReason,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>;
 }
 
@@ -540,7 +552,12 @@ impl Connection {
         // A bridge with one camera may omit the accessory id.
         let aid = request["aid"].as_u64().unwrap_or(1);
         let Some(source) = &self.shared.snapshots else { return failed(status::NOT_FOUND) };
-        match source.snapshot(aid, width, height).await {
+        let reason = match request["reason"].as_u64() {
+            Some(0) => SnapshotReason::Periodic,
+            Some(1) => SnapshotReason::Event,
+            _ => SnapshotReason::Unspecified,
+        };
+        match source.snapshot(aid, width, height, reason).await {
             Some(jpeg) => response(200, "image/jpeg", &jpeg),
             None => failed(SERVICE_COMMUNICATION_FAILURE),
         }
