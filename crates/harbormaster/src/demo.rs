@@ -6,6 +6,7 @@
 //! Nothing here talks to a network or serves video. The accessories are
 //! built the way the Protect bridge builds them, at the same instance ids.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +21,9 @@ use serde_json::{json, Value};
 use crate::overrides::{self, Overrides};
 use crate::protect_bridge::{DeviceDef, Features, Kind};
 use crate::{recording, status, video};
+
+/// Put before every pretend device's HomeKit name unless the owner chooses otherwise.
+const PREFIX: &str = "HM ";
 
 /// What the dashboard shows as the console's address.
 pub const CONSOLE: &str = "demo console";
@@ -47,6 +51,7 @@ fn fake(kind: Kind, id: &str, name: &str, model: &str) -> Fake {
             firmware: "1.0.0".into(),
             features: Features::default(),
             video: None,
+            lens: 0,
         },
         doorbell: false,
         online: true,
@@ -154,6 +159,9 @@ pub struct Fleet {
     devices: Vec<(u64, Fake)>,
     db: Arc<Database>,
     choices: &'static Overrides,
+    /// The plain name and the HomeKit name of each device now published,
+    /// by device id.
+    published: BTreeMap<String, (String, String)>,
 }
 
 impl Fleet {
@@ -166,7 +174,9 @@ impl Fleet {
             devices.push((store.accessory_id(&overrides::key(&f.def))?, f));
         }
         let first_run = choices.list().is_empty();
-        let fleet = Self { devices, db: db.clone(), choices };
+        // The prefix a real site might use, to show how one looks.
+        choices.affix_from(PREFIX, "");
+        let mut fleet = Self { devices, db: db.clone(), choices, published: BTreeMap::new() };
         fleet.sync();
         if first_run {
             // Start with one device not shared, to show what that looks like.
@@ -179,23 +189,28 @@ impl Fleet {
 
     /// Makes the database match the owner's choices. Returns whether
     /// anything was added, removed or renamed.
-    fn sync(&self) -> bool {
+    fn sync(&mut self) -> bool {
         let wanted = self.choices.apply(self.devices.iter().map(|(_, f)| f.def.clone()).collect(), true);
+        let (prefix, suffix) = self.choices.affix();
         let mut changed = false;
         for (aid, f) in &self.devices {
-            let name = wanted.iter().find(|d| d.id == f.def.id).map(|d| d.name.as_str());
-            let published = iid(&self.db, *aid, kind::ACCESSORY_INFORMATION, kind::NAME)
-                .and_then(|iid| self.db.read(*aid, iid).ok())
-                .and_then(|v| v.as_str().map(str::to_owned));
-            match (name, published) {
-                (None, Some(old)) => {
+            let name = wanted.iter().find(|d| d.id == f.def.id).map(|d| d.name.clone());
+            // HomeKit gets the name with the prefix and suffix; the log and
+            // the dashboard use the plain one.
+            let shown = name.as_ref().map(|name| format!("{prefix}{name}{suffix}"));
+            let old = self.published.get(&f.def.id).cloned();
+            match (name, shown, old) {
+                (None, _, Some((old, _))) => {
                     self.db.remove(*aid);
                     status::global().device_removed(*aid);
+                    self.published.remove(&f.def.id);
                     tracing::info!("{old} is no longer shared with HomeKit");
                     changed = true;
                 }
-                (Some(name), old) if old.as_deref() != Some(name) => {
-                    self.db.replace(build(*aid, f, name));
+                (Some(name), Some(shown), old) if old.as_ref().map(|o| &o.1) != Some(&shown) => {
+                    let name = name.as_str();
+                    self.db.replace(build(*aid, f, &shown));
+                    self.published.insert(f.def.id.clone(), (name.to_owned(), shown.clone()));
                     let kind = match f.def.kind {
                         Kind::Camera => "camera",
                         Kind::Light => "light",
@@ -206,7 +221,7 @@ impl Fleet {
                         set(&self.db, *aid, CAMERA_RECORDING_MANAGEMENT, ACTIVE, json!(1));
                     }
                     if old.is_some() {
-                        tracing::info!("{name}: published under its new name");
+                        tracing::info!("{name}: HomeKit now knows it as {shown}");
                     }
                     changed = true;
                 }
@@ -219,13 +234,12 @@ impl Fleet {
     /// The name a device currently goes by, if it is shared.
     fn shared(&self, id: &str) -> Option<(u64, String)> {
         let (aid, _) = self.devices.iter().find(|(_, f)| f.def.id == id)?;
-        let name = iid(&self.db, *aid, kind::ACCESSORY_INFORMATION, kind::NAME)?;
-        Some((*aid, self.db.read(*aid, name).ok()?.as_str()?.to_owned()))
+        Some((*aid, self.published.get(id)?.0.clone()))
     }
 
     /// Acts out a household for ever: motion, a ring, someone watching, a
     /// recording, a light, and whatever the owner changes in the terminal.
-    pub async fn run(self, bridge: Arc<Bridge>) {
+    pub async fn run(mut self, bridge: Arc<Bridge>) {
         let board = status::global();
         let viewer: IpAddr = [10, 0, 0, 23].into();
         let (mut watching, mut recording) = (None, None);
@@ -234,7 +248,7 @@ impl Fleet {
             tokio::time::sleep(Duration::from_secs(1)).await;
             board.console_update();
             if overrides::take_changed() && self.sync() {
-                bridge.config_changed();
+                bridge.republish();
             }
             let step = second % 60;
             if let Some((aid, name)) = self.shared("door") {
