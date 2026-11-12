@@ -345,6 +345,8 @@ impl Stream {
 
         let stream = self.clone();
         let stderr = child.stderr.take();
+        let viewer = pending.request.controller_ip;
+        let began = std::time::Instant::now();
         tokio::spawn(async move {
             // Keep the reserved port for as long as the stream lives.
             let _socket = pending.socket;
@@ -371,20 +373,20 @@ impl Stream {
             }
             tokio::select! {
                 exit = child.wait() => match exit {
-                    Ok(code) if code.success() => tracing::info!("{}: stream ended", stream.name),
+                    Ok(code) if code.success() => tracing::info!("{}: stream to {viewer} ended", stream.name),
                     Ok(code) => tracing::warn!("{}: ffmpeg stopped unexpectedly ({code})", stream.name),
                     Err(e) => tracing::warn!("{}: lost track of ffmpeg: {e}", stream.name),
                 },
                 // Fires when the sender is dropped, however the stream was ended.
                 _ = &mut stopped => {
                     let _ = child.kill().await;
-                    tracing::info!("{}: stream stopped", stream.name);
                 }
             }
             // Whether video actually flowed, which the lines above cannot say.
             tracing::info!(
-                "{}: the camera supplied {} kB; ffmpeg sent {} frames, {} kB",
+                "{}: stream to {viewer} stopped after {:.0} s: the camera supplied {} kB; ffmpeg sent {} frames, {} kB",
                 stream.name,
+                began.elapsed().as_secs_f64(),
                 progress.received.load(Ordering::Relaxed) / 1000,
                 progress.frames.load(Ordering::Relaxed),
                 progress.sent.load(Ordering::Relaxed) / 1000

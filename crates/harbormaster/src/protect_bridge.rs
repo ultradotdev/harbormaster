@@ -519,7 +519,10 @@ impl Devices {
         }
         if let (true, Some(iid)) = (data[motion].is_boolean() || data["isSmartDetected"].is_boolean(), h.motion) {
             let detected = h.plain_motion.load(Ordering::Relaxed) || h.smart_motion.load(Ordering::Relaxed);
-            if db.set(h.aid, iid, json!(detected)) && live {
+            // The console repeats the current state in later updates; only
+            // a real change is an event.
+            let changed = db.read(h.aid, iid).ok() != Some(json!(detected));
+            if db.set(h.aid, iid, json!(detected)) && live && changed {
                 tracing::info!("{}: motion {}", h.name, if detected { "detected" } else { "ended" });
                 if let (true, Some(recorder)) = (detected, &self.recorder) {
                     recorder.event_started(h.aid);
