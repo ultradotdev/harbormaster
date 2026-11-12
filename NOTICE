@@ -1,0 +1,26 @@
+Harbormaster
+Copyright 2026 Ultra (https://ultra.dev)
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+Harbormaster's HomeKit and UniFi Protect code is written from scratch and
+contains no code from the projects below. Their authors worked out, in the
+open, how these protocols behave, and Harbormaster could not have been
+written without that work:
+
+  unifi-protect and homebridge-unifi-protect, by HJD
+  https://github.com/hjdhjd/unifi-protect
+  ISC license. The reference for UniFi Protect's private API: sign-in, the
+  realtime update stream, the native livestream and talkback.
+
+  HAP-NodeJS, by the Homebridge project and its contributors
+  https://github.com/homebridge/HAP-NodeJS
+  Apache License 2.0. The reference for the HomeKit Accessory Protocol:
+  pairing, camera streaming and HomeKit Secure Video.
+
+Harbormaster is not affiliated with or endorsed by Apple or Ubiquiti.
+HomeKit is a trademark of Apple Inc. UniFi and UniFi Protect are trademarks
+of Ubiquiti Inc.
+
+The released binary is built from the Rust crates listed in Cargo.lock,
+each under its own license.

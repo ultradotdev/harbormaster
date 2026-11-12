@@ -5,7 +5,7 @@ members = ["crates/hap", "crates/harbormaster", "crates/protect"]
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-license = "MIT"
+license = "Apache-2.0"
 
 # Big-number math for pairing is painfully slow unoptimized.
 [profile.dev.package."*"]

@@ -327,12 +327,15 @@ fn link_binary(program: &Path, link: &Path) -> bool {
     std::os::unix::fs::symlink(program, link).is_ok()
 }
 
-/// Whether a `harbormaster` is already on the command path somewhere
-/// other than `link`, as it is when a package manager installed it.
+/// Whether a `harbormaster` is already on the command path without the
+/// link, as it is when a package manager or the install script put it
+/// there. A link at `link` itself does not count: it may be a stale one.
 fn on_path_elsewhere(path: Option<&std::ffi::OsStr>, link: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let runnable = |candidate: &Path| {
-        candidate != link && std::fs::metadata(candidate).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        let is_link = std::fs::symlink_metadata(candidate).is_ok_and(|m| m.file_type().is_symlink());
+        !(candidate == link && is_link)
+            && std::fs::metadata(candidate).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     };
     path.is_some_and(|path| std::env::split_paths(path).any(|directory| runnable(&directory.join("harbormaster"))))
 }
