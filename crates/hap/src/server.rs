@@ -293,7 +293,9 @@ fn parse_request(buf: &mut Vec<u8>) -> Result<Option<Request>, ConnectionError> 
         .find(|h| h.name.eq_ignore_ascii_case("content-length"))
         .map(|h| std::str::from_utf8(h.value).ok().and_then(|v| v.trim().parse::<usize>().ok()))
         .unwrap_or(Some(0))
-        .filter(|n| header_len + n <= MAX_REQUEST)
+        // Checked, because the length is whatever the sender wrote: one near
+        // the top of the range would wrap around and pass as small.
+        .filter(|n| header_len.checked_add(*n).is_some_and(|total| total <= MAX_REQUEST))
         .ok_or(ConnectionError::BadRequest)?;
     if buf.len() < header_len + body_len {
         return Ok(None);
@@ -732,5 +734,16 @@ mod tests {
         assert!(parse_request(&mut big).is_err());
         let mut garbage = b"\x00\x01\x02 not http\r\n\r\n".to_vec();
         assert!(parse_request(&mut garbage).is_err());
+    }
+
+    /// Anyone on the network can send this before pairing. A length that
+    /// wraps around when the header's size is added must be refused like
+    /// any other oversized one, not slip past the limit.
+    #[test]
+    fn rejects_a_body_length_that_overflows() {
+        for length in [usize::MAX.to_string(), (usize::MAX - 10).to_string(), "99999999999999999999999".to_owned()] {
+            let mut request = format!("POST /pair-setup HTTP/1.1\r\nContent-Length: {length}\r\n\r\n").into_bytes();
+            assert!(parse_request(&mut request).is_err(), "length {length}");
+        }
     }
 }
