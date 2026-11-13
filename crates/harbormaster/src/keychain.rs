@@ -1,4 +1,7 @@
-//! Secrets are kept in the macOS Keychain, never in files Harbormaster owns.
+//! The macOS Keychain, where the Protect password is looked for and where
+//! setup can store it. Harbormaster never writes a password to a file. The
+//! optional `protect-password` file, for machines that must start with
+//! nobody there, is the owner's to create; see `secrets.rs`.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
