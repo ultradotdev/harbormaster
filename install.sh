@@ -10,6 +10,9 @@
 set -eu
 
 repo="ultradotdev/harbormaster"
+# The Apple developer team that signs every release. It is not a secret:
+# it is written inside each released program.
+team="WN53UUCY94"
 say() { printf '%s\n' "$*"; }
 fail() { say "install: $*" >&2; exit 1; }
 
@@ -45,8 +48,19 @@ got="$(shasum -a 256 "$work/$name" | cut -d ' ' -f 1)"
 [ "$wanted" = "$got" ] || fail "the download does not match its checksum; nothing was installed"
 
 unzip -q "$work/$name" -d "$work/out"
-# A signature from anyone but the publisher is not what was asked for.
-codesign --verify --strict "$work/out/harbormaster" || fail "the program's signature is not valid"
+program="$work/out/harbormaster"
+codesign --verify --strict "$program" || fail "the program's signature is not valid"
+# A valid signature only says the file is as its signer left it, and anyone
+# can sign. The checksum came from the same place as the download, so it
+# cannot vouch for the signer either. So ask for the publisher's own
+# signature: a Developer ID certificate that Apple issued to this team.
+publisher="anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$team\""
+codesign --verify --strict -R="$publisher" "$program" 2>/dev/null || fail "the program was not signed by Harbormaster's publisher; nothing was installed"
+# The same again from what the signature says of itself, in case the
+# rule above ever comes to mean something else.
+signature="$(codesign -dvv "$program" 2>&1)" || fail "the program's signature could not be read"
+printf '%s\n' "$signature" | grep -qx "TeamIdentifier=$team" || fail "the program was not signed by Harbormaster's publisher; nothing was installed"
+printf '%s\n' "$signature" | grep -q "^Authority=Developer ID Application: " || fail "the program was not signed with a Developer ID; nothing was installed"
 
 dir="/usr/local/bin"
 if ! { [ -d "$dir" ] && [ -w "$dir" ]; }; then
@@ -54,7 +68,7 @@ if ! { [ -d "$dir" ] && [ -w "$dir" ]; }; then
   mkdir -p "$dir"
 fi
 # Moved into place in one step, never written over a running program.
-cp "$work/out/harbormaster" "$dir/harbormaster.new"
+cp "$program" "$dir/harbormaster.new"
 mv -f "$dir/harbormaster.new" "$dir/harbormaster"
 
 say "Installed $dir/harbormaster ($("$dir/harbormaster" --version))."

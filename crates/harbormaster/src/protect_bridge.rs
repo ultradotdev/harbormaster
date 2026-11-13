@@ -1055,11 +1055,11 @@ fn load_cache(state_dir: &Path) -> Vec<DeviceDef> {
 
 fn save_cache(state_dir: &Path, defs: &[DeviceDef]) {
     let path = cache_path(state_dir);
-    let tmp = path.with_extension("tmp");
+    // Owner-only like every other file here: it names the devices and
+    // lists their hardware addresses.
     let result = serde_json::to_vec_pretty(defs)
         .map_err(std::io::Error::other)
-        .and_then(|json| std::fs::write(&tmp, json))
-        .and_then(|()| std::fs::rename(&tmp, &path));
+        .and_then(|json| crate::overrides::write_private(&path, &json));
     if let Err(e) = result {
         tracing::warn!("could not save {}: {e}", path.display());
     }
@@ -1452,6 +1452,21 @@ mod sharing_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_device_cache_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("hm-protect-{}-cache-mode", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // One left by a build that wrote it for anyone to read.
+        std::fs::write(cache_path(&dir), "[]").unwrap();
+        std::fs::set_permissions(cache_path(&dir), std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_cache(&dir, &[]);
+        assert_eq!(std::fs::metadata(cache_path(&dir)).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(load_cache(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     pub(super) fn bootstrap() -> Value {
         json!({

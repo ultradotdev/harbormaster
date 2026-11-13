@@ -121,8 +121,10 @@ pub fn show(state_dir: &Path, count: usize, follow: bool) -> Result<()> {
     let mut print = |text: &str| out.write_all(text.as_bytes()).and_then(|()| out.flush()).is_ok();
     // Where the file ends now, so that following starts after what is shown.
     let mut position = std::fs::metadata(&path).map_or(0, |m| m.len());
+    // Lines are written clean, but a file from an earlier build may hold
+    // control characters, so what is shown is cleaned again here.
     for line in tail(state_dir, count) {
-        if !print(&format!("{line}\n")) {
+        if !print(&format!("{}\n", crate::logbuf::printable(&line))) {
             return Ok(());
         }
     }
@@ -146,7 +148,15 @@ pub fn show(state_dir: &Path, count: usize, follow: bool) -> Result<()> {
         });
         if read.is_ok() {
             position += fresh.len() as u64;
-            if !print(&String::from_utf8_lossy(&fresh)) {
+            let fresh = String::from_utf8_lossy(&fresh);
+            let clean: String = fresh
+                .split_inclusive('\n')
+                .map(|line| match line.strip_suffix('\n') {
+                    Some(line) => crate::logbuf::printable(line) + "\n",
+                    None => crate::logbuf::printable(line),
+                })
+                .collect();
+            if !print(&clean) {
                 return Ok(());
             }
         }

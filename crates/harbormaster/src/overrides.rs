@@ -148,7 +148,7 @@ pub fn take_changed() -> bool {
 }
 
 /// Replaces a file in one step with one only its owner can read.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let temporary = path.with_extension("json.tmp");

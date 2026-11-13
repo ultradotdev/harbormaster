@@ -6,6 +6,12 @@
 /// exhaust the stack.
 const MAX_DEPTH: usize = 16;
 
+/// A tag may stand for a value seen earlier in the message, which is then
+/// copied. This caps how many bytes one message may have copied that way,
+/// so a short message cannot ask for a long value thousands of times over
+/// and exhaust memory. Real messages repeat short names.
+const MAX_REPEATED: usize = 1 << 20;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Null,
@@ -118,7 +124,7 @@ impl Value {
 
     /// Decodes one value that must fill `bytes` exactly.
     pub fn decode(bytes: &[u8]) -> Option<Value> {
-        let mut reader = Reader { rest: bytes, seen: Vec::new() };
+        let mut reader = Reader { rest: bytes, seen: Vec::new(), repeated: 0 };
         let value = reader.value(0)?;
         (reader.rest.is_empty() && value != Item::End).then_some(())?;
         match value {
@@ -155,6 +161,8 @@ struct Reader<'a> {
     rest: &'a [u8],
     /// Values a later tag may refer back to instead of repeating them.
     seen: Vec<Value>,
+    /// Bytes copied so far for tags that refer back to an earlier value.
+    repeated: usize,
 }
 
 impl Reader<'_> {
@@ -259,7 +267,16 @@ impl Reader<'_> {
                 let len = self.length(tag - 0x90)?;
                 self.data(len)
             }
-            0xA0..=0xCF => plain(self.seen.get((tag - 0xA0) as usize)?.clone()),
+            0xA0..=0xCF => {
+                let value = self.seen.get((tag - 0xA0) as usize)?;
+                let size = match value {
+                    Value::Str(text) => text.len(),
+                    Value::Data(data) => data.len(),
+                    _ => 8,
+                };
+                self.repeated = self.repeated.checked_add(size).filter(|total| *total <= MAX_REPEATED)?;
+                plain(value.clone())
+            }
             0xD0..=0xDE => {
                 let mut items = Vec::new();
                 for _ in 0..tag - 0xD0 {
@@ -366,6 +383,22 @@ mod tests {
         );
         // A reference to something not yet seen.
         assert_eq!(Value::decode(&[0xD1, 0xA0]), None);
+    }
+
+    #[test]
+    fn refuses_a_message_that_repeats_a_long_value_without_end() {
+        // One 60,000-byte value, then a list of references to it. Each
+        // reference costs the sender one byte and the reader 60,000.
+        let long = |references: usize| {
+            let mut bytes = vec![0xDF, 0x92, 0x60, 0xEA];
+            bytes.extend_from_slice(&[7u8; 60_000]);
+            bytes.extend(std::iter::repeat_n(0xA0, references));
+            bytes.push(0x03);
+            bytes
+        };
+        let Some(Value::Array(items)) = Value::decode(&long(3)) else { panic!("a few repeats are fine") };
+        assert_eq!(items.len(), 4);
+        assert_eq!(Value::decode(&long(5_000)), None);
     }
 
     #[test]

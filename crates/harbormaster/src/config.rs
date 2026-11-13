@@ -1,6 +1,7 @@
 //! The optional `config.toml` in the state directory.
 //!
-//! It never holds secrets: passwords live in the macOS Keychain.
+//! It never holds secrets. The password comes from the macOS Keychain, from
+//! `harbormaster unlock`, or from the optional `protect-password` file.
 
 use std::path::{Path, PathBuf};
 

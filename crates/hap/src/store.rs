@@ -88,6 +88,19 @@ fn setup_uri(setup_code: &str, setup_id: &str, category: u8) -> String {
     format!("X-HM://{}{setup_id}", base36(code | IP_ACCESSORY | (category as u64) << 31, 9))
 }
 
+/// Six pairs of hex digits with colons between, like a network address.
+fn is_device_id(text: &str) -> bool {
+    let pairs: Vec<&str> = text.split(':').collect();
+    pairs.len() == 6 && pairs.iter().all(|pair| pair.len() == 2 && pair.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Eight digits written as `123-45-678`.
+fn is_setup_code(text: &str) -> bool {
+    let groups: Vec<&str> = text.split('-').collect();
+    groups.len() == 3
+        && groups.iter().zip([3, 2, 3]).all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn new_setup_code() -> String {
     // Codes Apple rejects as too guessable.
     const BANNED: [&str; 12] = [
@@ -118,6 +131,15 @@ impl Store {
                     .map_err(|e| StoreError::Corrupt(path.clone(), e.to_string()))?;
                 if from_hex(&state.secret_key).map(|k| k.len()) != Some(32) {
                     return Err(StoreError::Corrupt(path, "bad secret key".into()));
+                }
+                // Code elsewhere takes these two apart on the strength of
+                // their shape, so a damaged file is refused here, with a
+                // reason, and not found out later by a crash.
+                if !is_device_id(&state.device_id) {
+                    return Err(StoreError::Corrupt(path, "bad device id".into()));
+                }
+                if !is_setup_code(&state.setup_code) {
+                    return Err(StoreError::Corrupt(path, "bad setup code".into()));
                 }
                 // State files written before setup ids existed.
                 if state.setup_id.is_empty() {
@@ -346,6 +368,33 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{not json").unwrap();
         assert!(matches!(Store::open(&path), Err(StoreError::Corrupt(..))));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_identity_is_an_error_not_a_crash() {
+        let path = temp_path("damaged");
+        drop(Store::open(&path).unwrap());
+        let good: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for (field, value, reason) in [
+            ("device_id", "AA:BB", "bad device id"),
+            ("device_id", "", "bad device id"),
+            ("device_id", "AA:BB:CC:DD:EE:\u{e9}", "bad device id"),
+            ("setup_code", "12345678", "bad setup code"),
+            ("setup_code", "abc-de-fgh", "bad setup code"),
+        ] {
+            let mut damaged = good.clone();
+            damaged[field] = value.into();
+            std::fs::write(&path, damaged.to_string()).unwrap();
+            match Store::open(&path) {
+                Err(StoreError::Corrupt(_, why)) => assert_eq!(why, reason),
+                _ => panic!("{field} = {value:?} was accepted"),
+            }
+        }
+        // What this build writes is what it accepts.
+        std::fs::write(&path, good.to_string()).unwrap();
+        let store = Store::open(&path).unwrap();
+        assert!(store.setup_uri(2).starts_with("X-HM://"));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

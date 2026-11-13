@@ -170,8 +170,15 @@ mod tests {
 
     #[test]
     fn fingerprint_parses_both_spellings_and_round_trips() {
-        let colon = "F3:AF:A4:9E:EC:4D:C5:E6:F0:6C:94:E6:FC:33:10:EF:DC:BF:59:3F:14:4F:D4:DF:C3:CB:85:FD:AD:D5:D1:39";
+        // Made here from a few bytes that are no certificate at all, so
+        // that no real console's fingerprint sits in the source.
+        let made_up = Fingerprint::of(b"not a real certificate");
+        let colon = made_up.to_string();
+        // Thirty-two pairs of capital hex digits with colons between.
+        assert_eq!(colon.len(), 95);
+        assert!(colon.split(':').all(|pair| pair.len() == 2 && pair.bytes().all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))));
         let parsed: Fingerprint = colon.parse().unwrap();
+        assert_eq!(parsed, made_up);
         assert_eq!(parsed.to_string(), colon);
         assert_eq!(colon.replace(':', "").to_lowercase().parse::<Fingerprint>().unwrap(), parsed);
         assert_eq!("F3:AF".parse::<Fingerprint>(), Err(BadFingerprint));
