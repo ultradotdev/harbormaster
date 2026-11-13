@@ -5,11 +5,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, watch, Semaphore};
+use tokio::sync::{broadcast, watch, Notify, Semaphore};
 
 use crate::mdns::Advertiser;
 use crate::model::{status, Change, Database, WriteContext};
@@ -22,6 +23,16 @@ const MAX_REQUEST: usize = 64 * 1024;
 /// Simultaneous controller connections. Each Apple device in the home holds
 /// one open, so this needs headroom well beyond the protocol minimum of 8.
 const MAX_CONNECTIONS: usize = 64;
+/// How long a connection that has not verified itself may stay silent, or
+/// leave an answer unread, before it is closed. Without this anyone on the
+/// network could open every slot, say nothing, and keep the home's own
+/// devices out. Pairing takes several requests seconds apart, so this is
+/// a limit on silence, not on the connection's age. Verified controllers
+/// are never timed out: they hold a connection open, idle, for hours.
+const UNVERIFIED_IDLE: Duration = Duration::from_secs(60);
+/// How long a new connection waits for a slot to be given up when all are
+/// taken.
+const EVICTION_WAIT: Duration = Duration::from_secs(1);
 
 /// HAP status: the accessory could not reach the device behind it.
 const SERVICE_COMMUNICATION_FAILURE: i32 = -70402;
@@ -84,9 +95,19 @@ pub struct ConnectionInfo {
     pub connected_at: std::time::SystemTime,
 }
 
+/// One open connection: what a status display may see of it, and the
+/// means to ask it to close.
+struct Slot {
+    info: ConnectionInfo,
+    give_up: Arc<Notify>,
+}
+
 struct Shared {
     snapshots: Option<Arc<dyn SnapshotSource>>,
-    connections: Mutex<BTreeMap<u64, ConnectionInfo>>,
+    /// Keyed by connection id, which rises with each connection, so the
+    /// first entry is the oldest.
+    connections: Mutex<BTreeMap<u64, Slot>>,
+    unverified_idle: Duration,
     store: Arc<Store>,
     db: Arc<Database>,
     failed_setup_attempts: AtomicU32,
@@ -155,10 +176,22 @@ impl Bridge {
 
     /// Currently open controller connections, oldest first.
     pub fn connections(&self) -> Vec<ConnectionInfo> {
-        self.shared.connections.lock().unwrap().values().cloned().collect()
+        self.shared.connections.lock().unwrap().values().map(|slot| slot.info.clone()).collect()
     }
 
     pub async fn start(config: Config, store: Arc<Store>, db: Arc<Database>) -> Result<Self, Error> {
+        Self::start_with(config, store, db, MAX_CONNECTIONS, UNVERIFIED_IDLE).await
+    }
+
+    /// `start`, with the limits on connections given, so tests can reach
+    /// them without sixty-four sockets and a minute's wait.
+    async fn start_with(
+        config: Config,
+        store: Arc<Store>,
+        db: Arc<Database>,
+        max_connections: usize,
+        unverified_idle: Duration,
+    ) -> Result<Self, Error> {
         // Accessories may have been added or removed since the last run.
         match store.sync_layout(&db.layout()) {
             Ok(true) => tracing::info!("accessory database differs from the last run (configuration {})", store.config_number()),
@@ -184,6 +217,7 @@ impl Bridge {
         let shared = Arc::new(Shared {
             snapshots: config.snapshots,
             connections: Mutex::new(BTreeMap::new()),
+            unverified_idle,
             store,
             db,
             failed_setup_attempts: AtomicU32::new(0),
@@ -194,7 +228,7 @@ impl Bridge {
         let accept_shared = shared.clone();
         let task = tokio::spawn(async move {
             let shared = accept_shared;
-            let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+            let limit = Arc::new(Semaphore::new(max_connections));
             let mut next_id = 0u64;
             loop {
                 let (stream, peer) = match listener.accept().await {
@@ -206,9 +240,33 @@ impl Bridge {
                         continue;
                     }
                 };
-                let Ok(permit) = limit.clone().try_acquire_owned() else {
-                    tracing::warn!("connection limit reached, refusing {peer}");
-                    continue;
+                let permit = match limit.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        // Every slot is taken. A newcomer may be one of the
+                        // home's own devices, so the connection that has
+                        // gone longest without verifying itself makes way.
+                        // Verified controllers are never asked to.
+                        let oldest_unverified = shared
+                            .connections
+                            .lock()
+                            .unwrap()
+                            .values()
+                            .find(|slot| slot.info.controller.is_none())
+                            .map(|slot| slot.give_up.clone());
+                        let freed = match oldest_unverified {
+                            Some(give_up) => {
+                                give_up.notify_one();
+                                tokio::time::timeout(EVICTION_WAIT, limit.clone().acquire_owned()).await.ok().and_then(Result::ok)
+                            }
+                            None => None,
+                        };
+                        let Some(permit) = freed else {
+                            tracing::warn!("connection limit reached, refusing {peer}");
+                            continue;
+                        };
+                        permit
+                    }
                 };
                 next_id += 1;
                 let (shared, id) = (shared.clone(), next_id);
@@ -221,8 +279,9 @@ impl Bridge {
                         controller: None,
                         connected_at: std::time::SystemTime::now(),
                     };
-                    shared.connections.lock().unwrap().insert(id, info);
-                    let result = Connection::new(shared.clone(), stream, id, peer).run().await;
+                    let give_up = Arc::new(Notify::new());
+                    shared.connections.lock().unwrap().insert(id, Slot { info, give_up: give_up.clone() });
+                    let result = Connection::new(shared.clone(), stream, id, peer).run(give_up).await;
                     shared.connections.lock().unwrap().remove(&id);
                     shared.db.connection_closed(id);
                     if let Err(e) = result {
@@ -276,6 +335,10 @@ enum ConnectionError {
     Unpaired,
     #[error("fell too far behind on events")]
     Lagged,
+    #[error("sent nothing for too long without verifying itself")]
+    Idle,
+    #[error("made way for a newer connection while unverified")]
+    MadeWay,
 }
 
 /// Takes one complete request off the front of `buf`, if there is one.
@@ -386,24 +449,42 @@ impl Connection {
     }
 
     async fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        match &mut self.session {
-            Some(session) => self.stream.write_all(&session.encrypt(bytes)).await,
-            None => self.stream.write_all(bytes).await,
+        // A stranger who will not read its answers is not waited on for
+        // longer than one who says nothing.
+        let patience = self.controller.is_none().then_some(self.shared.unverified_idle);
+        let write = async {
+            match &mut self.session {
+                Some(session) => self.stream.write_all(&session.encrypt(bytes)).await,
+                None => self.stream.write_all(bytes).await,
+            }
+        };
+        match patience {
+            Some(patience) => tokio::time::timeout(patience, write)
+                .await
+                .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into())),
+            None => write.await,
         }
     }
 
-    async fn run(mut self) -> Result<(), ConnectionError> {
+    async fn run(mut self, give_up: Arc<Notify>) -> Result<(), ConnectionError> {
         let mut changes = self.shared.db.subscribe_changes();
         let mut pairings = self.shared.pairings_changed.subscribe();
         let (mut raw, mut plain) = (Vec::new(), Vec::new());
         let mut chunk = [0u8; 4096];
+        let mut last_heard = tokio::time::Instant::now();
         loop {
             tokio::select! {
+                // Both of these are for strangers only; see `UNVERIFIED_IDLE`.
+                _ = tokio::time::sleep_until(last_heard + self.shared.unverified_idle), if self.controller.is_none() => {
+                    return Err(ConnectionError::Idle);
+                }
+                _ = give_up.notified(), if self.controller.is_none() => return Err(ConnectionError::MadeWay),
                 read = self.stream.read(&mut chunk) => {
                     let n = read?;
                     if n == 0 {
                         return Ok(());
                     }
+                    last_heard = tokio::time::Instant::now();
                     match &mut self.session {
                         Some(session) => {
                             raw.extend_from_slice(&chunk[..n]);
@@ -491,8 +572,8 @@ impl Connection {
                 tracing::debug!("connection {} pair-verify exchange", self.id);
                 let session = verified.map(|v| {
                     tracing::debug!("connection {} verified as {}", self.id, v.controller_id);
-                    if let Some(info) = self.shared.connections.lock().unwrap().get_mut(&self.id) {
-                        info.controller = Some(v.controller_id.clone());
+                    if let Some(slot) = self.shared.connections.lock().unwrap().get_mut(&self.id) {
+                        slot.info.controller = Some(v.controller_id.clone());
                     }
                     self.controller = Some(v.controller_id);
                     self.shared_secret = Some(v.shared_secret);
@@ -745,5 +826,127 @@ mod tests {
             let mut request = format!("POST /pair-setup HTTP/1.1\r\nContent-Length: {length}\r\n\r\n").into_bytes();
             assert!(parse_request(&mut request).is_err(), "length {length}");
         }
+    }
+
+    /// A bridge on a free local port with small limits, its state in a
+    /// directory of its own.
+    async fn bridge(name: &str, slots: usize, idle: Duration) -> (Bridge, Arc<Store>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hm-server-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(dir.join("state.json")).unwrap());
+        let config = Config {
+            name: "Test".into(),
+            model: "Test".into(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            advertise: false,
+            snapshots: None,
+        };
+        let bridge = Bridge::start_with(config, store.clone(), Database::new(), slots, idle).await.unwrap();
+        (bridge, store, dir)
+    }
+
+    /// Sends one request in the clear and returns the body of its answer.
+    async fn ask(stream: &mut TcpStream, path: &str, body: &[u8]) -> Vec<u8> {
+        let head = format!("POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len());
+        stream.write_all(&[head.as_bytes(), body].concat()).await.unwrap();
+        let mut answer = Vec::new();
+        loop {
+            if let Some(end) = answer.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&answer[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map_or(0, |n| n.trim().parse::<usize>().unwrap());
+                if answer.len() >= end + 4 + length {
+                    return answer[end + 4..end + 4 + length].to_vec();
+                }
+            }
+            let mut chunk = [0u8; 1024];
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "the bridge hung up in the middle of an answer");
+            answer.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// Whether the bridge closes the connection within `within`.
+    async fn closes(stream: &mut TcpStream, within: Duration) -> bool {
+        let mut chunk = [0u8; 64];
+        matches!(tokio::time::timeout(within, stream.read(&mut chunk)).await, Ok(Ok(0)) | Ok(Err(_)))
+    }
+
+    /// Verifies as a controller the store already knows, the way an Apple
+    /// device does at the start of every connection.
+    async fn verify(stream: &mut TcpStream, store: &Store) {
+        use crate::crypto::{hkdf, random, seal};
+        use crate::tlv::{self, Tlv};
+        use ed25519_dalek::Signer;
+        let identity = ed25519_dalek::SigningKey::from_bytes(&random::<32>());
+        store.add_pairing("controller", &identity.verifying_key().to_bytes(), true).unwrap();
+        let secret = x25519_dalek::StaticSecret::from(random::<32>());
+        let public = x25519_dalek::PublicKey::from(&secret).to_bytes();
+
+        let first = Tlv::new().with(tlv::STATE, &[1]).with(tlv::PUBLIC_KEY, &public).encode();
+        let answer = Tlv::decode(&ask(stream, "/pair-verify", &first).await).unwrap();
+        let theirs: [u8; 32] = answer.get(tlv::PUBLIC_KEY).unwrap().try_into().unwrap();
+        let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(theirs)).to_bytes();
+        let key = hkdf(b"Pair-Verify-Encrypt-Salt", b"Pair-Verify-Encrypt-Info", &shared);
+        let signed = [&public[..], b"controller", &theirs[..]].concat();
+        let inner = Tlv::new()
+            .with(tlv::IDENTIFIER, b"controller")
+            .with(tlv::SIGNATURE, &identity.sign(&signed).to_bytes())
+            .encode();
+        let third = Tlv::new().with(tlv::STATE, &[3]).with(tlv::ENCRYPTED_DATA, &seal(&key, b"PV-Msg03", &[], &inner)).encode();
+        let answer = Tlv::decode(&ask(stream, "/pair-verify", &third).await).unwrap();
+        assert_eq!((answer.get_u8(tlv::STATE), answer.get_u8(tlv::ERROR)), (Some(4), None));
+    }
+
+    #[tokio::test]
+    async fn a_silent_stranger_is_dropped_and_a_verified_controller_is_not() {
+        let idle = Duration::from_millis(800);
+        let (bridge, store, dir) = bridge("idle", 8, idle).await;
+        let mut silent = TcpStream::connect(bridge.local_addr).await.unwrap();
+        let mut pairing = TcpStream::connect(bridge.local_addr).await.unwrap();
+        let mut controller = TcpStream::connect(bridge.local_addr).await.unwrap();
+        verify(&mut controller, &store).await;
+
+        // Pairing takes several requests on a connection that has not
+        // verified itself. Each one within the limit keeps it open, well
+        // past the point where a silent one is gone.
+        for _ in 0..12 {
+            tokio::time::sleep(idle / 4).await;
+            let refused = ask(&mut pairing, "/pair-setup", &[]).await;
+            assert!(!refused.is_empty());
+        }
+        assert!(closes(&mut silent, Duration::from_millis(100)).await, "three limits have passed in silence");
+        assert!(!closes(&mut controller, idle * 3).await, "a verified controller may be idle for as long as it likes");
+        assert!(closes(&mut pairing, Duration::from_millis(100)).await, "and the stranger that stopped talking is gone too");
+        let left = bridge.connections();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].controller.as_deref(), Some("controller"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn when_full_the_oldest_stranger_makes_way_but_no_verified_controller_does() {
+        // The limit on silence is out of the way here.
+        let (bridge, store, dir) = bridge("slots", 2, Duration::from_secs(600)).await;
+        let mut controller = TcpStream::connect(bridge.local_addr).await.unwrap();
+        verify(&mut controller, &store).await;
+        let mut first = TcpStream::connect(bridge.local_addr).await.unwrap();
+        ask(&mut first, "/identify", &[]).await;
+
+        // Both slots are taken. A newcomer gets the stranger's.
+        let mut second = TcpStream::connect(bridge.local_addr).await.unwrap();
+        assert!(closes(&mut first, Duration::from_secs(5)).await, "the older stranger was not asked to go");
+        ask(&mut second, "/identify", &[]).await;
+        verify(&mut second, &store).await;
+
+        // Now both are verified, and nobody makes way for a third.
+        let mut third = TcpStream::connect(bridge.local_addr).await.unwrap();
+        assert!(closes(&mut third, Duration::from_secs(5)).await, "a third connection was let in");
+        assert!(!closes(&mut controller, Duration::from_millis(200)).await);
+        assert!(!closes(&mut second, Duration::from_millis(200)).await);
+        assert_eq!(bridge.connections().len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
