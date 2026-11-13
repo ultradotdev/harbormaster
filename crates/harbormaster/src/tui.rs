@@ -2,9 +2,9 @@
 //! daemon over the control socket and only displays what the daemon
 //! reports, so closing it never affects the bridge.
 //!
-//! The screen has a quick status box and the list of devices on the left,
-//! the selected item's details on the right, and the log underneath, which
-//! narrows itself to the selected device.
+//! The screen has a quick status box and the list of devices down the
+//! left, and on the right the selected item's details with the log under
+//! them, which narrows itself to the selected device.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
@@ -22,7 +22,7 @@ use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::clock;
@@ -43,6 +43,8 @@ const AFFIX: Style = Style::new().fg(Color::White).bg(Color::DarkGray);
 const GOOD: Style = Style::new().fg(Color::Green);
 const WARN: Style = Style::new().fg(Color::Yellow);
 const BAD: Style = Style::new().fg(Color::Red);
+/// Keys to press, and the focused pane.
+const KEY: Style = Style::new().fg(Color::Cyan);
 
 enum Incoming {
     Attached,
@@ -86,15 +88,34 @@ impl Target {
     }
 }
 
-/// Something a line of the device pane does when clicked.
+/// Something a line of the detail pane does when clicked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
+    /// Show the pairing code.
+    Pair,
+    /// Select this row of the device list.
+    Select(usize),
     ToggleShared,
     Rename,
     Prefix,
     Suffix,
     /// Switch a recognition sensor on or off for the selected device.
     Detect(Detection),
+}
+
+/// A clickable stretch of the detail pane: a line, or part of one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Hit {
+    line: usize,
+    /// Columns inside the pane's border; the whole line when `None`.
+    columns: Option<std::ops::Range<usize>>,
+    action: Action,
+}
+
+impl Hit {
+    fn line(line: usize, action: Action) -> Self {
+        Self { line, columns: None, action }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,19 +143,27 @@ struct App {
     modal: Modal,
     /// Requests waiting to be sent to the daemon.
     outbox: Vec<Command>,
-    /// Which lines of the device pane can be clicked, by line number.
-    actions: Vec<(usize, Action)>,
+    /// What can be clicked in the detail pane, by line number.
+    actions: Vec<Hit>,
     /// Where the confirmation's Yes was last drawn.
     yes_area: Rect,
+    /// Where the open box was last drawn.
+    modal_area: Rect,
+    /// The footer's key hints, by the columns each was drawn in.
+    hint_areas: Vec<(std::ops::Range<u16>, KeyCode)>,
     warnings_only: bool,
     /// Whether the log narrows to the selected device.
     device_log: bool,
     /// Seconds local time is ahead of UTC at a given moment.
     zone: fn(u64) -> i64,
     /// Where the panes were last drawn, for mouse hit testing.
+    status_area: Rect,
     list_area: Rect,
+    /// Screen line of the list's first row, under its header if one is drawn.
+    list_top: u16,
     detail_area: Rect,
     log_area: Rect,
+    footer_area: Rect,
     /// How far the detail pane could scroll when last drawn.
     detail_max: usize,
 }
@@ -155,12 +184,17 @@ impl App {
             outbox: Vec::new(),
             actions: Vec::new(),
             yes_area: Rect::default(),
+            modal_area: Rect::default(),
+            hint_areas: Vec::new(),
             warnings_only: false,
             device_log: true,
             zone: clock::local_offset,
+            status_area: Rect::default(),
             list_area: Rect::default(),
+            list_top: 0,
             detail_area: Rect::default(),
             log_area: Rect::default(),
+            footer_area: Rect::default(),
             detail_max: 0,
         }
     }
@@ -325,6 +359,14 @@ impl App {
         spans
     }
 
+    /// Shows the pairing code, which the daemon sends whether or not the
+    /// bridge is paired.
+    fn open_pairing(&mut self) {
+        if self.state.is_some() {
+            self.modal = Modal::Setup;
+        }
+    }
+
     /// Whether the daemon is waiting to be given the Protect password.
     fn waiting_for_password(&self) -> bool {
         self.attached && self.state.as_ref().is_some_and(|s| s.console.as_ref().is_some_and(|c| c.waiting_for_password))
@@ -358,6 +400,8 @@ impl App {
 
     fn run(&mut self, action: Action) {
         match action {
+            Action::Pair => self.open_pairing(),
+            Action::Select(row) => self.select(row),
             Action::Detect(detection) => self.toggle_detection(detection),
             Action::ToggleShared => self.toggle_shared(),
             Action::Rename => self.start_rename(),
@@ -436,7 +480,7 @@ impl App {
                         self.focus = Focus::Detail;
                     }
                     KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Devices,
-                    KeyCode::Char('p') => self.modal = Modal::Setup,
+                    KeyCode::Char('p') => self.open_pairing(),
                     KeyCode::Char('u') => self.start_unlock(),
                     KeyCode::Char('s') => self.toggle_shared(),
                     KeyCode::Char('r') => self.start_rename(),
@@ -460,52 +504,94 @@ impl App {
                     _ => {}
                 }
             }
-            Event::Mouse(mouse) => {
-                let at = Position::new(mouse.column, mouse.row);
-                let over = if self.list_area.contains(at) {
-                    Some(Focus::Devices)
-                } else if self.detail_area.contains(at) {
-                    Some(Focus::Detail)
-                } else if self.log_area.contains(at) {
-                    Some(Focus::Log)
-                } else {
-                    None
-                };
-                match (mouse.kind, over) {
-                    (MouseEventKind::Down(MouseButton::Left), _) if self.modal != Modal::None => {
-                        // Yes confirms; a click anywhere else backs out.
-                        let confirm = if self.yes_area.contains(at) { KeyCode::Enter } else { KeyCode::Esc };
-                        match self.modal {
-                            Modal::ConfirmUnshare { .. } => drop(self.modal_key(confirm)),
-                            _ => self.modal = Modal::None,
-                        }
+            Event::Mouse(mouse) => return self.mouse(mouse),
+            _ => {}
+        }
+        true
+    }
+}
+
+impl App {
+    /// The pane under a point on the screen.
+    fn pane_at(&self, at: Position) -> Option<Focus> {
+        [(self.list_area, Focus::Devices), (self.detail_area, Focus::Detail), (self.log_area, Focus::Log)]
+            .into_iter()
+            .find(|(area, _)| area.contains(at))
+            .map(|(_, pane)| pane)
+    }
+
+    /// A click or the wheel. Every click lands where a key would: it
+    /// focuses the pane it is in, and a row or setting does what its key does.
+    fn mouse(&mut self, mouse: event::MouseEvent) -> bool {
+        let at = Position::new(mouse.column, mouse.row);
+        let click = mouse.kind == MouseEventKind::Down(MouseButton::Left);
+        if self.modal != Modal::None {
+            if !click {
+                return true;
+            }
+            match self.modal {
+                // Yes confirms; a click anywhere else backs out.
+                Modal::ConfirmUnshare { .. } => {
+                    let confirm = if self.yes_area.contains(at) { KeyCode::Enter } else { KeyCode::Esc };
+                    self.modal_key(confirm);
+                }
+                // Clicking into the box being typed in keeps it open.
+                Modal::Edit { .. } if self.modal_area.contains(at) => {}
+                Modal::Edit { .. } => drop(self.modal_key(KeyCode::Esc)),
+                _ => self.modal = Modal::None,
+            }
+            return true;
+        }
+        if click && self.footer_area.contains(at) {
+            if let Some((_, code)) = self.hint_areas.iter().find(|(columns, _)| columns.contains(&mouse.column)).cloned() {
+                return self.handle(Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE)));
+            }
+            return true;
+        }
+        if click && self.status_area.contains(at) {
+            // The status lines are Bridge, then Console.
+            match mouse.row.saturating_sub(self.status_area.y) {
+                1 => self.open_pairing(),
+                2 => self.start_unlock(),
+                _ => {}
+            }
+            return true;
+        }
+        let Some(pane) = self.pane_at(at) else { return true };
+        let down = match mouse.kind {
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
+            _ if click => 0,
+            _ => return true,
+        };
+        if down != 0 {
+            // The wheel moves whatever is under the pointer, without taking focus.
+            match pane {
+                Focus::Devices => self.move_selection(down),
+                Focus::Detail => self.scroll_detail(down * 3),
+                Focus::Log => self.scroll_log(-down * 3),
+            }
+            return true;
+        }
+        self.focus = pane;
+        match pane {
+            Focus::Devices => {
+                let inside = mouse.row >= self.list_top && mouse.row + 1 < self.list_area.bottom();
+                if inside {
+                    let row = self.list_offset + (mouse.row - self.list_top) as usize;
+                    if row <= self.devices.len() {
+                        self.select(row);
                     }
-                    _ if self.modal != Modal::None => {}
-                    (MouseEventKind::Down(MouseButton::Left), Some(pane)) => {
-                        self.focus = pane;
-                        if pane == Focus::Detail && mouse.row > self.detail_area.y {
-                            let line = self.detail_scroll + (mouse.row - self.detail_area.y - 1) as usize;
-                            if let Some((_, action)) = self.actions.iter().find(|(at, _)| *at == line).copied() {
-                                self.run(action);
-                            }
-                        }
-                        // Rows start one line below the pane's top border.
-                        let inside = mouse.row > self.list_area.y && mouse.row + 1 < self.list_area.bottom();
-                        if pane == Focus::Devices && inside {
-                            let row = self.list_offset + (mouse.row - self.list_area.y - 1) as usize;
-                            if row <= self.devices.len() {
-                                self.select(row);
-                            }
-                        }
-                    }
-                    // The wheel moves whatever is under the pointer.
-                    (MouseEventKind::ScrollUp, Some(Focus::Devices)) => self.move_selection(-1),
-                    (MouseEventKind::ScrollDown, Some(Focus::Devices)) => self.move_selection(1),
-                    (MouseEventKind::ScrollUp, Some(Focus::Detail)) => self.scroll_detail(-3),
-                    (MouseEventKind::ScrollDown, Some(Focus::Detail)) => self.scroll_detail(3),
-                    (MouseEventKind::ScrollUp, Some(Focus::Log)) => self.scroll_log(3),
-                    (MouseEventKind::ScrollDown, Some(Focus::Log)) => self.scroll_log(-3),
-                    _ => {}
+                }
+            }
+            Focus::Detail if mouse.row > self.detail_area.y && mouse.column > self.detail_area.x => {
+                let line = self.detail_scroll + (mouse.row - self.detail_area.y - 1) as usize;
+                let column = (mouse.column - self.detail_area.x - 1) as usize;
+                let hit = self.actions.iter().find(|h| {
+                    h.line == line && h.columns.as_ref().is_none_or(|c| c.contains(&column))
+                });
+                if let Some(action) = hit.map(|h| h.action) {
+                    self.run(action);
                 }
             }
             _ => {}
@@ -548,9 +634,18 @@ fn fit(text: &str, width: usize) -> String {
     out
 }
 
+/// A bordered pane. The focused one has a heavier cyan border and a bold
+/// title, so it can be told apart at a glance.
 fn pane(title: &str, focused: bool) -> Block<'_> {
-    let style = if focused { Style::new().fg(Color::Cyan) } else { DIM };
-    Block::bordered().title(format!(" {title} ")).border_style(style)
+    let block = Block::bordered().title(format!(" {title} "));
+    if focused {
+        block
+            .border_type(BorderType::Thick)
+            .border_style(KEY)
+            .title_style(KEY.add_modifier(Modifier::BOLD))
+    } else {
+        block.border_style(DIM)
+    }
 }
 
 /// A filled dot for online, a hollow one for offline, a faint one when the
@@ -646,30 +741,32 @@ impl App {
     }
 }
 
+/// Inner lines the detail pane is given at most: enough for a camera with
+/// all its settings. The log has the rest of the column.
+const DETAIL_LINES: u16 = 20;
+/// Rows the log keeps, border included, however tall the detail could be.
+const LOG_ROWS: u16 = 7;
+
 fn draw(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
-    let log_height = (screen.height * 3 / 10).max(5);
-    let [top, log, footer] =
-        Layout::vertical([Constraint::Min(8), Constraint::Length(log_height), Constraint::Length(1)]).areas(screen);
-    let side_width = (screen.width * 3 / 10).clamp(32, 44);
-    let [side, detail] = Layout::horizontal([Constraint::Length(side_width), Constraint::Min(20)]).areas(top);
+    let [body, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(screen);
+    let side_width = (screen.width * 32 / 100).clamp(32, 60);
+    let [side, right] = Layout::horizontal([Constraint::Length(side_width), Constraint::Min(20)]).areas(body);
     let [status, list] = Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).areas(side);
+    // A fixed share, so the log does not jump as different devices are selected.
+    let detail_rows = body.height.saturating_sub(LOG_ROWS).min(DETAIL_LINES + 2);
+    let [detail, log] = Layout::vertical([Constraint::Length(detail_rows), Constraint::Min(0)]).areas(right);
+    app.status_area = status;
     app.list_area = list;
     app.detail_area = detail;
     app.log_area = log;
+    app.footer_area = footer;
 
     draw_status(frame, app, status);
     draw_devices(frame, app, list);
     draw_detail(frame, app, detail);
     draw_log(frame, app, log);
-    let hints = if app.waiting_for_password() {
-        " u unlock (type the Protect password)  ↑↓ select  Tab pane  w warnings  q quit"
-    } else if app.selected_device().is_some_and(|d| d.key.is_some()) {
-        " ↑↓ select  Tab pane  s share  r rename  w warnings  f device log  q quit"
-    } else {
-        " ↑↓ select  Tab pane  P prefix  S suffix  w warnings  f log  p pair  q quit"
-    };
-    frame.render_widget(Paragraph::new(hints).style(DIM), footer);
+    draw_footer(frame, app, footer);
     match &app.modal {
         Modal::None => {}
         Modal::Setup => draw_setup(frame, app),
@@ -684,6 +781,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 Line::from(vec![Span::raw(" "), Span::styled("[ y  Yes, stop sharing ]", BAD), Span::raw("   [ n  Keep ]")]),
             ];
             let area = draw_box(frame, "Stop sharing", lines);
+            app.modal_area = area;
             // The Yes button is the start of the last line.
             app.yes_area = Rect { x: area.x + 2, y: area.bottom().saturating_sub(2), width: 24.min(area.width), height: 1 };
         }
@@ -721,9 +819,63 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 Line::styled(hints[0], DIM),
                 Line::styled(hints[1], DIM),
             ];
-            draw_box(frame, title, lines);
+            app.modal_area = draw_box(frame, title, lines);
         }
     }
+}
+
+/// The keys that work right now, most useful first, each with the key a
+/// click on it presses.
+fn hints(app: &App) -> Vec<(&'static str, &'static str, Option<KeyCode>)> {
+    let mut hints = Vec::new();
+    if app.waiting_for_password() {
+        hints.push(("u", "unlock", Some(KeyCode::Char('u'))));
+    }
+    hints.push(("↑↓", "select", None));
+    hints.push(("Tab", "pane", Some(KeyCode::Tab)));
+    if app.selected_device().is_some_and(|d| d.key.is_some()) {
+        hints.push(("s", "share", Some(KeyCode::Char('s'))));
+        hints.push(("r", "rename", Some(KeyCode::Char('r'))));
+    } else if app.selected == 0 && app.state.is_some() {
+        hints.push(("P", "prefix", Some(KeyCode::Char('P'))));
+        hints.push(("S", "suffix", Some(KeyCode::Char('S'))));
+    }
+    if app.state.is_some() {
+        hints.push(("p", "pair", Some(KeyCode::Char('p'))));
+    }
+    if app.selected_device().is_some() {
+        // The log's title says which way these are switched.
+        hints.push(("f", "log", Some(KeyCode::Char('f'))));
+    }
+    hints.push(("w", "warnings", Some(KeyCode::Char('w'))));
+    hints
+}
+
+/// The key hints. Those that do not fit are left off the end, but quit
+/// always stays.
+fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
+    let width = area.width as usize;
+    let quit = ("q", "quit", Some(KeyCode::Char('q')));
+    let size = |(key, label, _): &(&str, &str, Option<KeyCode>)| 2 + key.chars().count() + 1 + label.chars().count();
+    let mut shown = hints(app);
+    while !shown.is_empty() && shown.iter().chain([&quit]).map(size).sum::<usize>() > width {
+        shown.pop();
+    }
+    shown.push(quit);
+    let mut spans = Vec::new();
+    app.hint_areas.clear();
+    let mut x = area.x;
+    for (key, label, code) in shown {
+        let start = x + 1;
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(key, KEY));
+        spans.push(Span::styled(format!(" {label} "), DIM));
+        x += size(&(key, label, code)) as u16;
+        if let Some(code) = code {
+            app.hint_areas.push((start..x, code));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// The quick view: is the bridge healthy, and what is it doing.
@@ -785,9 +937,125 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(vec![bridge, console, devices, activity]).block(pane(&s.name, false)), area);
 }
 
-/// The sidebar: the overview, then every device with its state at a glance.
+/// How wide each column of the device list is; zero for a column left out
+/// for want of room.
+#[derive(Debug, PartialEq, Eq)]
+struct Columns {
+    name: usize,
+    kind: usize,
+    state: usize,
+    motion: usize,
+}
+
+/// Widest the state column grows.
+const STATE_WIDTH: usize = 8;
+/// Fewest letters of a name before columns are given up for it.
+const NAME_WIDTH: usize = 16;
+
+impl App {
+    /// The one fact that best says how a device is, for the list: trouble
+    /// first, then what it is doing, then how it is set.
+    fn state_cell(&self, d: &Device) -> Span<'static> {
+        let recording = d.recording.as_ref();
+        let span = if d.hidden {
+            Span::styled("unshared", DIM)
+        } else if d.online == Some(false) {
+            Span::styled("offline", BAD)
+        } else if d.tampered == Some(true) {
+            Span::styled("tampered", BAD)
+        } else if recording.is_some_and(|r| r.active_secs.is_some()) {
+            Span::styled("rec now", BAD)
+        } else if d.low_battery == Some(true) {
+            Span::styled(format!("batt {}%", d.battery.unwrap_or(0)), WARN)
+        } else if !d.viewers.is_empty() {
+            Span::styled("watching", KEY)
+        } else if let Some(on) = d.light_on {
+            match (on, d.brightness) {
+                (true, Some(percent)) => Span::styled(format!("on {percent}%"), WARN),
+                (true, None) => Span::styled("on", WARN),
+                (false, _) => Span::styled("off", DIM),
+            }
+        } else if let Some(r) = recording {
+            if r.enabled { Span::raw("rec on") } else { Span::styled("rec off", DIM) }
+        } else if let Some(reading) = d.readings.first() {
+            Span::raw(reading.value.clone())
+        } else if let Some(percent) = d.battery {
+            Span::raw(format!("batt {percent}%"))
+        } else {
+            Span::raw("")
+        };
+        Span::styled(fit(&span.content, STATE_WIDTH), span.style)
+    }
+
+    /// When the device last saw motion: `now`, a time today, or a date.
+    fn motion_cell(&self, d: &Device) -> Span<'static> {
+        if d.hidden || d.online == Some(false) {
+            return Span::raw("");
+        }
+        match (d.motion, d.last_motion) {
+            (Some(true), _) => Span::styled("now", WARN),
+            // `14:03`, or `Nov 10` for another day.
+            (_, Some(at)) => {
+                let time = self.short_time(at);
+                Span::raw(time.rsplit_once(' ').map_or(time.clone(), |(date, _)| date.to_owned()))
+            }
+            _ => Span::raw(""),
+        }
+    }
+
+    /// Fits the columns to `width`: the name gets what is left, and the
+    /// kind, then motion, then state are given up so it keeps a readable
+    /// length.
+    fn columns(&self, width: usize) -> Columns {
+        let widest = |cell: &dyn Fn(&Device) -> usize, header: usize| {
+            let most = self.devices.iter().map(cell).max().unwrap_or(0);
+            if most == 0 { 0 } else { most.max(header) }
+        };
+        let mut columns = Columns {
+            name: 0,
+            kind: widest(&|d| d.kind.chars().count(), 4),
+            state: widest(&|d| self.state_cell(d).content.chars().count(), 5),
+            motion: widest(&|d| self.motion_cell(d).content.chars().count(), 6),
+        };
+        // The dot and its spaces, and a gap before each column shown.
+        let rest = |c: &Columns| 3 + [c.kind, c.state, c.motion].iter().map(|w| if *w > 0 { w + 1 } else { 0 }).sum::<usize>();
+        let longest = self.devices.iter().map(|d| self.homekit_name(d, usize::MAX).iter().map(|s| s.content.chars().count()).sum::<usize>());
+        let longest = longest.max().unwrap_or(0).max(4);
+        let wanted = longest.min(NAME_WIDTH);
+        // The kind only goes in when names have room to spare.
+        if width.saturating_sub(rest(&columns)) < longest.max(NAME_WIDTH + 8) {
+            columns.kind = 0;
+        }
+        if width.saturating_sub(rest(&columns)) < wanted {
+            columns.motion = 0;
+        }
+        if width.saturating_sub(rest(&columns)) < wanted {
+            columns.state = 0;
+        }
+        // No wider than the longest name, so the columns sit beside the names.
+        columns.name = width.saturating_sub(rest(&columns)).min(longest);
+        columns
+    }
+}
+
+/// Pads a cell to `width`, or leaves it out when the column is.
+fn cell(spans: &mut Vec<Span<'static>>, content: Span<'static>, width: usize) {
+    if width > 0 {
+        let used = content.content.chars().count();
+        spans.push(Span::raw(" "));
+        spans.push(content);
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    }
+}
+
+/// The sidebar: the overview, then every device with its state at a glance,
+/// in columns under a faint header when there is room for one.
 fn draw_devices(frame: &mut Frame, app: &mut App, area: Rect) {
-    let (width, height) = (area.width.saturating_sub(2) as usize, area.height.saturating_sub(2) as usize);
+    let (width, inner) = (area.width.saturating_sub(2) as usize, area.height.saturating_sub(2) as usize);
+    let columns = app.columns(width);
+    let header = inner >= 10 && columns.state + columns.motion > 0;
+    let height = inner - usize::from(header);
+    app.list_top = area.y + 1 + u16::from(header);
     // Keep the selected row on screen.
     if app.selected < app.list_offset {
         app.list_offset = app.selected;
@@ -798,19 +1066,25 @@ fn draw_devices(frame: &mut Frame, app: &mut App, area: Rect) {
     app.list_offset = app.list_offset.min(rows.saturating_sub(height));
 
     let mut lines = Vec::new();
+    if header {
+        let mut spans = vec![Span::raw(format!("   {:<1$}", "Name", columns.name))];
+        cell(&mut spans, Span::raw("Kind"), columns.kind);
+        cell(&mut spans, Span::raw("State"), columns.state);
+        cell(&mut spans, Span::raw("Motion"), columns.motion);
+        lines.push(Line::from(spans).style(DIM));
+    }
     for row in app.list_offset..rows.min(app.list_offset + height) {
         let mut spans = match row.checked_sub(1).and_then(|i| app.devices.get(i)) {
-            None => vec![Span::raw("  Overview")],
+            None => vec![Span::raw("   Overview")],
             Some(d) => {
-                // The name comes first; whatever room is left shows state.
-                let name = app.homekit_name(d, width.saturating_sub(3));
-                let room = width.saturating_sub(4 + name.iter().map(|s| s.content.chars().count()).sum::<usize>());
                 let mut spans = vec![Span::raw(" "), dot(d.online), Span::raw(" ")];
+                let name = app.homekit_name(d, columns.name);
+                let used: usize = name.iter().map(|s| s.content.chars().count()).sum();
                 spans.extend(name);
-                let state = app.summary_line(d, room);
-                let used: usize = state.iter().map(|s| s.content.chars().count()).sum();
-                spans.push(Span::raw(" ".repeat(room.saturating_sub(used) + 1)));
-                spans.extend(state);
+                spans.push(Span::raw(" ".repeat(columns.name.saturating_sub(used))));
+                cell(&mut spans, Span::styled(d.kind.clone(), DIM), columns.kind);
+                cell(&mut spans, app.state_cell(d), columns.state);
+                cell(&mut spans, app.motion_cell(d), columns.motion);
                 spans
             }
         };
@@ -840,16 +1114,16 @@ fn affix_setting(label: &str, key: &str, text: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{label:<12} "), DIM),
         value,
-        Span::styled(format!("  {key}"), Style::new().fg(Color::Cyan)),
+        Span::styled(format!("  {key}"), KEY),
         Span::styled(" to change", DIM),
     ])
 }
 
-/// The lines of the overview, and which of them can be clicked.
 /// What an unpaired bridge shows first: the code to scan or type in the
 /// Home app. The picture is left out where the pane is too narrow for it.
+/// Once paired the code is still sent, but only `p` shows it.
 fn pairing_lines(s: &State, width: usize) -> Vec<Line<'static>> {
-    let Some(code) = &s.setup_code else { return Vec::new() };
+    let Some(code) = s.setup_code.as_ref().filter(|_| !s.paired) else { return Vec::new() };
     // The digits come first: on a short terminal the picture scrolls away.
     let mut lines = vec![
         heading("Pair with the Home app"),
@@ -866,8 +1140,10 @@ fn pairing_lines(s: &State, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Vec<(usize, Action)>) {
+/// The lines of the overview, and what can be clicked in them.
+fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Vec<Hit>) {
     let mut lines = pairing_lines(s, width);
+    let pairing = lines.len() + 3;
     lines.extend([
         field("Bridge", format!("{}  v{}", s.name, s.version)),
         field("Listening", format!("{}  configuration {}", s.listen, s.config_number)),
@@ -877,7 +1153,7 @@ fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Ve
             if s.paired {
                 Span::raw(format!("paired with {} controller(s)", s.controllers.len()))
             } else {
-                Span::styled("not paired (press p to pair)", WARN)
+                Span::styled("not paired (p shows the code)", WARN)
             },
         ),
         field(
@@ -908,8 +1184,13 @@ fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Ve
     if let Some(problem) = s.console.as_ref().and_then(|c| c.problem.clone()) {
         lines.push(field("", Span::styled(problem, DIM)));
     }
-    // The next two lines are the name settings.
-    let actions = vec![(lines.len(), Action::Prefix), (lines.len() + 1, Action::Suffix)];
+    // The pairing line shows the code; the next two lines are the name settings.
+    let mut actions = vec![Hit::line(pairing, Action::Pair), Hit::line(lines.len(), Action::Prefix), Hit::line(lines.len() + 1, Action::Suffix)];
+    // Each sensor switch on the two lines after them, by where it is drawn.
+    for (number, detection) in Detection::ALL.into_iter().enumerate() {
+        let start = 13 + 13 * (number % 2);
+        actions.push(Hit { line: lines.len() + 2 + number / 2, columns: Some(start..start + 13), action: Action::Detect(detection) });
+    }
     // Which recognition sensors every camera gets, switched by number.
     // Two short lines, since the pane is narrow on a small terminal.
     let sensors = |label: &str, shown: std::ops::Range<usize>| {
@@ -917,7 +1198,7 @@ fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Ve
         for number in shown {
             let detection = Detection::ALL[number];
             let on = s.detect_everywhere.iter().any(|w| w == detection.word());
-            line.push(Span::styled(format!("{}", number + 1), Style::new().fg(Color::Cyan)));
+            line.push(Span::styled(format!("{}", number + 1), KEY));
             line.push(Span::raw(format!("{}{:<9}", if on { "[x]" } else { "[ ]" }, detection.label())));
         }
         Line::from(line)
@@ -952,7 +1233,9 @@ fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Ve
     lines.push(heading("Devices"));
     let affix = s.name_prefix.chars().count() + s.name_suffix.chars().count();
     let name_width = app.devices.iter().map(|d| d.name.chars().count()).max().unwrap_or(0).clamp(4, 22) + affix;
-    for d in &app.devices {
+    for (row, d) in app.devices.iter().enumerate() {
+        // Clicking a device here selects it, as in the list.
+        actions.push(Hit::line(lines.len(), Action::Select(row + 1)));
         let name = app.homekit_name(d, name_width);
         let used: usize = name.iter().map(|s| s.content.chars().count()).sum();
         let mut spans = vec![Span::raw("  "), dot(d.online), Span::raw(" ")];
@@ -969,7 +1252,7 @@ fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Ve
 }
 
 /// The lines of a device's pane, and which of them can be clicked.
-fn device_lines(app: &App, d: &Device) -> (Vec<Line<'static>>, Vec<(usize, Action)>) {
+fn device_lines(app: &App, d: &Device) -> (Vec<Line<'static>>, Vec<Hit>) {
     let mut lines = device_facts(app, d);
     let mut actions = Vec::new();
     if d.key.is_some() {
@@ -977,13 +1260,13 @@ fn device_lines(app: &App, d: &Device) -> (Vec<Line<'static>>, Vec<(usize, Actio
             lines.push(Line::raw(""));
         }
         lines.push(heading("Settings"));
-        let key = |k: &str| Span::styled(format!("  {k}  "), Style::new().fg(Color::Cyan));
-        actions.push((lines.len(), Action::ToggleShared));
+        let key = |k: &str| Span::styled(format!("  {k}  "), KEY);
+        actions.push(Hit::line(lines.len(), Action::ToggleShared));
         lines.push(Line::from(vec![
             key("s"),
             Span::raw(if d.hidden { "[ ] Share with HomeKit" } else { "[x] Share with HomeKit" }),
         ]));
-        actions.push((lines.len(), Action::Rename));
+        actions.push(Hit::line(lines.len(), Action::Rename));
         let mut name = vec![key("r"), Span::raw(format!("Name: {}", d.name))];
         if let Some(own) = &d.protect_name {
             name.push(Span::styled(format!("  (Protect: {own})"), DIM));
@@ -996,7 +1279,7 @@ fn device_lines(app: &App, d: &Device) -> (Vec<Line<'static>>, Vec<(usize, Actio
             if !listed(&d.detects) {
                 continue;
             }
-            actions.push((lines.len(), Action::Detect(detection)));
+            actions.push(Hit::line(lines.len(), Action::Detect(detection)));
             let (here, all) = (listed(&d.detect_here), listed(everywhere));
             let mut line = vec![
                 key(&format!("{}", number + 1)),
@@ -1139,26 +1422,36 @@ fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(pane(&title, app.focus == Focus::Log)), area);
 }
 
-fn draw_setup(frame: &mut Frame, app: &App) {
+/// The pairing code, paired or not. HomeKit takes it only while the bridge
+/// is unpaired, so once paired it says so rather than leave it to be tried.
+fn draw_setup(frame: &mut Frame, app: &mut App) {
     let Some(state) = &app.state else { return };
+    let mut notes = Vec::new();
+    if state.paired && state.setup_code.is_some() {
+        notes.push(Line::styled("Already paired. HomeKit accepts a setup code", DIM).centered());
+        notes.push(Line::styled("only while unpaired, so this one works again", DIM).centered());
+        notes.push(Line::styled("only after the bridge is removed from Home.", DIM).centered());
+        notes.push(Line::raw(""));
+    }
+    notes.push(Line::styled("press any key to close", DIM).centered());
     let mut lines: Vec<Line> = Vec::new();
     match (&state.setup_code, &state.setup_uri) {
         (Some(code), uri) => {
             if let Some(qr) = uri.as_deref().and_then(crate::qr::render) {
-                // Leave room for the border, the code line and the hint.
-                if qr.lines().count() as u16 + 6 <= frame.area().height {
-                    lines.extend(qr.lines().map(|l| Line::raw(l.to_owned())));
+                // Leave room for the border, the code line and the notes.
+                if (qr.lines().count() + notes.len() + 4) as u16 <= frame.area().height {
+                    lines.extend(qr.lines().map(|l| Line::raw(l.to_owned()).centered()));
                     lines.push(Line::raw(""));
                 }
             }
-            lines.push(Line::raw(format!("Setup code: {code}")).centered());
+            lines.push(Line::from(vec![Span::raw("Setup code  "), Span::styled(code.clone(), WARN)]).centered());
+            lines.push(Line::raw(""));
         }
-        _ => lines.push(Line::raw("Already paired. Remove the bridge in the Home app to pair again.")),
+        // A daemon from before the code was always sent.
+        _ => notes.insert(0, Line::raw("Already paired. Remove the bridge in the Home app to pair again.")),
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled("press any key to close", DIM).centered());
-
-    draw_box(frame, "Pair with the Home app", lines);
+    lines.extend(notes);
+    app.modal_area = draw_box(frame, "Pair with the Home app", lines);
 }
 
 /// Draws a titled box in the middle of the screen, sized to its lines, and
@@ -1175,7 +1468,8 @@ fn draw_box(frame: &mut Frame, title: &str, lines: Vec<Line>) -> Rect {
         height: height.min(screen.height),
     };
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(Block::bordered().title(format!(" {title} "))), area);
+    let block = Block::bordered().border_type(BorderType::Rounded).border_style(KEY).title(format!(" {title} "));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
     area
 }
 
@@ -1285,8 +1579,9 @@ mod tests {
             listen: "[::]:51826".into(),
             uptime_secs: 3725,
             paired,
-            setup_code: (!paired).then(|| "420-21-195".into()),
-            setup_uri: (!paired).then(|| "X-HM://0081YCYEP7OSX".into()),
+            // The daemon sends the code whether or not it is paired.
+            setup_code: Some("420-21-195".into()),
+            setup_uri: Some("X-HM://0081YCYEP7OSX".into()),
             controllers: vec![Controller { id: "AAAA1111-2222".into(), admin: true }],
             connections: vec![Connection {
                 peer: "192.0.2.236".into(),
@@ -1546,14 +1841,16 @@ mod tests {
     fn mouse_selects_focuses_and_scrolls() {
         let mut app = app_with(sample_state(true));
         render(&mut app);
-        // The third row of the list is the second device.
-        let (x, y) = (app.list_area.x + 3, app.list_area.y + 3);
+        // Under the header, the third row of the list is the second device.
+        assert_eq!(app.list_top, app.list_area.y + 2);
+        let (x, y) = (app.list_area.x + 3, app.list_top + 2);
         app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
         assert_eq!((app.selected, app.focus), (2, Focus::Devices));
         assert!(render(&mut app).contains("Garage · camera"));
-        // Clicking the border or below the last device changes nothing.
-        app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, app.list_area.y));
-        app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, app.list_area.y + 7));
+        // Clicking the border, the header or below the last device changes nothing.
+        for row in [app.list_area.y, app.list_area.y + 1, app.list_top + 6] {
+            app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, row));
+        }
         assert_eq!(app.selected, 2);
 
         app.handle(mouse(MouseEventKind::ScrollUp, x, y));
@@ -1666,7 +1963,7 @@ mod tests {
     }
 
     #[test]
-    fn pairing_popup_shows_code_only_while_unpaired() {
+    fn pairing_code_is_always_at_hand() {
         let mut app = app_with(sample_state(false));
         assert!(render(&mut app).contains("not paired (press p)"));
         // The overview leads with the code, and draws it where there is room.
@@ -1676,17 +1973,177 @@ mod tests {
         assert!(render(&mut app).contains("Setup code  420-21-195"));
         app.handle(key(KeyCode::Char('p')));
         let screen = render_at(&mut app, 110, 34);
-        assert!(screen.contains("Setup code: 420-21-195"), "{screen}");
+        assert!(screen.contains("Setup code  420-21-195"), "{screen}");
         assert!(screen.contains('█'), "QR code should be drawn");
+        assert!(!screen.contains("Already paired"), "{screen}");
         // Too short for the code's picture: the digits alone still fit.
-        assert!(render(&mut app).contains("Setup code: 420-21-195"));
+        assert!(render_at(&mut app, 80, 16).contains("Setup code  420-21-195"));
         app.handle(key(KeyCode::Char('x')));
         assert_eq!(app.modal, Modal::None);
 
+        // Once paired the overview no longer leads with it, though the
+        // daemon still sends it, and p still shows it with the plain truth.
         let mut app = app_with(sample_state(true));
-        assert!(!render_at(&mut app, 110, 40).contains("Setup code"));
+        let overview = render_at(&mut app, 110, 40);
+        assert!(!overview.contains("Setup code") && !overview.contains('█'), "{overview}");
+        assert!(overview.contains(" p pair "), "{overview}");
         app.handle(key(KeyCode::Char('p')));
-        assert!(render(&mut app).contains("Already paired"));
+        let screen = render(&mut app);
+        assert_shows(&screen, &["Setup code  420-21-195", "Already paired", "only after the bridge is removed from Home."]);
+        // 24 lines is room enough for the picture too.
+        assert!(screen.contains('█'), "{screen}");
+
+        // A daemon from before the code was always sent says nothing of a code.
+        let mut state = sample_state(true);
+        (state.setup_code, state.setup_uri) = (None, None);
+        let mut app = app_with(state);
+        app.handle(key(KeyCode::Char('p')));
+        let screen = render(&mut app);
+        assert!(screen.contains("Remove the bridge in the Home app to pair again") && !screen.contains("Setup code"), "{screen}");
+    }
+
+    #[test]
+    fn the_left_column_runs_the_full_height_and_the_log_sits_under_the_detail() {
+        for (width, height) in [(80, 24), (190, 55)] {
+            let mut app = app_with(sample_state(true));
+            render_at(&mut app, width, height);
+            // Status box, then the list down to the footer.
+            assert_eq!(app.list_area.bottom(), height - 1);
+            assert_eq!((app.log_area.x, app.log_area.width), (app.detail_area.x, app.detail_area.width));
+            assert_eq!((app.detail_area.y, app.log_area.y), (0, app.detail_area.bottom()));
+            assert_eq!(app.log_area.bottom(), height - 1);
+        }
+        // On a tall screen the detail stops at what a camera needs, and the
+        // log gets the rest: far more than the old 30%.
+        let mut app = app_with(sample_state(true));
+        render_at(&mut app, 190, 55);
+        assert_eq!(app.detail_area.height, DETAIL_LINES + 2);
+        assert!(app.log_area.height >= 30, "{:?}", app.log_area);
+        // The log keeps its rows on a small one.
+        render(&mut app);
+        assert_eq!(app.log_area.height, LOG_ROWS);
+    }
+
+    #[test]
+    fn device_list_is_a_table_that_gives_way_on_narrow_terminals() {
+        let mut app = app_with(with_affix(editable(sample_state(true))));
+        let wide = render_at(&mut app, 190, 55);
+        // A faint header, then one aligned row per device, the HomeKit name first.
+        assert_shows(
+            &wide,
+            &[
+                "   Name               Kind     State    Motion",
+                " ● HM Front Door (UP) doorbell rec now  now",
+                " ● HM Garage (UP)     camera   rec off  Nov 13",
+                " ● HM Floodlight (UP) light    on 83%",
+                " ○ HM Yard (UP)       sensor   offline",
+                " ● HM Porch (UP)      sensor   closed",
+                " · Side Gate          camera   unshared",
+            ],
+        );
+        // Every state starts in the same column.
+        let state_column = |screen: &str, name: &str| {
+            let line = screen.lines().find(|l| l.contains(name)).unwrap();
+            let state = ["rec ", "on 83%", "offline", "closed", "unshared"].iter().find_map(|s| line.find(s)).unwrap();
+            line[..state].chars().count()
+        };
+        let column = state_column(&wide, "Front Door (UP)");
+        for name in ["Garage (UP)", "Floodlight (UP)", "Yard (UP)", "Porch (UP)", "Side Gate"] {
+            assert_eq!(state_column(&wide, name), column, "{name}:\n{wide}");
+        }
+
+        // At 80 columns the kind and motion give way so names keep their length.
+        let narrow = render(&mut app);
+        assert_shows(&narrow, &["   Name               State", " ● HM Front Door (UP) rec now", " · Side Gate          unshared"]);
+        assert!(!narrow.contains("Motion") && !narrow.contains("doorbell rec"), "{narrow}");
+        for name in ["HM Garage (UP)", "HM Floodlight (UP)", "Side Gate"] {
+            assert_eq!(state_column(&narrow, name), state_column(&narrow, "Front Door (UP)"), "{name}:\n{narrow}");
+        }
+
+        // A long name is cut with a mark, not left to push the state out.
+        let mut state = sample_state(true);
+        state.devices[2].name = "Garage Exterior Turret Northwest Corner".into();
+        let screen = render(&mut app_with(state));
+        assert!(screen.contains("● Garage Exterior Tu… on 83%"), "{screen}");
+        assert!(screen.lines().all(|l| l.chars().count() == 80));
+    }
+
+    #[test]
+    fn footer_offers_pairing_and_fits_80_columns_in_every_state() {
+        let footer = |app: &mut App| render(app).lines().last().unwrap().to_owned();
+        let mut waiting = sample_state(true);
+        waiting.console.as_mut().unwrap().waiting_for_password = true;
+        let mut unpaired = editable(sample_state(false));
+        unpaired.console.as_mut().unwrap().waiting_for_password = true;
+        for state in [sample_state(true), editable(sample_state(true)), waiting, unpaired] {
+            for row in 0..=5 {
+                let mut app = app_with(state.clone());
+                app.select(row);
+                app.warnings_only = row % 2 == 0;
+                let line = footer(&mut app);
+                assert!(line.chars().count() <= 80);
+                assert_shows(&line, &[" p pair ", " q quit"]);
+            }
+        }
+        // Detached, there is nothing to pair with.
+        assert!(!footer(&mut App::new()).contains("p pair"));
+    }
+
+    #[test]
+    fn every_key_hint_and_quick_status_line_can_be_clicked() {
+        let mut app = app_with(editable(sample_state(true)));
+        app.select(1);
+        let screen = render(&mut app);
+        let footer = screen.lines().last().unwrap();
+        let at = |text: &str| footer.find(text).map(|i| footer[..i].chars().count() as u16).unwrap();
+        let click = |app: &mut App, x: u16, y: u16| app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        let bottom = app.footer_area.y;
+        // A hint does what its key does.
+        click(&mut app, at("p pair"), bottom);
+        assert_eq!(app.modal, Modal::Setup);
+        click(&mut app, 0, 0);
+        assert_eq!(app.modal, Modal::None);
+        click(&mut app, at("w warnings") + 2, bottom);
+        assert!(app.warnings_only);
+        click(&mut app, at("r rename"), bottom);
+        assert!(matches!(app.modal, Modal::Edit { .. }));
+        // Clicking inside the box being typed in keeps it open; outside, closes it.
+        render(&mut app);
+        let inside = (app.modal_area.x + 2, app.modal_area.y + 1);
+        click(&mut app, inside.0, inside.1);
+        assert!(matches!(app.modal, Modal::Edit { .. }));
+        click(&mut app, 0, 0);
+        assert_eq!(app.modal, Modal::None);
+        // The quick status's Bridge line shows the code.
+        let bridge = app.status_area.y + 1;
+        click(&mut app, 4, bridge);
+        assert_eq!(app.modal, Modal::Setup);
+        app.handle(key(KeyCode::Esc));
+        // And quit quits.
+        assert!(!click(&mut app, at("q quit"), bottom));
+    }
+
+    #[test]
+    fn overview_rows_and_sensor_switches_can_be_clicked() {
+        let mut app = app_with(sample_state(true));
+        let screen = render_at(&mut app, 120, 50);
+        let row = |text: &str| screen.lines().position(|l| l.contains(text)).unwrap() as u16;
+        let click = |app: &mut App, x: u16, y: u16| app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        let x = app.detail_area.x + 1;
+        // Each of the two switches on a line is its own target.
+        click(&mut app, x + 13 + 13 + 2, row("all cameras"));
+        assert_eq!(app.outbox, [Command::SetDetection { key: None, detection: "package".into(), on: true }]);
+        click(&mut app, x + 2, row("all cameras"));
+        assert_eq!(app.outbox.len(), 1, "the label is not a switch");
+        click(&mut app, x + 14, row("Sensors on"));
+        assert_eq!(app.outbox[1], Command::SetDetection { key: None, detection: "person".into(), on: true });
+        // The pairing line shows the code.
+        click(&mut app, x + 4, row("Pairing"));
+        assert_eq!(app.modal, Modal::Setup);
+        app.handle(key(KeyCode::Esc));
+        // A device in the overview's table selects it.
+        click(&mut app, x + 4, row("Floodlight light"));
+        assert_eq!(app.selected_device().unwrap().name, "Floodlight");
     }
 
     fn editable(mut state: State) -> State {
@@ -1730,7 +2187,7 @@ mod tests {
         let key_of = app.devices[0].key.clone();
         assert_eq!(app.outbox, [Command::SetDetection { key: key_of.clone(), detection: "person".into(), on: false }]);
         app.outbox.clear();
-        let row = app.actions.iter().find(|(_, action)| *action == Action::Detect(Detection::Vehicle)).unwrap().0;
+        let row = app.actions.iter().find(|h| h.action == Action::Detect(Detection::Vehicle)).unwrap().line;
         let (x, y) = (app.detail_area.x + 3, app.detail_area.y + 1 + row as u16);
         app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
         assert_eq!(app.outbox, [Command::SetDetection { key: key_of, detection: "vehicle".into(), on: true }]);
@@ -1892,7 +2349,7 @@ mod tests {
         state.name_prefix = "Harbormaster bridge ".into();
         let mut app = app_with(state);
         let screen = render(&mut app);
-        assert!(screen.contains("● Harbormaster brid…Fro… (UP)│"), "{screen}");
+        assert!(screen.contains("● Harborma…Fro… (UP) rec now"), "{screen}");
         assert!(screen.lines().all(|l| l.chars().count() == 80));
     }
 
