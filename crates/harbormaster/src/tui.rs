@@ -150,6 +150,8 @@ struct App {
     /// The footer's key hints, by the columns each was drawn in.
     hint_areas: Vec<(std::ops::Range<u16>, KeyCode)>,
     warnings_only: bool,
+    /// Whether long log lines wrap onto more rows. They do unless `W` says not.
+    log_wrap: bool,
     /// Whether the pairing code is on screen. It is unless hidden with `p`.
     show_pairing: bool,
     /// Whether the pairing box has room for the QR code, as last drawn.
@@ -191,6 +193,7 @@ impl App {
             hint_areas: Vec::new(),
             warnings_only: false,
             show_pairing: true,
+            log_wrap: true,
             pairing_picture: false,
             device_log: true,
             zone: clock::local_offset,
@@ -287,8 +290,43 @@ impl App {
 
     fn scroll_log(&mut self, delta: isize) {
         let visible = self.log_area.height.saturating_sub(2) as usize;
-        let max = self.visible_logs().len().saturating_sub(visible);
+        let width = self.log_area.width.saturating_sub(2) as usize;
+        let shown = self.visible_logs();
+        // Scrolled furthest back, the oldest lines fill the pane.
+        let mut rows = 0;
+        let fill = shown.iter().take_while(|l| {
+            rows += self.log_rows(l, width).len();
+            rows <= visible
+        });
+        let max = shown.len() - fill.count().min(shown.len());
         self.log_scroll = self.log_scroll.saturating_add_signed(delta).min(max);
+    }
+
+    /// One log line as drawn: a single row, or wrapped at spaces to `width`
+    /// with the time and level hanging to the left.
+    fn log_rows(&self, l: &LogLine, width: usize) -> Vec<Line<'static>> {
+        let color = match l.level.as_str() {
+            "ERROR" => Color::Red,
+            "WARN" => Color::Yellow,
+            _ => Color::Reset,
+        };
+        let head = vec![
+            Span::styled(format!("{} ", clock::time_of_day(l.time, (self.zone)(l.time))), DIM),
+            Span::styled(format!("{:<5} ", l.level), Style::new().fg(color)),
+        ];
+        let indent: usize = head.iter().map(|s| s.content.chars().count()).sum();
+        if !self.log_wrap || width < indent + 10 {
+            let mut spans = head;
+            spans.push(Span::raw(l.message.clone()));
+            return vec![Line::from(spans)];
+        }
+        let mut rows = Vec::new();
+        for (i, text) in wrap(&l.message, width - indent).into_iter().enumerate() {
+            let mut spans = if i == 0 { head.clone() } else { vec![Span::raw(" ".repeat(indent))] };
+            spans.push(Span::raw(text));
+            rows.push(Line::from(spans));
+        }
+        rows
     }
 
     /// Moves the focused pane by `lines`, where positive is down the screen.
@@ -495,6 +533,10 @@ impl App {
                     KeyCode::Char('P') => self.edit_affix(Target::Prefix),
                     KeyCode::Char('S') => self.edit_affix(Target::Suffix),
                     KeyCode::Char(c @ '1'..='4') => self.toggle_detection(Detection::ALL[c as usize - '1' as usize]),
+                    KeyCode::Char('W') => {
+                        self.log_wrap = !self.log_wrap;
+                        self.log_scroll = 0;
+                    }
                     KeyCode::Char('w') => {
                         self.warnings_only = !self.warnings_only;
                         self.log_scroll = 0;
@@ -569,6 +611,11 @@ impl App {
             self.toggle_pairing();
             return true;
         }
+        // The wrap switch sits at the right end of the log's top border.
+        if click && mouse.row == self.log_area.y && mouse.column + 12 >= self.log_area.right() && self.log_area.contains(at) {
+            self.handle(Event::Key(event::KeyEvent::new(KeyCode::Char('W'), KeyModifiers::NONE)));
+            return true;
+        }
         let Some(pane) = self.pane_at(at) else { return true };
         let down = match mouse.kind {
             MouseEventKind::ScrollUp => -1,
@@ -632,6 +679,35 @@ fn duration(secs: u64) -> String {
         3600..86400 => format!("{}h {:02}m", secs / 3600, secs % 3600 / 60),
         _ => format!("{}d {:02}h", secs / 86400, secs % 86400 / 3600),
     }
+}
+
+/// Breaks `text` into rows of at most `width` characters, at spaces where
+/// it can and inside a word only when the word alone is too long.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    for word in text.split(' ') {
+        let row = rows.last_mut().expect("never empty");
+        let (used, needed) = (row.chars().count(), word.chars().count());
+        if used > 0 && used + 1 + needed <= width {
+            row.push(' ');
+            row.push_str(word);
+            continue;
+        }
+        if used > 0 {
+            rows.push(String::new());
+        }
+        let mut chars = word.chars().peekable();
+        while chars.peek().is_some() {
+            let piece: String = chars.by_ref().take(width).collect();
+            let row = rows.last_mut().expect("never empty");
+            if !row.is_empty() {
+                rows.push(String::new());
+            }
+            rows.last_mut().expect("never empty").push_str(&piece);
+        }
+    }
+    rows
 }
 
 /// Shortens `text` to at most `width` characters, marking the cut.
@@ -867,6 +943,8 @@ fn hints(app: &App) -> Vec<(&'static str, &'static str, Option<KeyCode>)> {
         hints.push(("f", "log", Some(KeyCode::Char('f'))));
     }
     hints.push(("w", "warnings", Some(KeyCode::Char('w'))));
+    // Last, as the log's border also offers it.
+    hints.push(("W", "wrap", Some(KeyCode::Char('W'))));
     hints
 }
 
@@ -1433,25 +1511,22 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
-    let visible = area.height.saturating_sub(2) as usize;
+    let (visible, width) = (area.height.saturating_sub(2) as usize, area.width.saturating_sub(2) as usize);
     let shown = app.visible_logs();
     let end = shown.len().saturating_sub(app.log_scroll);
-    let start = end.saturating_sub(visible);
-    let mut lines: Vec<Line> = shown[start..end]
-        .iter()
-        .map(|l| {
-            let color = match l.level.as_str() {
-                "ERROR" => Color::Red,
-                "WARN" => Color::Yellow,
-                _ => Color::Reset,
-            };
-            Line::from(vec![
-                Span::styled(format!("{} ", clock::time_of_day(l.time, (app.zone)(l.time))), DIM),
-                Span::styled(format!("{:<5} ", l.level), Style::new().fg(color)),
-                Span::raw(l.message.clone()),
-            ])
-        })
-        .collect();
+    // Back from the newest line shown until the pane is full; the oldest of
+    // them may lose its first rows off the top.
+    let mut lines: Vec<Line> = Vec::new();
+    for l in shown[..end].iter().rev() {
+        if lines.len() >= visible {
+            break;
+        }
+        let mut rows = app.log_rows(l, width);
+        rows.append(&mut lines);
+        lines = rows;
+    }
+    let lines = lines.split_off(lines.len().saturating_sub(visible));
+    let mut lines = lines;
     let mut title = "Log".to_owned();
     if let Some(name) = app.log_device() {
         title.push_str(&format!(": {name} (f for all)"));
@@ -1465,7 +1540,10 @@ fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
     if lines.is_empty() && !app.logs.is_empty() {
         lines.push(Line::styled("nothing logged that matches", DIM));
     }
-    frame.render_widget(Paragraph::new(lines).block(pane(&title, app.focus == Focus::Log)), area);
+    // The wrap switch, on the right of the border, where a click flips it.
+    let wrap = Line::from(vec![Span::raw(" "), Span::styled("W", KEY), Span::styled(if app.log_wrap { " no wrap " } else { " wrap " }, DIM)]);
+    let block = pane(&title, app.focus == Focus::Log).title(wrap.right_aligned());
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Draws a titled box in the middle of the screen, sized to its lines, and
@@ -2432,6 +2510,52 @@ mod tests {
         app.select(3);
         app.handle(key(KeyCode::Char('P')));
         assert!(matches!(app.modal, Modal::Edit { target: Target::Prefix, .. }));
+    }
+
+    #[test]
+    fn long_log_lines_wrap_until_w_turns_it_off() {
+        let mut app = app_with(sample_state(true));
+        let long = "Front Door: recording for HomeKit at 1600x1200, 2000 kbps, no sound, reaching back 4 s (16 buffered)";
+        app.receive(Incoming::Message(Box::new(Message::Log(LogLine { time: NOW, level: "INFO".into(), message: long.into() }))));
+        let screen = render(&mut app);
+        // On by default: broken at spaces, the rest hanging under the message.
+        assert_shows(
+            &screen,
+            &[
+                "│14:13:20 INFO  Front Door: recording for      │",
+                "│               HomeKit at 1600x1200, 2000     │",
+                "│               s (16 buffered)                │",
+                "─ W no wrap ┐",
+            ],
+        );
+        // Older lines still fill the rows above it.
+        assert!(screen.contains("event 39"), "{screen}");
+
+        app.handle(key(KeyCode::Char('W')));
+        let screen = render(&mut app);
+        assert!(!app.log_wrap && !screen.contains("back 4 s") && screen.contains(" W wrap "), "{screen}");
+        assert!(screen.contains("14:13:20 INFO  Front Door: recording for HomeK│"), "{screen}");
+
+        // A click on the switch in the border turns it back on.
+        let (x, y) = (app.log_area.right() - 4, app.log_area.y);
+        app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        assert!(app.log_wrap);
+
+        // Scrolled all the way back, the oldest lines fill the pane.
+        app.handle(key(KeyCode::Char('f')));
+        app.focus = Focus::Log;
+        render(&mut app);
+        app.handle(key(KeyCode::Home));
+        let screen = render(&mut app);
+        assert!(screen.contains("event 0 ") && !screen.contains("back 4 s"), "{screen}");
+    }
+
+    #[test]
+    fn wrapping_breaks_at_spaces_and_splits_only_overlong_words() {
+        assert_eq!(wrap("one two three", 7), ["one two", "three"]);
+        assert_eq!(wrap("abcdefghij kl", 4), ["abcd", "efgh", "ij", "kl"]);
+        assert_eq!(wrap("", 5), [""]);
+        assert_eq!(wrap("a b", 0), ["a", "b"]);
     }
 
     #[test]
