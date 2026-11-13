@@ -52,7 +52,9 @@ pub async fn run(options: Options, logs: LogBuffer) -> Result<()> {
 
     let store = Arc::new(Store::open(options.state_dir.join("state.json"))?);
     let device_id = store.device_id();
-    let name = format!("Harbormaster {}", device_id[12..].replace(':', ""));
+    // The last two bytes of the id tell bridges apart. The store has
+    // checked the id's shape, so the tail is always there.
+    let name = format!("Harbormaster {}", device_id.get(12..).unwrap_or_default().replace(':', ""));
 
     let db = Database::new();
     let mut bridge_accessory = Accessory::new(
