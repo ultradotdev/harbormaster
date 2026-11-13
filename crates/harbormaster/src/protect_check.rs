@@ -112,13 +112,30 @@ fn redact(value: &mut serde_json::Value) {
     }
 }
 
+/// The folder captures go in, for its owner only like the state directory
+/// around it.
+fn capture_dir(state_dir: &Path) -> Result<std::path::PathBuf> {
+    let dir = state_dir.join("protect-capture");
+    crate::daemon::create_private_dir(&dir)?;
+    Ok(dir)
+}
+
+/// Creates or empties a capture file that only its owner can read. What is
+/// captured is redacted, but it still describes a home and may show it.
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    // The mode above only applies to a file that did not exist yet.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
 /// `harbormaster protect-capture`: records the device inventory and a
 /// sample of realtime updates to files, for developing against real data.
 pub async fn capture(state_dir: &Path, seconds: u64) -> Result<()> {
     use std::io::Write;
     let Some((client, protect)) = sign_in(state_dir).await? else { return Ok(()) };
-    let dir = state_dir.join("protect-capture");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let dir = capture_dir(state_dir)?;
 
     let mut bootstrap = client.bootstrap_raw().await?;
     let last_update_id = bootstrap["lastUpdateId"].as_str().map(str::to_owned);
@@ -127,12 +144,13 @@ pub async fn capture(state_dir: &Path, seconds: u64) -> Result<()> {
     }
     redact(&mut bootstrap);
     let bootstrap_path = dir.join("bootstrap.json");
-    std::fs::write(&bootstrap_path, serde_json::to_vec_pretty(&bootstrap)?)
+    create_private(&bootstrap_path)
+        .and_then(|mut file| file.write_all(&serde_json::to_vec_pretty(&bootstrap)?))
         .with_context(|| format!("writing {}", bootstrap_path.display()))?;
     println!("Signed in to {}. Wrote {}", protect.host, bootstrap_path.display());
 
     let updates_path = dir.join("updates.jsonl");
-    let mut file = std::fs::File::create(&updates_path)
+    let mut file = create_private(&updates_path)
         .with_context(|| format!("creating {}", updates_path.display()))?;
     let mut stream = client.updates(last_update_id.as_deref()).await?;
     println!("Recording updates for {seconds} seconds. Trigger some motion or ring the doorbell.");
@@ -190,10 +208,9 @@ pub async fn feed(state_dir: &Path, camera: Option<&str>, channel: u8, lens: u8,
         println!("channel {}: {} {}x{} at {} fps{}", c.id, c.name, c.width, c.height, c.fps, if c.enabled { "" } else { " (off)" });
     }
 
-    let dir = state_dir.join("protect-capture");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let dir = capture_dir(state_dir)?;
     let path = dir.join(format!("feed-{channel}-lens{lens}.mp4"));
-    let mut file = std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+    let mut file = create_private(&path).with_context(|| format!("creating {}", path.display()))?;
 
     let started = std::time::Instant::now();
     let mut stream = client.livestream(&found.device.id, FeedOptions { channel, lens, ..Default::default() }).await?;
@@ -251,6 +268,25 @@ pub async fn feed(state_dir: &Path, camera: Option<&str>, channel: u8, lens: u8,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_files_are_readable_by_their_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = std::env::temp_dir().join(format!("hm-check-{}-capture-mode", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
+        let dir = capture_dir(&state).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        // One left by a build that wrote it for anyone to read.
+        let path = dir.join("bootstrap.json");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(create_private(&path).unwrap());
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"", "and it starts empty");
+        std::fs::remove_dir_all(&state).unwrap();
+    }
 
     #[test]
     fn redaction_removes_secrets_at_any_depth_and_keeps_the_rest() {
