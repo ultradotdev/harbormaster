@@ -489,6 +489,9 @@ async fn talkback<S: AsyncRead + AsyncWrite + Unpin>(mut socket: WebSocketStream
 /// The `mock-console` command.
 pub fn run(state_dir: &Path, listen: SocketAddr) -> Result<()> {
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    // On a clean machine this may run before setup has made the state
+    // directory, which must be the owner's alone like everything in it.
+    crate::daemon::create_private_dir(state_dir)?;
     let identity = Identity::load_or_create(&state_dir.join("mock-console"))?;
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
