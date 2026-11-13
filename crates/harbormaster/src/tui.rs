@@ -56,8 +56,6 @@ enum Incoming {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Modal {
     None,
-    /// The pairing code.
-    Setup,
     /// Asking before a device is taken away from HomeKit.
     ConfirmUnshare { key: String, name: String },
     /// Typing a device's new name, or the prefix or suffix for all names.
@@ -91,7 +89,7 @@ impl Target {
 /// Something a line of the detail pane does when clicked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
-    /// Show the pairing code.
+    /// Hide or show the pairing code.
     Pair,
     /// Select this row of the device list.
     Select(usize),
@@ -152,12 +150,17 @@ struct App {
     /// The footer's key hints, by the columns each was drawn in.
     hint_areas: Vec<(std::ops::Range<u16>, KeyCode)>,
     warnings_only: bool,
+    /// Whether the pairing code is on screen. It is unless hidden with `p`.
+    show_pairing: bool,
+    /// Whether the pairing box has room for the QR code, as last drawn.
+    pairing_picture: bool,
     /// Whether the log narrows to the selected device.
     device_log: bool,
     /// Seconds local time is ahead of UTC at a given moment.
     zone: fn(u64) -> i64,
     /// Where the panes were last drawn, for mouse hit testing.
     status_area: Rect,
+    pairing_area: Rect,
     list_area: Rect,
     /// Screen line of the list's first row, under its header if one is drawn.
     list_top: u16,
@@ -187,9 +190,12 @@ impl App {
             modal_area: Rect::default(),
             hint_areas: Vec::new(),
             warnings_only: false,
+            show_pairing: true,
+            pairing_picture: false,
             device_log: true,
             zone: clock::local_offset,
             status_area: Rect::default(),
+            pairing_area: Rect::default(),
             list_area: Rect::default(),
             list_top: 0,
             detail_area: Rect::default(),
@@ -359,11 +365,15 @@ impl App {
         spans
     }
 
-    /// Shows the pairing code, which the daemon sends whether or not the
-    /// bridge is paired.
-    fn open_pairing(&mut self) {
-        if self.state.is_some() {
-            self.modal = Modal::Setup;
+    /// The pairing code, if the daemon sends it and it is not hidden.
+    fn pairing_code(&self) -> Option<&State> {
+        self.state.as_ref().filter(|s| self.attached && s.setup_code.is_some())
+    }
+
+    /// Hides or shows the pairing code.
+    fn toggle_pairing(&mut self) {
+        if self.pairing_code().is_some() {
+            self.show_pairing = !self.show_pairing;
         }
     }
 
@@ -400,7 +410,7 @@ impl App {
 
     fn run(&mut self, action: Action) {
         match action {
-            Action::Pair => self.open_pairing(),
+            Action::Pair => self.toggle_pairing(),
             Action::Select(row) => self.select(row),
             Action::Detect(detection) => self.toggle_detection(detection),
             Action::ToggleShared => self.toggle_shared(),
@@ -414,8 +424,6 @@ impl App {
     fn modal_key(&mut self, code: KeyCode) -> bool {
         match std::mem::replace(&mut self.modal, Modal::None) {
             Modal::None => return false,
-            // Any key closes the pairing code.
-            Modal::Setup => {}
             Modal::ConfirmUnshare { key, .. } => {
                 if matches!(code, KeyCode::Char('y' | 'Y') | KeyCode::Enter) {
                     self.outbox.push(Command::SetShared { key, shared: false });
@@ -480,7 +488,7 @@ impl App {
                         self.focus = Focus::Detail;
                     }
                     KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Devices,
-                    KeyCode::Char('p') => self.open_pairing(),
+                    KeyCode::Char('p') => self.toggle_pairing(),
                     KeyCode::Char('u') => self.start_unlock(),
                     KeyCode::Char('s') => self.toggle_shared(),
                     KeyCode::Char('r') => self.start_rename(),
@@ -551,10 +559,14 @@ impl App {
         if click && self.status_area.contains(at) {
             // The status lines are Bridge, then Console.
             match mouse.row.saturating_sub(self.status_area.y) {
-                1 => self.open_pairing(),
+                1 => self.toggle_pairing(),
                 2 => self.start_unlock(),
                 _ => {}
             }
+            return true;
+        }
+        if click && self.pairing_area.contains(at) {
+            self.toggle_pairing();
             return true;
         }
         let Some(pane) = self.pane_at(at) else { return true };
@@ -752,24 +764,31 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let [body, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(screen);
     let side_width = (screen.width * 32 / 100).clamp(32, 60);
     let [side, right] = Layout::horizontal([Constraint::Length(side_width), Constraint::Min(20)]).areas(body);
-    let [status, list] = Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).areas(side);
+    let pairing = pairing_box(app, side.width.saturating_sub(2) as usize, side.height.saturating_sub(6));
+    let pairing_rows = pairing.as_ref().map_or(0, |lines| lines.len() as u16 + 2);
+    let [status, code, list] =
+        Layout::vertical([Constraint::Length(6), Constraint::Length(pairing_rows), Constraint::Min(3)]).areas(side);
     // A fixed share, so the log does not jump as different devices are selected.
     let detail_rows = body.height.saturating_sub(LOG_ROWS).min(DETAIL_LINES + 2);
     let [detail, log] = Layout::vertical([Constraint::Length(detail_rows), Constraint::Min(0)]).areas(right);
     app.status_area = status;
+    app.pairing_area = code;
     app.list_area = list;
     app.detail_area = detail;
     app.log_area = log;
     app.footer_area = footer;
 
     draw_status(frame, app, status);
+    if let Some(lines) = pairing {
+        let title = Line::from(vec![Span::raw(" Pairing code "), Span::styled("p", KEY), Span::styled(" hide ", DIM)]);
+        frame.render_widget(Paragraph::new(lines).block(Block::bordered().title(title).border_style(DIM)), code);
+    }
     draw_devices(frame, app, list);
     draw_detail(frame, app, detail);
     draw_log(frame, app, log);
     draw_footer(frame, app, footer);
     match &app.modal {
         Modal::None => {}
-        Modal::Setup => draw_setup(frame, app),
         Modal::ConfirmUnshare { name, .. } => {
             let lines = vec![
                 Line::raw(format!(" Stop sharing {name} with HomeKit?")),
@@ -840,8 +859,8 @@ fn hints(app: &App) -> Vec<(&'static str, &'static str, Option<KeyCode>)> {
         hints.push(("P", "prefix", Some(KeyCode::Char('P'))));
         hints.push(("S", "suffix", Some(KeyCode::Char('S'))));
     }
-    if app.state.is_some() {
-        hints.push(("p", "pair", Some(KeyCode::Char('p'))));
+    if app.pairing_code().is_some() {
+        hints.push(("p", if app.show_pairing { "hide code" } else { "show code" }, Some(KeyCode::Char('p'))));
     }
     if app.selected_device().is_some() {
         // The log's title says which way these are switched.
@@ -878,6 +897,34 @@ fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// The pairing code for the left column, shown until hidden with `p`, paired
+/// or not. The QR code goes in when the device list keeps room for every
+/// device (or a dozen rows) under it; otherwise only the digits.
+fn pairing_box(app: &mut App, width: usize, height: u16) -> Option<Vec<Line<'static>>> {
+    app.pairing_picture = false;
+    let s = app.pairing_code().filter(|_| app.show_pairing)?;
+    let code = s.setup_code.clone()?;
+    let mut lines = vec![Line::from(vec![Span::styled("Setup code  ", DIM), Span::styled(code, WARN)])];
+    // HomeKit takes a code only while unpaired, so say so rather than leave it to be tried.
+    if s.paired {
+        let long = "Paired: remove the bridge from Home to use it again.";
+        lines.push(Line::styled(if long.len() <= width { long } else { "Remove from Home to reuse it." }, DIM));
+    }
+    let list_rows = (app.devices.len() as u16 + 4).min(14);
+    if let Some(qr) = s.setup_uri.as_deref().and_then(crate::qr::render) {
+        let picture: Vec<Line> = qr.lines().map(|l| Line::raw(l.to_owned()).centered()).collect();
+        let fits = qr.lines().all(|l| l.chars().count() <= width);
+        if fits && height >= (picture.len() + lines.len() + 2) as u16 + list_rows {
+            app.pairing_picture = true;
+            lines.splice(0..0, picture);
+            for line in &mut lines {
+                line.alignment = Some(ratatui::layout::Alignment::Center);
+            }
+        }
+    }
+    Some(lines)
+}
+
 /// The quick view: is the bridge healthy, and what is it doing.
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let (Some(s), true) = (&app.state, app.attached) else {
@@ -897,7 +944,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let bridge = if s.paired {
         row(dot(Some(true)), "Bridge", vec![Span::raw(format!("paired · {} connected", s.connections.len()))])
     } else {
-        row(Span::styled("○", WARN), "Bridge", vec![Span::styled("not paired (press p)", WARN)])
+        let how = if app.show_pairing && s.setup_code.is_some() { "not paired" } else { "not paired (press p)" };
+        row(Span::styled("○", WARN), "Bridge", vec![Span::styled(how, WARN)])
     };
     let console = match &s.console {
         Some(c) if c.connected => {
@@ -1119,19 +1167,17 @@ fn affix_setting(label: &str, key: &str, text: &str) -> Line<'static> {
     ])
 }
 
-/// What an unpaired bridge shows first: the code to scan or type in the
-/// Home app. The picture is left out where the pane is too narrow for it.
-/// Once paired the code is still sent, but only `p` shows it.
-fn pairing_lines(s: &State, width: usize) -> Vec<Line<'static>> {
-    let Some(code) = s.setup_code.as_ref().filter(|_| !s.paired) else { return Vec::new() };
-    // The digits come first: on a short terminal the picture scrolls away.
+/// What an unpaired bridge's overview shows first: how to pair, with the
+/// QR code where the left column has no room for it and this pane does.
+fn pairing_lines(app: &App, s: &State, width: usize) -> Vec<Line<'static>> {
+    let Some(code) = s.setup_code.as_ref().filter(|_| !s.paired && app.show_pairing) else { return Vec::new() };
+    // The digits are always in the left column, so they are not repeated here.
     let mut lines = vec![
         heading("Pair with the Home app"),
-        Line::from(vec![Span::styled("Setup code  ", DIM), Span::styled(code.clone(), WARN)]),
-        Line::styled("In Home choose Add Accessory, then scan or type it.", DIM),
+        Line::styled(format!("In Home choose Add Accessory, then scan or type {code}."), DIM),
         Line::raw(""),
     ];
-    if let Some(qr) = s.setup_uri.as_deref().and_then(crate::qr::render) {
+    if let Some(qr) = s.setup_uri.as_deref().and_then(crate::qr::render).filter(|_| !app.pairing_picture) {
         if qr.lines().all(|l| l.chars().count() <= width) {
             lines.extend(qr.lines().map(|l| Line::raw(l.to_owned())));
             lines.push(Line::raw(""));
@@ -1142,7 +1188,7 @@ fn pairing_lines(s: &State, width: usize) -> Vec<Line<'static>> {
 
 /// The lines of the overview, and what can be clicked in them.
 fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Vec<Hit>) {
-    let mut lines = pairing_lines(s, width);
+    let mut lines = pairing_lines(app, s, width);
     let pairing = lines.len() + 3;
     lines.extend([
         field("Bridge", format!("{}  v{}", s.name, s.version)),
@@ -1153,7 +1199,7 @@ fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Ve
             if s.paired {
                 Span::raw(format!("paired with {} controller(s)", s.controllers.len()))
             } else {
-                Span::styled("not paired (p shows the code)", WARN)
+                Span::styled("not paired", WARN)
             },
         ),
         field(
@@ -1420,38 +1466,6 @@ fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::styled("nothing logged that matches", DIM));
     }
     frame.render_widget(Paragraph::new(lines).block(pane(&title, app.focus == Focus::Log)), area);
-}
-
-/// The pairing code, paired or not. HomeKit takes it only while the bridge
-/// is unpaired, so once paired it says so rather than leave it to be tried.
-fn draw_setup(frame: &mut Frame, app: &mut App) {
-    let Some(state) = &app.state else { return };
-    let mut notes = Vec::new();
-    if state.paired && state.setup_code.is_some() {
-        notes.push(Line::styled("Already paired. HomeKit accepts a setup code", DIM).centered());
-        notes.push(Line::styled("only while unpaired, so this one works again", DIM).centered());
-        notes.push(Line::styled("only after the bridge is removed from Home.", DIM).centered());
-        notes.push(Line::raw(""));
-    }
-    notes.push(Line::styled("press any key to close", DIM).centered());
-    let mut lines: Vec<Line> = Vec::new();
-    match (&state.setup_code, &state.setup_uri) {
-        (Some(code), uri) => {
-            if let Some(qr) = uri.as_deref().and_then(crate::qr::render) {
-                // Leave room for the border, the code line and the notes.
-                if (qr.lines().count() + notes.len() + 4) as u16 <= frame.area().height {
-                    lines.extend(qr.lines().map(|l| Line::raw(l.to_owned()).centered()));
-                    lines.push(Line::raw(""));
-                }
-            }
-            lines.push(Line::from(vec![Span::raw("Setup code  "), Span::styled(code.clone(), WARN)]).centered());
-            lines.push(Line::raw(""));
-        }
-        // A daemon from before the code was always sent.
-        _ => notes.insert(0, Line::raw("Already paired. Remove the bridge in the Home app to pair again.")),
-    }
-    lines.extend(notes);
-    app.modal_area = draw_box(frame, "Pair with the Home app", lines);
 }
 
 /// Draws a titled box in the middle of the screen, sized to its lines, and
@@ -1964,42 +1978,44 @@ mod tests {
 
     #[test]
     fn pairing_code_is_always_at_hand() {
+        // Unpaired: the code is beside the list, and the overview says how to pair.
         let mut app = app_with(sample_state(false));
-        assert!(render(&mut app).contains("not paired (press p)"));
-        // The overview leads with the code, and draws it where there is room.
-        let overview = render_at(&mut app, 110, 40);
-        assert_shows(&overview, &["Pair with the Home app", "Setup code  420-21-195"]);
-        assert!(overview.contains('█'), "{overview}");
-        assert!(render(&mut app).contains("Setup code  420-21-195"));
-        app.handle(key(KeyCode::Char('p')));
-        let screen = render_at(&mut app, 110, 34);
-        assert!(screen.contains("Setup code  420-21-195"), "{screen}");
-        assert!(screen.contains('█'), "QR code should be drawn");
-        assert!(!screen.contains("Already paired"), "{screen}");
-        // Too short for the code's picture: the digits alone still fit.
-        assert!(render_at(&mut app, 80, 16).contains("Setup code  420-21-195"));
-        app.handle(key(KeyCode::Char('x')));
-        assert_eq!(app.modal, Modal::None);
-
-        // Once paired the overview no longer leads with it, though the
-        // daemon still sends it, and p still shows it with the plain truth.
-        let mut app = app_with(sample_state(true));
-        let overview = render_at(&mut app, 110, 40);
-        assert!(!overview.contains("Setup code") && !overview.contains('█'), "{overview}");
-        assert!(overview.contains(" p pair "), "{overview}");
-        app.handle(key(KeyCode::Char('p')));
         let screen = render(&mut app);
-        assert_shows(&screen, &["Setup code  420-21-195", "Already paired", "only after the bridge is removed from Home."]);
-        // 24 lines is room enough for the picture too.
-        assert!(screen.contains('█'), "{screen}");
+        assert_shows(&screen, &["○ Bridge  not paired  ", " Pairing code p hide ", "Setup code  420-21-195", "Pair with the Home app", " p hide code "]);
+        // At 80x24 the picture does not crowd the list: it goes in the overview.
+        assert!(!app.pairing_picture);
+        assert!(app.list_area.height >= 10, "{screen}");
+        assert!(render_at(&mut app, 110, 40).contains('█'));
+        // On a tall terminal it sits in the left column, and is not drawn twice.
+        let tall = render_at(&mut app, 190, 55);
+        assert!(app.pairing_picture && app.pairing_area.height > 15, "{tall}");
+        let side = app.list_area.width as usize;
+        assert!(tall.lines().all(|l| !l.chars().skip(side).any(|c| c == '█')), "drawn once, on the left: {tall}");
 
-        // A daemon from before the code was always sent says nothing of a code.
+        // p hides it all, and shows it again.
+        app.handle(key(KeyCode::Char('p')));
+        let hidden = render(&mut app);
+        assert!(!hidden.contains("420-21-195") && !hidden.contains('█'), "{hidden}");
+        assert_shows(&hidden, &["not paired (press p)", " p show code "]);
+        assert_eq!(app.pairing_area.height, 0);
+        app.handle(key(KeyCode::Char('p')));
+        assert!(render(&mut app).contains("Setup code  420-21-195"));
+
+        // Paired: still shown by default, with the plain truth about it.
+        let mut app = app_with(sample_state(true));
+        let screen = render(&mut app);
+        assert_shows(&screen, &["Setup code  420-21-195", "Remove from Home to reuse it.", " p hide code "]);
+        assert!(!screen.contains("Pair with the Home app"), "the overview no longer leads with it: {screen}");
+        let tall = render_at(&mut app, 190, 55);
+        assert_shows(&tall, &["Paired: remove the bridge from Home to use it again."]);
+        assert!(tall.contains('█'), "{tall}");
+
+        // A daemon from before the code was always sent: nothing to show or toggle.
         let mut state = sample_state(true);
         (state.setup_code, state.setup_uri) = (None, None);
         let mut app = app_with(state);
-        app.handle(key(KeyCode::Char('p')));
         let screen = render(&mut app);
-        assert!(screen.contains("Remove the bridge in the Home app to pair again") && !screen.contains("Setup code"), "{screen}");
+        assert!(!screen.contains("Setup code") && !screen.contains("p hide"), "{screen}");
     }
 
     #[test]
@@ -2043,7 +2059,9 @@ mod tests {
         );
         // Every state starts in the same column.
         let state_column = |screen: &str, name: &str| {
-            let line = screen.lines().find(|l| l.contains(name)).unwrap();
+            // Only the device list, on the left.
+            let side: String = screen.lines().map(|l| l.chars().take(60).collect::<String>() + "\n").collect();
+            let line = side.lines().find(|l| l.contains(name)).unwrap_or_else(|| panic!("{name} in {screen}")).to_owned();
             let state = ["rec ", "on 83%", "offline", "closed", "unshared"].iter().find_map(|s| line.find(s)).unwrap();
             line[..state].chars().count()
         };
@@ -2082,11 +2100,11 @@ mod tests {
                 app.warnings_only = row % 2 == 0;
                 let line = footer(&mut app);
                 assert!(line.chars().count() <= 80);
-                assert_shows(&line, &[" p pair ", " q quit"]);
+                assert_shows(&line, &[" p hide code ", " q quit"]);
             }
         }
-        // Detached, there is nothing to pair with.
-        assert!(!footer(&mut App::new()).contains("p pair"));
+        // Detached, there is no code to show.
+        assert!(!footer(&mut App::new()).contains("code"));
     }
 
     #[test]
@@ -2099,10 +2117,8 @@ mod tests {
         let click = |app: &mut App, x: u16, y: u16| app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
         let bottom = app.footer_area.y;
         // A hint does what its key does.
-        click(&mut app, at("p pair"), bottom);
-        assert_eq!(app.modal, Modal::Setup);
-        click(&mut app, 0, 0);
-        assert_eq!(app.modal, Modal::None);
+        click(&mut app, at("p hide code"), bottom);
+        assert!(!app.show_pairing);
         click(&mut app, at("w warnings") + 2, bottom);
         assert!(app.warnings_only);
         click(&mut app, at("r rename"), bottom);
@@ -2114,11 +2130,15 @@ mod tests {
         assert!(matches!(app.modal, Modal::Edit { .. }));
         click(&mut app, 0, 0);
         assert_eq!(app.modal, Modal::None);
-        // The quick status's Bridge line shows the code.
+        // The quick status's Bridge line shows the code again, and the
+        // code's own box hides it.
         let bridge = app.status_area.y + 1;
         click(&mut app, 4, bridge);
-        assert_eq!(app.modal, Modal::Setup);
-        app.handle(key(KeyCode::Esc));
+        assert!(app.show_pairing);
+        render(&mut app);
+        let code = (app.pairing_area.x + 3, app.pairing_area.y + 1);
+        click(&mut app, code.0, code.1);
+        assert!(!app.show_pairing);
         // And quit quits.
         assert!(!click(&mut app, at("q quit"), bottom));
     }
@@ -2137,10 +2157,9 @@ mod tests {
         assert_eq!(app.outbox.len(), 1, "the label is not a switch");
         click(&mut app, x + 14, row("Sensors on"));
         assert_eq!(app.outbox[1], Command::SetDetection { key: None, detection: "person".into(), on: true });
-        // The pairing line shows the code.
-        click(&mut app, x + 4, row("Pairing"));
-        assert_eq!(app.modal, Modal::Setup);
-        app.handle(key(KeyCode::Esc));
+        // The pairing line hides or shows the code.
+        click(&mut app, x + 4, row("Pairing      paired"));
+        assert!(!app.show_pairing);
         // A device in the overview's table selects it.
         click(&mut app, x + 4, row("Floodlight light"));
         assert_eq!(app.selected_device().unwrap().name, "Floodlight");
