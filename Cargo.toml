@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/hap", "crates/harbormaster", "crates/protect"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "Apache-2.0"
+
+# Big-number math for pairing is painfully slow unoptimized.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+panic = "abort"

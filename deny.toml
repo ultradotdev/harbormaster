@@ -1,0 +1,34 @@
+# What `cargo deny check` holds the dependencies to. CI runs it on every
+# change and once a week, since advisories appear without any change here.
+
+[graph]
+# Harbormaster ships for these; a dependency used only elsewhere is not shipped.
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+# Known vulnerabilities and unmaintained crates fail the check.
+yanked = "deny"
+
+[licenses]
+# Licenses that may be combined into an Apache-2.0 binary and shipped.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Two versions of one crate bloat the binary but break nothing.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Everything comes from crates.io: no git dependencies, no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"

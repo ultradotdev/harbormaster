@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Mondays, 14:00 UTC: advisories appear without any change here.
+    - cron: "0 14 * * 1"
+
+# Nothing here writes to the repository or publishes anything.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Lints are errors here, so a warning cannot slip in unnoticed.
+  RUSTFLAGS: -D warnings
+  # One named Rust version, the one the release is built with. "stable"
+  # moves every six weeks and brings new lints, which would fail changes
+  # that touched nothing. Raise this deliberately, fixing what it finds.
+  RUST_VERSION: "1.97.1"
+
+jobs:
+  test:
+    name: Build, lint and test (macOS)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy && rustup default "$RUST_VERSION"
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Release build for both Mac architectures
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: The binary runs and reports its version
+        run: target/aarch64-apple-darwin/release/harbormaster --version
+
+  pairing:
+    name: Pair with an independent HomeKit controller
+    runs-on: macos-15
+    timeout-minutes: 20
+    # The controller finds the bridge by Bonjour, which is unproven on
+    # hosted runners. Until it has passed there reliably, a failure here
+    # is reported but does not block a change.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal && rustup default "$RUST_VERSION"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Install the controller
+        run: |
+          python3 -m venv "$RUNNER_TEMP/e2e/venv"
+          "$RUNNER_TEMP/e2e/venv/bin/pip" install aiohomekit==4.0.1
+      - name: Pair, read, restart, reconnect, unpair
+        run: bash tools/e2e/run.sh "$RUNNER_TEMP/e2e"
+
+  dependencies:
+    name: Dependencies and scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny@0.20.2
+        env:
+          RUSTFLAGS: ""
+      - name: Known vulnerabilities, licenses and where dependencies come from
+        run: cargo deny check
+      - name: Shell scripts
+        run: shellcheck install.sh tools/release/*.sh tools/e2e/run.sh
+      - name: The install script only downloads from this project's releases
+        run: |
+          # Every address in it must be this repository on GitHub.
+          # shellcheck disable=SC2016
+          if grep -Eo 'https?://[^" ]+' install.sh | grep -v '^https://github.com/\$repo' | grep -v '^https://raw.githubusercontent.com/ultradotdev/harbormaster/'; then
+            echo "install.sh reaches somewhere unexpected" >&2
+            exit 1
+          fi

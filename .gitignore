@@ -40,3 +40,8 @@
 .opencode/hooks/cortex-session-start.sh
 .opencode/hooks/cortex-stop.sh
 .opencode/agents/cortex-capture.md
+/target
+
+# Captured console data from real sites
+protect-capture/
+/dist
