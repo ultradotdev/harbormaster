@@ -22,10 +22,20 @@ fix if you want it.
 - It listens for HomeKit on your local network and makes no connections
   beyond your console. It has no telemetry and no update check.
 
+## What it does not protect against
+
+- Other people logged in to the same Mac. While someone watches a camera
+  live, the key that encrypts that one stream is passed to ffmpeg on its
+  command line, where any user of the machine can read it for as long as
+  the stream runs. Harbormaster is meant for a machine that only its owner
+  logs in to.
+
 ## How releases are checked
 
 - Every change is built, linted and tested, and its dependencies checked
   for known vulnerabilities, license problems and unexpected sources.
 - Release binaries are signed with an Apple Developer ID.
 - Each release publishes SHA-256 checksums. The install script and the
-  Homebrew formula both refuse a download that does not match.
+  Homebrew formula both refuse a download that does not match. The install
+  script also refuses a program that was not signed by this project's
+  Developer ID.
