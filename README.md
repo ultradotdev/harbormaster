@@ -73,7 +73,7 @@ Create an account for Harbormaster in UniFi OS first: a local-access-only
 admin with access to Protect. Full management lets Harbormaster switch
 floodlights; view only is enough for everything else.
 
-Then open the dashboard, press `p` for the pairing code, and add it in the
+Then open the dashboard, which shows the pairing code, and add it in the
 Home app under Add Accessory, More Options.
 
 ```sh
@@ -126,6 +126,13 @@ presents the exact certificate you confirmed during setup.
   Renaming in the dashboard changes what new accessories are called.
 - Chimes, smoke and CO alarms, and Protect's sound detections are not
   published.
+
+## Trying it without a console
+
+`harbormaster mock-console` runs a pretend UniFi Protect console with an
+invented site, so setup, sign-in, the dashboard, events and live video can
+be tried on a spare Mac or virtual machine with no real console. See
+[docs/mock-console.md](docs/mock-console.md).
 
 ## Files
 

@@ -14,6 +14,7 @@ mod keychain;
 mod launchd;
 mod logbuf;
 mod logfile;
+mod mock_console;
 mod overrides;
 mod password;
 mod protect_bridge;
@@ -94,6 +95,8 @@ enum Command {
     ProtectCheck,
     ProtectCapture,
     ProtectFeed,
+    /// A pretend console for testing, left out of the help on purpose.
+    MockConsole,
 }
 
 struct Args {
@@ -164,6 +167,7 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
             "protect-check" => args.command = Command::ProtectCheck,
             "protect-capture" => args.command = Command::ProtectCapture,
             "protect-feed" => args.command = Command::ProtectFeed,
+            "mock-console" => args.command = Command::MockConsole,
             "--camera" => args.camera = Some(value()?),
             "--lens" => args.lens = value()?.parse().context("--lens expects a small number")?,
             "--channel" => args.channel = value()?.parse().context("--channel expects a small number")?,
@@ -253,6 +257,10 @@ fn main() -> Result<()> {
             args.lens,
             args.seconds,
         )),
+        Command::MockConsole => {
+            let listen = if args.listen_given { args.listen } else { mock_console::DEFAULT_LISTEN.parse()? };
+            mock_console::run(&args.state_dir, listen, args.stdin)
+        }
         Command::Daemon => {
             let logs = logbuf::LogBuffer::new();
             // The log file lives in the state directory, which holds

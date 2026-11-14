@@ -19,8 +19,11 @@ toml = "1.2.1"
 tracing = "0.1.44"
 zeroize = "1.9.1"
 tracing-subscriber = { version = "0.3.23", features = ["registry"] }
-
-[dev-dependencies]
+# For the mock console (`harbormaster mock-console`).
+flate2 = "1.1.11"
+futures-util = "0.3.34"
 rcgen = "0.14.10"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+

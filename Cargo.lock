@@ -797,6 +797,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "flate2",
+ "futures-util",
  "harbormaster-hap",
  "harbormaster-protect",
  "libc",
@@ -808,6 +810,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "toml",
  "tracing",
  "tracing-subscriber",
