@@ -73,7 +73,7 @@ Create an account for Harbormaster in UniFi OS first: a local-access-only
 admin with access to Protect. Full management lets Harbormaster switch
 floodlights; view only is enough for everything else.
 
-Then open the dashboard, press `p` for the pairing code, and add it in the
+Then open the dashboard, which shows the pairing code, and add it in the
 Home app under Add Accessory, More Options.
 
 ```sh

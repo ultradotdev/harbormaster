@@ -2,7 +2,8 @@
 //! a fresh install end to end without a real one.
 //!
 //! It serves what Harbormaster asks a console for, over TLS with a
-//! certificate of its own: sign-in with a fixed test account, the
+//! certificate of its own: sign-in with one account, whose password the
+//! person starting the mock chooses as it starts, the
 //! inventory of a small invented site, the realtime update stream in the
 //! console's binary format with motion, recognitions, doorbell rings and
 //! sensor changes played from a script, live video and snapshots made by
@@ -33,12 +34,12 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+use crate::password::Secret;
 use site::{Scene, Site, SCRIPT};
 
-/// The one account the mock accepts. These are published test values for a
-/// console that does not exist; they open nothing real.
+/// The one account the mock accepts. Its password is chosen each time the
+/// mock starts and kept only in memory, so none is written anywhere.
 pub const USERNAME: &str = "protect-mock";
-pub const PASSWORD: &str = "mock-password";
 
 /// Where the mock listens unless told otherwise.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7443";
@@ -112,6 +113,8 @@ enum Ticket {
 }
 
 struct Console {
+    /// The password the one account signs in with.
+    password: Secret,
     site: Mutex<Site>,
     updates: broadcast::Sender<Bytes>,
     sessions: Mutex<HashSet<String>>,
@@ -149,9 +152,10 @@ fn token() -> String {
 
 /// Serves the mock on `listener` until the process ends. `pace` sets how
 /// quickly the script of events plays.
-pub async fn serve(listener: TcpListener, identity: &Identity, pace: Duration) -> Result<()> {
+pub async fn serve(listener: TcpListener, identity: &Identity, password: Secret, pace: Duration) -> Result<()> {
     let acceptor = identity.acceptor()?;
     let console = Arc::new(Console {
+        password,
         site: Mutex::new(Site::default()),
         updates: broadcast::channel(256).0,
         sessions: Mutex::default(),
@@ -321,7 +325,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(console: Arc
 fn sign_in(console: &Console, request: &Request) -> Reply {
     let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
     let username = body["username"].as_str().unwrap_or_default();
-    if username != USERNAME || body["password"] != PASSWORD {
+    if username != USERNAME || body["password"].as_str() != Some(console.password.expose()) {
         // The name is the tester's own typing; the password is never shown.
         tracing::info!("refused a sign-in as \"{}\"", username.escape_debug());
         return Reply::json("401 Unauthorized", &json!({"code": "AUTHENTICATION_FAILED_INVALID_CREDENTIALS"}));
@@ -486,31 +490,52 @@ async fn talkback<S: AsyncRead + AsyncWrite + Unpin>(mut socket: WebSocketStream
     tracing::info!("camera {camera}: speaker closed after {} kB of sound", heard / 1024);
 }
 
+/// Asks the person starting the mock which password it should accept.
+fn choose_password(from_stdin: bool) -> Result<Secret> {
+    if from_stdin {
+        return crate::tty::read_stdin();
+    }
+    for _ in 0..3 {
+        let first = crate::tty::read_password(&format!("Choose a password for the mock's \"{USERNAME}\" account: "))?;
+        if first.is_empty() {
+            println!("The password cannot be empty.");
+            continue;
+        }
+        let again = crate::tty::read_password("The same password again: ")?;
+        if again.expose() == first.expose() {
+            return Ok(first);
+        }
+        println!("Those were not the same.");
+    }
+    bail!("no password was chosen")
+}
+
 /// The `mock-console` command.
-pub fn run(state_dir: &Path, listen: SocketAddr) -> Result<()> {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+pub fn run(state_dir: &Path, listen: SocketAddr, from_stdin: bool) -> Result<()> {
     // On a clean machine this may run before setup has made the state
     // directory, which must be the owner's alone like everything in it.
     crate::daemon::create_private_dir(state_dir)?;
     let identity = Identity::load_or_create(&state_dir.join("mock-console"))?;
+    let password = choose_password(from_stdin)?;
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let listener = TcpListener::bind(listen).await.with_context(|| format!("listening on {listen}"))?;
         let address = listener.local_addr()?;
         let host = if address.ip().is_unspecified() { "this Mac's address".to_owned() } else { address.ip().to_string() };
         println!(
-            "A mock UniFi Protect console is listening on {address}.\n\
+            "\nA mock UniFi Protect console is listening on {address}.\n\
              It is not a real console: it serves an invented site for testing Harbormaster.\n\n\
              \x20   address:     {host}:{port}\n\
              \x20   fingerprint: {fingerprint}\n\
              \x20   username:    {USERNAME}\n\
-             \x20   password:    {PASSWORD}\n\n\
+             \x20   password:    the one you just chose\n\n\
              In another terminal, run `harbormaster setup` and give it those answers.\n\
              Press Ctrl-C to stop.\n",
             port = address.port(),
             fingerprint = identity.fingerprint(),
         );
-        serve(listener, &identity, Duration::from_secs(3)).await
+        serve(listener, &identity, password, Duration::from_secs(3)).await
     })
 }
 
@@ -519,29 +544,34 @@ mod tests {
     use super::*;
     use harbormaster_protect::{Client, Error, FeedOptions, Segment};
 
-    async fn start(pace: Duration) -> (u16, Fingerprint) {
+    /// Starts a mock that accepts a password made up on the spot, and
+    /// returns where it is, its fingerprint and that password.
+    async fn start(pace: Duration) -> (u16, Fingerprint, String) {
         let identity = Identity::generate().unwrap();
         let fingerprint = identity.fingerprint();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move { serve(listener, &identity, pace).await });
-        (port, fingerprint)
+        let chosen = token();
+        let password = Secret::new(chosen.clone());
+        tokio::spawn(async move { serve(listener, &identity, password, pace).await });
+        (port, fingerprint, chosen)
     }
 
     #[tokio::test]
     async fn the_client_signs_in_reads_the_site_and_hears_what_happens() {
-        let (port, fingerprint) = start(Duration::from_millis(50)).await;
+        let (port, fingerprint, password) = start(Duration::from_millis(50)).await;
         assert_eq!(harbormaster_protect::fetch_fingerprint("127.0.0.1", port).await.unwrap(), fingerprint);
 
         let mut client = Client::new("127.0.0.1", port, fingerprint);
         assert!(matches!(client.bootstrap().await, Err(Error::NotSignedIn)));
-        assert!(matches!(client.login(USERNAME, "wrong").await, Err(Error::BadCredentials)));
-        assert!(matches!(client.login("someone", PASSWORD).await, Err(Error::BadCredentials)));
+        let wrong: String = password.chars().rev().collect();
+        assert!(matches!(client.login(USERNAME, &wrong).await, Err(Error::BadCredentials)));
+        assert!(matches!(client.login(&format!("{USERNAME}2"), &password).await, Err(Error::BadCredentials)));
         // A client that pins some other certificate sends nothing.
         let mut stranger = Client::new("127.0.0.1", port, Fingerprint::of(b"another console"));
-        assert!(matches!(stranger.login(USERNAME, PASSWORD).await, Err(Error::CertificateMismatch(_))));
+        assert!(matches!(stranger.login(USERNAME, &password).await, Err(Error::CertificateMismatch(_))));
 
-        client.login(USERNAME, PASSWORD).await.unwrap();
+        client.login(USERNAME, &password).await.unwrap();
         let bootstrap = client.bootstrap().await.unwrap();
         assert_eq!(bootstrap.nvr.name.as_deref(), Some("Mock Protect"));
         assert_eq!((bootstrap.cameras.len(), bootstrap.lights.len(), bootstrap.sensors.len()), (4, 1, 3));
@@ -576,9 +606,9 @@ mod tests {
             eprintln!("skipping: ffmpeg is not installed");
             return;
         }
-        let (port, fingerprint) = start(Duration::from_secs(60)).await;
+        let (port, fingerprint, password) = start(Duration::from_secs(60)).await;
         let mut client = Client::new("127.0.0.1", port, fingerprint);
-        client.login(USERNAME, PASSWORD).await.unwrap();
+        client.login(USERNAME, &password).await.unwrap();
 
         let jpeg = client.snapshot(site::DRIVEWAY, 320, 180).await.unwrap();
         assert!(jpeg.starts_with(&[0xFF, 0xD8]));

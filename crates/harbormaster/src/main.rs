@@ -259,7 +259,7 @@ fn main() -> Result<()> {
         )),
         Command::MockConsole => {
             let listen = if args.listen_given { args.listen } else { mock_console::DEFAULT_LISTEN.parse()? };
-            mock_console::run(&args.state_dir, listen)
+            mock_console::run(&args.state_dir, listen, args.stdin)
         }
         Command::Daemon => {
             let logs = logbuf::LogBuffer::new();
