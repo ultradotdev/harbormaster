@@ -2005,14 +2005,15 @@ mod tests {
         assert_shows(&screen, &["needs password (u)", "waiting for the Protect password", "u unlock", "rejected the username"]);
 
         app.handle(key(KeyCode::Char('u')));
-        for c in "correct horse".chars() {
+        let typed = crate::test_random::word();
+        for c in typed.chars() {
             app.handle(key(KeyCode::Char(c)));
         }
         let screen = render(&mut app);
-        assert_shows(&screen, &["UniFi Protect password", "•••••••••••••", "Enter signs in"]);
-        assert!(!screen.contains("correct") && !screen.contains("horse"), "{screen}");
+        assert_shows(&screen, &["UniFi Protect password", &"•".repeat(typed.len()), "Enter signs in"]);
+        assert!(!screen.contains(&typed), "{screen}");
         app.handle(key(KeyCode::Enter));
-        assert_eq!(app.outbox, [Command::Unlock { password: Secret::new("correct horse".into()) }]);
+        assert_eq!(app.outbox, [Command::Unlock { password: Secret::new(typed) }]);
         assert_eq!(app.modal, Modal::None);
 
         // With a password in hand there is nothing to unlock.

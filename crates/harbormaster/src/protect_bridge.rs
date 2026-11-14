@@ -1979,7 +1979,11 @@ mod unlock_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tracing_subscriber::layer::SubscriberExt;
 
-    const PASSWORD: &str = "correct horse";
+    /// The password the stand-in console accepts, made afresh each run.
+    fn password() -> &'static str {
+        static PASSWORD: std::sync::LazyLock<String> = std::sync::LazyLock::new(crate::test_random::word);
+        &PASSWORD
+    }
 
     struct Console {
         port: u16,
@@ -1999,7 +2003,7 @@ mod unlock_tests {
             "POST /api/auth/login HTTP/1.1" => {
                 logins.fetch_add(1, Ordering::SeqCst);
                 let json: Value = serde_json::from_str(body).unwrap_or_default();
-                if json["username"] == "harbormaster" && json["password"] == PASSWORD {
+                if json["username"] == "harbormaster" && json["password"] == password() {
                     reply("200 OK", "Set-Cookie: TOKEN=session-1; Path=/; HttpOnly\r\nX-CSRF-Token: csrf-1\r\n", "{}")
                 } else {
                     reply("401 Unauthorized", "", "{}")
@@ -2111,7 +2115,7 @@ mod unlock_tests {
         assert_eq!(console.logins.load(Ordering::SeqCst), 0);
 
         // A wrong password is tried once, discarded, and the wait resumes.
-        let outcome = vault.offer(Secret::new("wrong horse".into())).await.unwrap();
+        let outcome = vault.offer(Secret::new(format!("{}x", password()))).await.unwrap();
         assert!(matches!(&outcome, Outcome::Rejected(why) if why.contains("rejected")), "{outcome:?}");
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(console.logins.load(Ordering::SeqCst), 1, "a refused password must not be retried");
@@ -2119,7 +2123,7 @@ mod unlock_tests {
         assert!(view.waiting && view.problem.as_deref().unwrap().contains("rejected"), "{view:?}");
 
         // The right one signs in at once.
-        let outcome = vault.offer(Secret::new(PASSWORD.into())).await.unwrap();
+        let outcome = vault.offer(Secret::new(password().into())).await.unwrap();
         assert_eq!(outcome, Outcome::SignedIn { devices: known.len() });
         assert_eq!(console.logins.load(Ordering::SeqCst), 2);
         assert!(!vault.view().waiting);
@@ -2132,7 +2136,7 @@ mod unlock_tests {
         assert!(said("rejected the password"), "{lines:?}");
         assert!(said("connected to UniFi Protect"), "{lines:?}");
         let everything = format!("{lines:?} {:?} {:?}", vault.view(), outcome);
-        assert!(!everything.contains("horse"), "a password leaked: {everything}");
+        assert!(!everything.contains(password()), "a password leaked: {everything}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

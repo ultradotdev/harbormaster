@@ -412,7 +412,7 @@ mod tests {
 
     impl Client {
         async fn connect(streams: &DataStreams, secret: &[u8; 32]) -> Self {
-            let controller_salt = [9u8; 32];
+            let controller_salt = crate::crypto::random::<32>();
             let accessory_salt = streams.prepare(5, secret, &controller_salt).unwrap();
             let salt = [&controller_salt[..], &accessory_salt[..]].concat();
             Self {
@@ -474,7 +474,7 @@ mod tests {
     #[tokio::test]
     async fn sends_a_recording_in_numbered_chunks() {
         let streams = DataStreams::start(Arc::new(Canned { allow: true })).unwrap();
-        let mut client = Client::connect(&streams, &[4; 32]).await;
+        let mut client = Client::connect(&streams, &crate::crypto::random()).await;
         client.hello().await;
         assert_eq!(client.open_recording().await.body.get("status").and_then(Value::as_i64), Some(0));
 
@@ -515,14 +515,14 @@ mod tests {
     #[tokio::test]
     async fn refusals_reach_the_hub_and_strangers_are_dropped() {
         let streams = DataStreams::start(Arc::new(Canned { allow: false })).unwrap();
-        let mut client = Client::connect(&streams, &[4; 32]).await;
+        let mut client = Client::connect(&streams, &crate::crypto::random()).await;
         client.hello().await;
         let reply = client.open_recording().await;
         assert_eq!(reply.body.get("status").and_then(Value::as_i64), Some(Refusal::NotAllowed as i64));
 
         // Right port, wrong keys: the connection is closed without a reply.
-        let mut stranger = Client::connect(&streams, &[4; 32]).await;
-        stranger.write_key = [0; 32];
+        let mut stranger = Client::connect(&streams, &crate::crypto::random()).await;
+        stranger.write_key = crate::crypto::random();
         stranger.request("control", "hello", 1, Value::Dict(Vec::new())).await;
         assert!(stranger.receive().await.is_none());
 
@@ -534,9 +534,10 @@ mod tests {
     #[tokio::test]
     async fn waiting_requests_are_limited() {
         let streams = DataStreams::start(Arc::new(Canned { allow: true })).unwrap();
+        let (secret, theirs) = (crate::crypto::random::<32>(), crate::crypto::random::<32>());
         for _ in 0..MAX_PREPARED {
-            assert!(streams.prepare(5, &[1; 32], &[2; 32]).is_some());
+            assert!(streams.prepare(5, &secret, &theirs).is_some());
         }
-        assert!(streams.prepare(5, &[1; 32], &[2; 32]).is_none());
+        assert!(streams.prepare(5, &secret, &theirs).is_none());
     }
 }

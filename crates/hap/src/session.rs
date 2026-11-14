@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn large_message_round_trips_across_partial_reads() {
-        let secret = [4u8; 32];
+        let secret = crate::crypto::random::<32>();
         let (mut accessory, mut controller) = (Session::new(&secret), peer(&secret));
         let message: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
         let wire = controller.encrypt(&message);
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn tampered_frame_is_rejected() {
-        let secret = [4u8; 32];
+        let secret = crate::crypto::random::<32>();
         let (mut accessory, mut controller) = (Session::new(&secret), peer(&secret));
         let mut wire = controller.encrypt(b"GET /accessories HTTP/1.1\r\n\r\n");
         wire[5] ^= 1;

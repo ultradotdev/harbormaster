@@ -92,7 +92,9 @@ mod tests {
 
     #[test]
     fn only_the_line_ending_is_removed() {
-        assert_eq!(first_line(" correct horse \r\n").expose(), " correct horse ");
+        // Spaces at either end are part of what was typed.
+        let typed = format!(" {} {} ", crate::test_random::word(), crate::test_random::word());
+        assert_eq!(first_line(&format!("{typed}\r\n")).expose(), typed);
         assert_eq!(first_line("no newline").expose(), "no newline");
         assert!(first_line("\n").is_empty());
     }

@@ -124,19 +124,20 @@ mod tests {
 
     #[test]
     fn the_file_comes_first_then_the_keychain_then_waiting() {
-        let file = temp_file("order", "from the file\n", 0o600);
+        let (in_file, in_keychain) = (crate::test_random::word(), crate::test_random::word());
+        let file = temp_file("order", &format!("{in_file}\n"), 0o600);
         let dir = file.parent().unwrap();
         std::fs::rename(&file, protect_password_path(dir)).unwrap();
         let unused = |_: &str| -> Result<Secret, keychain::Failure> { panic!("the Keychain must not be asked") };
-        assert_eq!(find_at_start(dir, "hm", unused).unwrap().expose(), "from the file");
+        assert_eq!(find_at_start(dir, "hm", unused).unwrap().expose(), in_file);
 
         // No file: the Keychain is asked, for the configured username.
         std::fs::remove_file(protect_password_path(dir)).unwrap();
         let found = find_at_start(dir, "hm", |user| {
             assert_eq!(user, "hm");
-            Ok(Secret::new("from the keychain".into()))
+            Ok(Secret::new(in_keychain.clone()))
         });
-        assert_eq!(found.unwrap().expose(), "from the keychain");
+        assert_eq!(found.unwrap().expose(), in_keychain);
 
         // Neither: the daemon waits, whatever the Keychain's reason.
         for failure in [
@@ -148,10 +149,10 @@ mod tests {
         }
 
         // A file other users can read is passed over, not trusted.
-        std::fs::write(protect_password_path(dir), "exposed\n").unwrap();
+        std::fs::write(protect_password_path(dir), format!("{}\n", crate::test_random::word())).unwrap();
         std::fs::set_permissions(protect_password_path(dir), std::fs::Permissions::from_mode(0o644)).unwrap();
-        let found = find_at_start(dir, "hm", |_| Ok(Secret::new("from the keychain".into())));
-        assert_eq!(found.unwrap().expose(), "from the keychain");
+        let found = find_at_start(dir, "hm", |_| Ok(Secret::new(in_keychain.clone())));
+        assert_eq!(found.unwrap().expose(), in_keychain);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -871,7 +871,7 @@ mod tests {
             connection: 1,
             local_ip: "127.0.0.1".parse().unwrap(),
             peer_ip: "127.0.0.1".parse().unwrap(),
-            shared_secret: Some([7; 32]),
+            shared_secret: Some(crate::test_random::bytes()),
         };
 
         let (db, ids) = build();
@@ -889,10 +889,7 @@ mod tests {
         assert!(matches!(recorder.open(9), Err(Refusal::Unexpected)));
 
         // A hub sets up a data stream and is told where to connect.
-        // Read whole from the system, so no stand-in value is ever written here.
-        let mut hub_salt = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::Read::take(std::fs::File::open("/dev/urandom").unwrap(), 32), &mut hub_salt)
-            .unwrap();
+        let hub_salt = crate::test_random::bytes::<32>();
         let answer = db.write(2, ids.transport_setup, &transport_setup_value(&hub_salt), &context).unwrap();
         let (port, salt) = transport_answer(&answer).unwrap();
         assert!(port > 0 && salt.len() == 32);

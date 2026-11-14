@@ -338,8 +338,9 @@ mod tests {
         assert_eq!(parse_transport_setup(&test_support::transport_setup_value(&salt)), Some(salt.to_vec()));
         assert_eq!(parse_transport_setup(&test_support::transport_setup_value(&salt[..16])), None);
         assert_eq!(parse_transport_setup(&json!("")), None);
-        let answer = transport_response(51234, &[8; 32]);
-        assert_eq!(test_support::transport_answer(&answer), Some((51234, vec![8; 32])));
+        let ours = crate::crypto::random::<32>();
+        let answer = transport_response(51234, &ours);
+        assert_eq!(test_support::transport_answer(&answer), Some((51234, ours.to_vec())));
         assert_eq!(test_support::transport_answer(&transport_busy()), None);
     }
 }

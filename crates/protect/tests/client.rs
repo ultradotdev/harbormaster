@@ -28,8 +28,9 @@ struct Console {
 /// that none is written in the source.
 fn password() -> String {
     static PASSWORD: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        let mut bytes = [0u8; 12];
-        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").unwrap(), &mut bytes).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(std::fs::File::open("/dev/urandom").unwrap(), 12), &mut bytes)
+            .unwrap();
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     });
     PASSWORD.clone()

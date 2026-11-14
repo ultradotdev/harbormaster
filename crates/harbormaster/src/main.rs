@@ -26,6 +26,8 @@ mod secrets;
 mod service;
 mod setup;
 mod status;
+#[cfg(test)]
+mod test_random;
 mod tty;
 mod tui;
 mod unlock;
