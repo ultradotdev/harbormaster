@@ -36,10 +36,16 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy && rustup default "$RUST_VERSION"
+      # Twice: as released, and with the optional mock console, which
+      # releases leave out but which must keep building and passing.
       - name: Lint
-        run: cargo clippy --workspace --all-targets --locked
+        run: |
+          cargo clippy --workspace --all-targets --locked
+          cargo clippy --workspace --all-targets --all-features --locked
       - name: Test
-        run: cargo test --workspace --locked
+        run: |
+          cargo test --workspace --locked
+          cargo test --workspace --all-features --locked
       - name: Release build for both Mac architectures
         run: |
           rustup target add x86_64-apple-darwin
@@ -47,6 +53,12 @@ jobs:
           cargo build --release --locked --target x86_64-apple-darwin
       - name: The binary runs and reports its version
         run: target/aarch64-apple-darwin/release/harbormaster --version
+      - name: The released binary has no mock console in it
+        run: |
+          if target/aarch64-apple-darwin/release/harbormaster mock-console --stdin </dev/null 2>refusal; then
+            echo "the release build started a mock console" >&2; exit 1
+          fi
+          grep -q "no mock console" refusal
 
   pairing:
     name: Pair with an independent HomeKit controller

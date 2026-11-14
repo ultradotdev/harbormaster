@@ -1,12 +1,28 @@
 # Trying Harbormaster against a mock console
 
-`harbormaster mock-console` is a pretend UniFi Protect console built into
-the `harbormaster` program. It lets you test a fresh install end to end
+`harbormaster mock-console` is a pretend UniFi Protect console that can
+be built into the `harbormaster` program. It lets you test a fresh install end to end
 (setup, sign-in, certificate pinning, the dashboard, motion and doorbell
 events, snapshots and live video) on a spare Mac or a virtual machine,
 without a real console and without touching your real one.
 
-It is a development aid and is left out of `harbormaster --help`.
+It is a development aid. Released builds (Homebrew, the install script)
+do not contain it, and it is left out of `harbormaster --help`.
+
+## Getting a build that has it
+
+Build from source with the `mock-console` feature:
+
+```bash
+cargo build --release --features mock-console
+```
+
+That gives `target/release/harbormaster` with the `mock-console` command.
+To test a real release, keep the two apart: install Harbormaster the
+normal way, copy this build next to it under another name such as
+`harbormaster-mock`, and use that copy only to play the console. The
+commands below then start with `harbormaster-mock mock-console` for the
+mock and plain `harbormaster` for everything else.
 
 ## What it pretends to be
 
