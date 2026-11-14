@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "harbormaster"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "harbormaster-hap"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "harbormaster-protect"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "flate2",
