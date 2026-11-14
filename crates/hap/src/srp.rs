@@ -162,22 +162,37 @@ mod tests {
         (a_pub, m1, key)
     }
 
+    /// A setup code made for this run, in the shape HomeKit uses. Nothing
+    /// in these tests depends on a particular code, so none is written down.
+    fn setup_code() -> String {
+        let digits: String = crate::crypto::random::<8>().iter().map(|b| char::from(b'0' + b % 10)).collect();
+        format!("{}-{}-{}", &digits[..3], &digits[3..5], &digits[5..])
+    }
+
     #[test]
     fn accepts_correct_password_and_rejects_wrong_one() {
-        let server = SrpServer::with_secrets("Pair-Setup", "031-45-154", [3u8; 16], &[5u8; 32]);
-        let (a_pub, m1, key) =
-            client_proof("Pair-Setup", "031-45-154", server.salt(), server.public_key(), &[7u8; 32]);
+        let code = setup_code();
+        let server = SrpServer::with_secrets(
+            "Pair-Setup",
+            &code,
+            crate::crypto::random::<16>(),
+            &crate::crypto::random::<32>(),
+        );
+        let ours = crate::crypto::random::<32>();
+        let (a_pub, m1, key) = client_proof("Pair-Setup", &code, server.salt(), server.public_key(), &ours);
         let (_m2, server_key) = server.verify(&a_pub, &m1).expect("proof should verify");
         assert_eq!(server_key, key);
 
-        let (a_pub, m1, _) =
-            client_proof("Pair-Setup", "111-11-111", server.salt(), server.public_key(), &[7u8; 32]);
+        // The same code with its last digit changed.
+        let last = code.as_bytes()[code.len() - 1] - b'0';
+        let other = format!("{}{}", &code[..code.len() - 1], (last + 1) % 10);
+        let (a_pub, m1, _) = client_proof("Pair-Setup", &other, server.salt(), server.public_key(), &ours);
         assert!(server.verify(&a_pub, &m1).is_none());
     }
 
     #[test]
     fn rejects_zero_public_value() {
-        let server = SrpServer::new("Pair-Setup", "031-45-154");
+        let server = SrpServer::new("Pair-Setup", &setup_code());
         assert!(server.verify(&[0u8; KEY_LEN], &[0u8; 64]).is_none());
         assert!(server.verify(&modulus().to_bytes_be(), &[0u8; 64]).is_none());
     }

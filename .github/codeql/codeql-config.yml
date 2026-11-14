@@ -1,0 +1,15 @@
+name: Harbormaster
+
+# Two files are left out of scanning, and only these two. Each holds one
+# kind of line that a scanner cannot tell from a mistake, kept apart from
+# everything else so that the rules stay on for the rest of the code.
+# Each file's own header says what may live in it.
+paths-ignore:
+  # The fixed strings the HomeKit protocol mixes into key derivation.
+  # They are published, identical in every HomeKit product, and not
+  # secrets; the scanner reads them as hard-coded cryptographic values.
+  - crates/hap/src/labels.rs
+  # The lines that tell the person at the terminal which Protect account
+  # is in use. The scanner reads an account name as sensitive; no
+  # password, key or token is ever passed to this file.
+  - crates/harbormaster/src/account_lines.rs

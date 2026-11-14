@@ -889,7 +889,7 @@ mod tests {
         let answer = Tlv::decode(&ask(stream, "/pair-verify", &first).await).unwrap();
         let theirs: [u8; 32] = answer.get(tlv::PUBLIC_KEY).unwrap().try_into().unwrap();
         let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(theirs)).to_bytes();
-        let key = hkdf(b"Pair-Verify-Encrypt-Salt", b"Pair-Verify-Encrypt-Info", &shared);
+        let key = hkdf(crate::labels::PAIR_VERIFY_ENCRYPT_SALT, crate::labels::PAIR_VERIFY_ENCRYPT_INFO, &shared);
         let signed = [&public[..], b"controller", &theirs[..]].concat();
         let inner = Tlv::new()
             .with(tlv::IDENTIFIER, b"controller")

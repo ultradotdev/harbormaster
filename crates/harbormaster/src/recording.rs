@@ -889,11 +889,13 @@ mod tests {
         assert!(matches!(recorder.open(9), Err(Refusal::Unexpected)));
 
         // A hub sets up a data stream and is told where to connect.
-        let answer = db.write(2, ids.transport_setup, &transport_setup_value(&[5; 32]), &context).unwrap();
+        let mut hub_salt = [0u8; 32];
+        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").unwrap(), &mut hub_salt).unwrap();
+        let answer = db.write(2, ids.transport_setup, &transport_setup_value(&hub_salt), &context).unwrap();
         let (port, salt) = transport_answer(&answer).unwrap();
         assert!(port > 0 && salt.len() == 32);
         let no_session = WriteContext { shared_secret: None, ..context };
-        assert!(db.write(2, ids.transport_setup, &transport_setup_value(&[5; 32]), &no_session).is_err());
+        assert!(db.write(2, ids.transport_setup, &transport_setup_value(&hub_salt), &no_session).is_err());
 
         // Home's switches decide what may be seen. 400 stands in for a
         // stream's own on/off switch.

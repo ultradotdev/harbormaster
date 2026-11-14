@@ -334,8 +334,9 @@ mod tests {
 
     #[test]
     fn transport_setup_round_trips_and_refuses_odd_requests() {
-        assert_eq!(parse_transport_setup(&test_support::transport_setup_value(&[5; 32])), Some(vec![5; 32]));
-        assert_eq!(parse_transport_setup(&test_support::transport_setup_value(&[5; 16])), None);
+        let salt = crate::crypto::random::<32>();
+        assert_eq!(parse_transport_setup(&test_support::transport_setup_value(&salt)), Some(salt.to_vec()));
+        assert_eq!(parse_transport_setup(&test_support::transport_setup_value(&salt[..16])), None);
         assert_eq!(parse_transport_setup(&json!("")), None);
         let answer = transport_response(51234, &[8; 32]);
         assert_eq!(test_support::transport_answer(&answer), Some((51234, vec![8; 32])));

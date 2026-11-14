@@ -114,7 +114,7 @@ fn obtain(platform: &mut dyn Platform, username: &str) -> Result<Secret> {
                 bail!("no password was entered");
             }
             if let Some(command) = platform.store_hint(username) {
-                eprintln!("To have it read from the Keychain next time, store it once with:\n\n    {command}\n");
+                crate::account_lines::store_it_once(&command);
             }
             Ok(password)
         }
@@ -152,7 +152,7 @@ pub fn run(state_dir: &Path, from_stdin: bool) -> Result<()> {
         return Ok(());
     }
     let password = if from_stdin { tty::read_stdin()? } else { obtain(platform().as_mut(), &protect.username)? };
-    println!("Signing in to UniFi Protect at {} as \"{}\"...", protect.host, protect.username);
+    crate::account_lines::signing_in(&protect.host, &protect.username);
     let reply = client::unlock(state_dir, password)?;
     if reply.signed_in {
         println!("Signed in. {} devices are published to HomeKit.", reply.devices);
@@ -228,7 +228,7 @@ mod tests {
         }
 
         fn ask(&mut self, prompt: &str) -> Result<Secret> {
-            assert!(prompt.contains("\"hm\""), "{prompt}");
+            assert!(prompt.contains("\"hm\""));
             self.did.push("ask");
             Ok(Secret::new(self.typed.to_owned()))
         }

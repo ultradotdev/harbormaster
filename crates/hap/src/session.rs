@@ -5,6 +5,7 @@
 //! per-direction message counter as the nonce.
 
 use crate::crypto::{hkdf, open, seal};
+use crate::labels;
 
 const MAX_FRAME: usize = 1024;
 const TAG: usize = 16;
@@ -25,8 +26,8 @@ pub struct BadFrame;
 impl Session {
     pub fn new(shared_secret: &[u8; 32]) -> Self {
         Self {
-            read_key: hkdf(b"Control-Salt", b"Control-Write-Encryption-Key", shared_secret),
-            write_key: hkdf(b"Control-Salt", b"Control-Read-Encryption-Key", shared_secret),
+            read_key: hkdf(labels::CONTROL_SALT, labels::CONTROL_WRITE_KEY_INFO, shared_secret),
+            write_key: hkdf(labels::CONTROL_SALT, labels::CONTROL_READ_KEY_INFO, shared_secret),
             read_count: 0,
             write_count: 0,
         }
