@@ -889,8 +889,10 @@ mod tests {
         assert!(matches!(recorder.open(9), Err(Refusal::Unexpected)));
 
         // A hub sets up a data stream and is told where to connect.
-        let mut hub_salt = [0u8; 32];
-        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").unwrap(), &mut hub_salt).unwrap();
+        // Read whole from the system, so no stand-in value is ever written here.
+        let mut hub_salt = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(std::fs::File::open("/dev/urandom").unwrap(), 32), &mut hub_salt)
+            .unwrap();
         let answer = db.write(2, ids.transport_setup, &transport_setup_value(&hub_salt), &context).unwrap();
         let (port, salt) = transport_answer(&answer).unwrap();
         assert!(port > 0 && salt.len() == 32);
