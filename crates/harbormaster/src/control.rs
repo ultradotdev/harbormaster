@@ -64,7 +64,9 @@ pub struct State {
     pub listen: String,
     pub uptime_secs: u64,
     pub paired: bool,
-    /// Present only while unpaired.
+    /// The pairing code and its QR code payload. Earlier daemons sent
+    /// them only while unpaired; newer ones always do, so whether the
+    /// bridge is paired is told by `paired` alone, never by these.
     pub setup_code: Option<String>,
     pub setup_uri: Option<String>,
     pub controllers: Vec<Controller>,
@@ -313,6 +315,16 @@ mod tests {
             serde_json::to_string(&reply).unwrap(),
             r#"{"type":"unlock","signed_in":true,"devices":18,"kept":false,"detail":""}"#
         );
+    }
+
+    /// A paired bridge now sends its code too. `paired` still says what is
+    /// true, so no dashboard, old or new, reads the code as "not paired".
+    #[test]
+    fn a_paired_snapshot_with_its_code_is_still_paired() {
+        let line = OLD_STATE.replace(r#""setup_code":null,"setup_uri":null"#, r#""setup_code":"111-22-333","setup_uri":"X-HM://0000""#);
+        let Message::State(state) = serde_json::from_str(&line).unwrap() else { panic!("not a state") };
+        assert!(state.paired);
+        assert_eq!(state.setup_code.as_deref(), Some("111-22-333"));
     }
 
     /// The fields a TUI from before the dashboard insists on must stay.

@@ -26,6 +26,7 @@ if [ -z "$identity" ]; then
 fi
 [ -n "$identity" ] || { echo "No Developer ID Application certificate found. Set HARBORMASTER_SIGN_IDENTITY." >&2; exit 1; }
 
+. tools/release/flags.sh
 rm -rf dist
 mkdir -p dist
 installed="$(rustup target list --installed 2>/dev/null || true)"

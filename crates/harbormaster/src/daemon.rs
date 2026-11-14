@@ -334,8 +334,10 @@ impl Daemon {
             listen: self.bridge.local_addr.to_string(),
             uptime_secs: self.started.elapsed().as_secs(),
             paired,
-            setup_code: (!paired).then(|| self.store.setup_code()),
-            setup_uri: (!paired).then(|| self.store.setup_uri(CATEGORY_BRIDGE)),
+            // Always sent, so the code can be found again later. HomeKit
+            // takes it only while `paired` is false.
+            setup_code: Some(self.store.setup_code()),
+            setup_uri: Some(self.store.setup_uri(CATEGORY_BRIDGE)),
             controllers: self
                 .store
                 .pairings()
