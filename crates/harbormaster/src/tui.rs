@@ -7,7 +7,7 @@
 //! narrows itself to the selected device.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -846,8 +846,29 @@ fn affix_setting(label: &str, key: &str, text: &str) -> Line<'static> {
 }
 
 /// The lines of the overview, and which of them can be clicked.
-fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Vec<(usize, Action)>) {
+/// What an unpaired bridge shows first: the code to scan or type in the
+/// Home app. The picture is left out where the pane is too narrow for it.
+fn pairing_lines(s: &State, width: usize) -> Vec<Line<'static>> {
+    let Some(code) = &s.setup_code else { return Vec::new() };
+    // The digits come first: on a short terminal the picture scrolls away.
     let mut lines = vec![
+        heading("Pair with the Home app"),
+        Line::from(vec![Span::styled("Setup code  ", DIM), Span::styled(code.clone(), WARN)]),
+        Line::styled("In Home choose Add Accessory, then scan or type it.", DIM),
+        Line::raw(""),
+    ];
+    if let Some(qr) = s.setup_uri.as_deref().and_then(crate::qr::render) {
+        if qr.lines().all(|l| l.chars().count() <= width) {
+            lines.extend(qr.lines().map(|l| Line::raw(l.to_owned())));
+            lines.push(Line::raw(""));
+        }
+    }
+    lines
+}
+
+fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Vec<(usize, Action)>) {
+    let mut lines = pairing_lines(s, width);
+    lines.extend([
         field("Bridge", format!("{}  v{}", s.name, s.version)),
         field("Listening", format!("{}  configuration {}", s.listen, s.config_number)),
         field("Uptime", duration(s.uptime_secs)),
@@ -882,7 +903,7 @@ fn overview_lines(app: &App, s: &State, width: usize) -> (Vec<Line<'static>>, Ve
                 None => Span::styled("no UniFi Protect configured", DIM),
             },
         ),
-    ];
+    ]);
     // Why the console is not connected, when the daemon knows.
     if let Some(problem) = s.console.as_ref().and_then(|c| c.problem.clone()) {
         lines.push(field("", Span::styled(problem, DIM)));
@@ -1205,6 +1226,13 @@ pub fn run(state_dir: &Path) -> Result<()> {
     let for_reader = requests.clone();
     std::thread::spawn(move || read_daemon(socket, tx, for_reader));
 
+    // Without a terminal there is nothing to draw on, and the library
+    // underneath would abort rather than say so.
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        anyhow::bail!(
+            "the dashboard needs a terminal. For a report that does not, use `harbormaster service status` or `harbormaster logs`"
+        );
+    }
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let mut app = App::new();
@@ -1641,6 +1669,11 @@ mod tests {
     fn pairing_popup_shows_code_only_while_unpaired() {
         let mut app = app_with(sample_state(false));
         assert!(render(&mut app).contains("not paired (press p)"));
+        // The overview leads with the code, and draws it where there is room.
+        let overview = render_at(&mut app, 110, 40);
+        assert_shows(&overview, &["Pair with the Home app", "Setup code  420-21-195"]);
+        assert!(overview.contains('█'), "{overview}");
+        assert!(render(&mut app).contains("Setup code  420-21-195"));
         app.handle(key(KeyCode::Char('p')));
         let screen = render_at(&mut app, 110, 34);
         assert!(screen.contains("Setup code: 420-21-195"), "{screen}");
@@ -1651,6 +1684,7 @@ mod tests {
         assert_eq!(app.modal, Modal::None);
 
         let mut app = app_with(sample_state(true));
+        assert!(!render_at(&mut app, 110, 40).contains("Setup code"));
         app.handle(key(KeyCode::Char('p')));
         assert!(render(&mut app).contains("Already paired"));
     }

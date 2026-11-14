@@ -194,8 +194,32 @@ fn parse_args(input: impl IntoIterator<Item = String>) -> Result<Args> {
     Ok(args)
 }
 
+/// Commands that look at an installation say so plainly when there is
+/// none, rather than failing on whichever file they reach for first.
+fn require_setup(args: &Args) -> Result<()> {
+    let looks = matches!(
+        args.command,
+        Command::Tui
+            | Command::Unlock
+            | Command::Logs
+            | Command::ServiceStatus
+            | Command::ServiceRestart
+            | Command::ServiceStop
+            | Command::ServiceStart
+            | Command::ServiceUninstall
+    );
+    if looks && !args.state_dir.exists() {
+        bail!(
+            "Harbormaster is not set up yet (there is no {}). Start with:\n\n    harbormaster setup\n",
+            args.state_dir.display()
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = parse_args(std::env::args().skip(1))?;
+    require_setup(&args)?;
     match args.command {
         Command::Setup => setup::run(&args.state_dir, args.user_agent),
         Command::Tui => tui::run(&args.state_dir),
@@ -290,6 +314,18 @@ mod tests {
         assert!(detached.detached && detached.listen_given);
         assert!(matches!(parse(&["unlock", "--stdin"]).unwrap(), Args { command: Command::Unlock, stdin: true, .. }));
         assert!(parse(&["bogus"]).is_err());
+        // Looking at an installation that is not there is one plain message.
+        for looking in [&["service", "status"][..], &["logs"], &["unlock"], &["tui"], &[]] {
+            let mut words = looking.to_vec();
+            words.extend(["--state-dir", "/nonexistent/harbormaster"]);
+            let said = require_setup(&parse(&words).unwrap()).unwrap_err().to_string();
+            assert!(said.contains("not set up yet") && said.contains("harbormaster setup"), "{said}");
+        }
+        for making in [&["setup"][..], &["daemon"], &["service", "install"]] {
+            let mut words = making.to_vec();
+            words.extend(["--state-dir", "/nonexistent/harbormaster"]);
+            assert!(require_setup(&parse(&words).unwrap()).is_ok());
+        }
         assert!(parse(&["--listen"]).is_err());
     }
 }

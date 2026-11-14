@@ -7,7 +7,7 @@
 //! only saves editing files. Running it again changes nothing that is
 //! already in place.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -285,16 +285,48 @@ fn hand_over(state_dir: &Path, password: Secret) {
     }
 }
 
+/// Bold where the output is a terminal, plain where it is a file or a pipe.
+fn bold(text: &str) -> String {
+    if std::io::stdout().is_terminal() {
+        format!("\x1b[1m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// What setup opens with: whose questions these are, and how many.
+fn banner() -> String {
+    format!(
+        "\n  {}\n  HomeKit bridge for UniFi Protect\n\n  \
+         Setup is four steps: find your console, sign in, run as a service, add to Home.\n  \
+         It is safe to run again; nothing already in place is changed.\n",
+        bold(&format!("\u{2693} Harbormaster {}", env!("CARGO_PKG_VERSION")))
+    )
+}
+
+fn step(number: u8, title: &str) -> String {
+    bold(&format!("Step {number} of 4  {title}"))
+}
+
+/// The pairing code of a running, unpaired bridge, drawn for the Home
+/// app to scan. Nothing when the service is not up or is already paired.
+fn pairing_code(state_dir: &Path) -> Option<String> {
+    let state = client::state(state_dir).ok()?;
+    let code = state.setup_code?;
+    let picture = state.setup_uri.as_deref().and_then(crate::qr::render).map(|qr| format!("{qr}\n\n")).unwrap_or_default();
+    Some(format!("{picture}Setup code: {code}"))
+}
+
 pub fn run(state_dir: &Path, user_agent: bool) -> Result<()> {
     let ask: &mut dyn Prompter = &mut Terminal;
-    println!("Harbormaster setup\n");
+    println!("{}", banner());
     daemon::create_private_dir(state_dir)?;
     let runtime = tokio::runtime::Runtime::new()?;
 
-    println!("1. The UniFi Protect console\n");
+    println!("{}\n", step(1, "The UniFi Protect console"));
     let console = runtime.block_on(find_console(state_dir, ask))?;
 
-    println!("\n2. Signing in\n");
+    println!("\n{}\n", step(2, "Signing in"));
     let (password, from_keychain) = runtime.block_on(sign_in(&console, ask))?;
     if let Some(text) = &console.config {
         write_config(state_dir, text)?;
@@ -307,7 +339,7 @@ pub fn run(state_dir: &Path, user_agent: bool) -> Result<()> {
         println!("\nLive video and recording need ffmpeg, which was not found. With Homebrew: brew install ffmpeg");
     }
 
-    println!("\n3. Running as a service\n");
+    println!("\n{}\n", step(3, "Running as a service"));
     // A daemon started before the console was configured does not know of it.
     let stale = console.config.is_some() && client::state(state_dir).is_ok();
     if ask.confirm("Install Harbormaster as a service that starts at boot and is restarted if it stops?", true)? {
@@ -326,12 +358,18 @@ pub fn run(state_dir: &Path, user_agent: bool) -> Result<()> {
         println!("To run it yourself: harbormaster daemon");
     }
 
-    println!(
-        "\n4. Adding it to HomeKit\n\n\
-         Once the service is running and has the password (`harbormaster unlock`), open the dashboard\n\
-         with `harbormaster` and press p for the pairing code. In the Home app choose Add Accessory,\n\
-         then More Options, and pick Harbormaster."
-    );
+    println!("\n{}\n", step(4, "Adding it to Home"));
+    match pairing_code(state_dir) {
+        Some(code) => println!(
+            "In the Home app choose Add Accessory, then scan this code or type it in.\n\n{code}\n\n\
+             The dashboard shows it again until the bridge is paired: harbormaster"
+        ),
+        None => println!(
+            "Once the service is running and has the password (`harbormaster unlock`), open the dashboard\n\
+             with `harbormaster`: it shows the pairing code. In the Home app choose Add Accessory and scan\n\
+             it, or choose More Options and pick Harbormaster."
+        ),
+    }
     if cfg!(target_os = "macos") {
         println!(
             "\nIf the service cannot reach the console (\"No route to host\"), allow it under System Settings,\n\
@@ -354,6 +392,16 @@ mod tests {
         for bad in ["", "   ", "my console", "host:port", "a\"b"] {
             assert_eq!(address(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_opening_names_the_program_and_the_steps_are_numbered() {
+        let banner = banner();
+        assert!(banner.contains(&format!("Harbormaster {}", env!("CARGO_PKG_VERSION"))), "{banner}");
+        assert!(banner.contains("HomeKit bridge for UniFi Protect") && banner.contains("four steps"));
+        // Tests do not run on a terminal, so nothing is styled.
+        assert_eq!(step(2, "Signing in"), "Step 2 of 4  Signing in");
+        assert_eq!(pairing_code(Path::new("/nonexistent/harbormaster")), None);
     }
 
     fn pin() -> Fingerprint {

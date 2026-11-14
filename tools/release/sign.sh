@@ -18,6 +18,7 @@ if [ -z "$identity" ]; then
   exit 1
 fi
 
+. tools/release/flags.sh
 cargo build --release
 binary=target/release/harbormaster
 # The hardened runtime is what notarization requires later; the secure
