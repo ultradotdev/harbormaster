@@ -83,9 +83,10 @@ mod tests {
             stream.write_all(b"{\"type\":\"unlock\",\"signed_in\":true,\"devices\":18}\n").unwrap();
             request
         });
-        let reply = unlock(&dir, Secret::new("correct horse".into())).unwrap();
+        let typed = crate::test_random::word();
+        let reply = unlock(&dir, Secret::new(typed.clone())).unwrap();
         assert_eq!(reply, UnlockReply { signed_in: true, devices: 18, ..UnlockReply::default() });
-        assert_eq!(daemon.join().unwrap(), "{\"type\":\"unlock\",\"password\":\"correct horse\"}\n");
+        assert_eq!(daemon.join().unwrap(), format!("{{\"type\":\"unlock\",\"password\":\"{typed}\"}}\n"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

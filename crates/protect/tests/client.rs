@@ -24,6 +24,18 @@ struct Console {
     requests: Arc<AtomicUsize>,
 }
 
+/// The password the stand-in accepts, made afresh for each test run so
+/// that none is written in the source.
+fn password() -> String {
+    static PASSWORD: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(std::fs::File::open("/dev/urandom").unwrap(), 12), &mut bytes)
+            .unwrap();
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    });
+    PASSWORD.clone()
+}
+
 /// How the stand-in answers sign-in and bootstrap requests.
 #[derive(Clone, Copy)]
 enum Behaviour {
@@ -45,7 +57,7 @@ fn answer(request: &str, behaviour: Behaviour) -> String {
         ("POST /api/auth/login HTTP/1.1", Behaviour::TwoFactor) => reply("499 MFA", "", "{}"),
         ("POST /api/auth/login HTTP/1.1", _) => {
             let json: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-            if json["username"] == "harbormaster" && json["password"] == "correct horse" {
+            if json["username"] == "harbormaster" && json["password"] == password() {
                 reply(
                     "200 OK",
                     "Set-Cookie: OTHER=1; Path=/\r\nSet-Cookie: TOKEN=session-1; Path=/; HttpOnly\r\nX-CSRF-Token: csrf-1\r\n",
@@ -139,7 +151,7 @@ async fn signs_in_and_reads_inventory() {
     let mut client = Client::new("localhost", console.port, console.fingerprint);
     assert!(matches!(client.bootstrap().await, Err(Error::NotSignedIn)));
 
-    client.login("harbormaster", "correct horse").await.unwrap();
+    client.login("harbormaster", &password()).await.unwrap();
     let bootstrap = client.bootstrap().await.unwrap();
     assert_eq!(bootstrap.nvr.name.as_deref(), Some("Test NVR"));
     assert_eq!(bootstrap.cameras.len(), 1);
@@ -151,12 +163,12 @@ async fn signs_in_and_reads_inventory() {
 async fn reports_bad_credentials_and_two_factor_accounts() {
     let console = start(Behaviour::Normal).await;
     let mut client = Client::new("localhost", console.port, console.fingerprint);
-    assert!(matches!(client.login("harbormaster", "wrong").await, Err(Error::BadCredentials)));
+    assert!(matches!(client.login("harbormaster", &format!("{}x", password())).await, Err(Error::BadCredentials)));
     assert!(matches!(client.bootstrap().await, Err(Error::NotSignedIn)));
 
     let console = start(Behaviour::TwoFactor).await;
     let mut client = Client::new("localhost", console.port, console.fingerprint);
-    assert!(matches!(client.login("harbormaster", "correct horse").await, Err(Error::TwoFactorRequired)));
+    assert!(matches!(client.login("harbormaster", &password()).await, Err(Error::TwoFactorRequired)));
 }
 
 #[tokio::test]
@@ -165,7 +177,7 @@ async fn wrong_certificate_stops_before_credentials_are_sent() {
     let impostor = start(Behaviour::Normal).await;
     // Pinned to one console's certificate but pointed at the other.
     let mut client = Client::new("localhost", impostor.port, console.fingerprint);
-    let error = client.login("harbormaster", "correct horse").await.unwrap_err();
+    let error = client.login("harbormaster", &password()).await.unwrap_err();
     assert!(matches!(error, Error::CertificateMismatch(_)), "{error}");
     assert!(error.to_string().contains(&impostor.fingerprint.to_string()), "{error}");
     assert_eq!(impostor.requests.load(Ordering::SeqCst), 0, "no request may reach an unpinned server");
@@ -182,7 +194,7 @@ async fn reads_fingerprint_without_sending_a_request() {
 async fn console_without_protect_is_reported_clearly() {
     let console = start(Behaviour::NoProtect).await;
     let mut client = Client::new("localhost", console.port, console.fingerprint);
-    client.login("harbormaster", "correct horse").await.unwrap();
+    client.login("harbormaster", &password()).await.unwrap();
     assert!(matches!(client.bootstrap().await, Err(Error::ProtectNotFound)));
 }
 
@@ -192,7 +204,7 @@ async fn unreachable_console_is_a_connect_error() {
     let port = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
     let pin: Fingerprint = "00".repeat(32).parse().unwrap();
     let mut client = Client::new("127.0.0.1", port, pin);
-    assert!(matches!(client.login("a", "b").await, Err(Error::Connect(_))));
+    assert!(matches!(client.login("a", &password()).await, Err(Error::Connect(_))));
 }
 
 #[tokio::test]
@@ -200,7 +212,7 @@ async fn fetches_snapshots_and_refuses_odd_camera_ids() {
     let console = start(Behaviour::Normal).await;
     let mut client = Client::new("localhost", console.port, console.fingerprint);
     assert!(matches!(client.snapshot("c1", 640, 480).await, Err(Error::NotSignedIn)));
-    client.login("harbormaster", "correct horse").await.unwrap();
+    client.login("harbormaster", &password()).await.unwrap();
     assert_eq!(&client.snapshot("c1", 640, 480).await.unwrap()[..], b"JPEG-640");
     assert_eq!(&client.package_snapshot("c1", 640, 480).await.unwrap()[..], b"PACKAGE");
     assert!(matches!(client.package_snapshot("../x", 1, 1).await, Err(Error::Protocol(_))));
@@ -217,7 +229,7 @@ async fn changes_a_device_and_reports_refusals() {
     let mut client = Client::new("localhost", console.port, console.fingerprint);
     let on = serde_json::json!({"lightOnSettings": {"isLedForceOn": true}});
     assert!(matches!(client.update_device("lights", "l1", &on).await, Err(Error::NotSignedIn)));
-    client.login("harbormaster", "correct horse").await.unwrap();
+    client.login("harbormaster", &password()).await.unwrap();
     client.update_device("lights", "l1", &on).await.unwrap();
     assert!(matches!(client.update_device("lights", "readonly", &on).await, Err(Error::Forbidden)));
     assert!(matches!(client.update_device("lights", "missing", &on).await, Err(Error::Status(_))));

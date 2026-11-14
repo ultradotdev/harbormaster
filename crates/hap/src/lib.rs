@@ -6,6 +6,7 @@
 
 pub mod camera;
 mod crypto;
+mod labels;
 pub mod datastream;
 mod mdns;
 pub mod opack;

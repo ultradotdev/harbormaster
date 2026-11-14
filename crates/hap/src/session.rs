@@ -5,6 +5,7 @@
 //! per-direction message counter as the nonce.
 
 use crate::crypto::{hkdf, open, seal};
+use crate::labels;
 
 const MAX_FRAME: usize = 1024;
 const TAG: usize = 16;
@@ -25,8 +26,8 @@ pub struct BadFrame;
 impl Session {
     pub fn new(shared_secret: &[u8; 32]) -> Self {
         Self {
-            read_key: hkdf(b"Control-Salt", b"Control-Write-Encryption-Key", shared_secret),
-            write_key: hkdf(b"Control-Salt", b"Control-Read-Encryption-Key", shared_secret),
+            read_key: hkdf(labels::CONTROL_SALT, labels::CONTROL_WRITE_KEY_INFO, shared_secret),
+            write_key: hkdf(labels::CONTROL_SALT, labels::CONTROL_READ_KEY_INFO, shared_secret),
             read_count: 0,
             write_count: 0,
         }
@@ -84,7 +85,7 @@ mod tests {
 
     #[test]
     fn large_message_round_trips_across_partial_reads() {
-        let secret = [4u8; 32];
+        let secret = crate::crypto::random::<32>();
         let (mut accessory, mut controller) = (Session::new(&secret), peer(&secret));
         let message: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
         let wire = controller.encrypt(&message);
@@ -100,7 +101,7 @@ mod tests {
 
     #[test]
     fn tampered_frame_is_rejected() {
-        let secret = [4u8; 32];
+        let secret = crate::crypto::random::<32>();
         let (mut accessory, mut controller) = (Session::new(&secret), peer(&secret));
         let mut wire = controller.encrypt(b"GET /accessories HTTP/1.1\r\n\r\n");
         wire[5] ^= 1;

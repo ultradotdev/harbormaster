@@ -149,7 +149,7 @@ async fn find_console(state_dir: &Path, ask: &mut dyn Prompter) -> Result<Consol
     let configured = config::load(state_dir)?.protect;
     let (host, port, username) = match &configured {
         Some(protect) => {
-            println!("{} already names the console at {} and the account \"{}\".", path.display(), protect.host, protect.username);
+            crate::account_lines::already_configured(&path, &protect.host, &protect.username);
             (protect.host.clone(), Some(protect.port), protect.username.clone())
         }
         None => {
@@ -262,9 +262,9 @@ fn keep_password(username: &str, password: &Secret, ask: &mut dyn Prompter) -> R
     }
     match outcome {
         Ok(()) => println!("Stored in the Keychain."),
-        Err(why) => println!(
-            "It could not be stored ({why}). To store it yourself later:\n\n    {}\n",
-            keychain::store_command(keychain::PROTECT_SERVICE, username)
+        Err(why) => crate::account_lines::could_not_store(
+            &why,
+            &keychain::store_command(keychain::PROTECT_SERVICE, username),
         ),
     }
     Ok(())

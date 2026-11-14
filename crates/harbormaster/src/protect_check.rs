@@ -44,7 +44,7 @@ async fn sign_in(state_dir: &Path) -> Result<Option<(Client, config::Protect)>> 
 
 pub async fn run(state_dir: &Path) -> Result<()> {
     let Some((client, protect)) = sign_in(state_dir).await? else { return Ok(()) };
-    println!("Signed in to {} as {}.", protect.host, protect.username);
+    crate::account_lines::signed_in(&protect.host, &protect.username);
 
     let bootstrap = client.bootstrap().await?;
     let nvr = &bootstrap.nvr;

@@ -306,10 +306,12 @@ mod tests {
         assert_eq!(serde_json::from_str::<Command>(&line).unwrap(), prefix);
         let default: Command = serde_json::from_str(r#"{"type":"set_name_suffix"}"#).unwrap();
         assert_eq!(default, Command::SetNameSuffix { text: None });
-        let unlock: Command = serde_json::from_str(r#"{"type":"unlock","password":"correct horse"}"#).unwrap();
+        let typed = crate::test_random::word();
+        let unlock: Command =
+            serde_json::from_str(&format!(r#"{{"type":"unlock","password":"{typed}"}}"#)).unwrap();
         let Command::Unlock { password } = &unlock else { panic!("not an unlock") };
-        assert_eq!(password.expose(), "correct horse");
-        assert!(!format!("{unlock:?}").contains("horse"), "a command must be safe to print");
+        assert_eq!(password.expose(), typed);
+        assert!(!format!("{unlock:?}").contains(&typed), "a command must be safe to print");
         let reply = Message::Unlock(UnlockReply { signed_in: true, devices: 18, ..UnlockReply::default() });
         assert_eq!(
             serde_json::to_string(&reply).unwrap(),

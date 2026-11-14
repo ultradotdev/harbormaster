@@ -672,11 +672,12 @@ mod tests {
         let client = tokio::spawn(async move { serving.serve_client(theirs).await });
         let (read, mut write) = ours.into_split();
         let mut lines = BufReader::new(read).lines();
-        write.write_all(b"{\"type\":\"unlock\",\"password\":\"correct horse\"}\n").await.unwrap();
+        let typed = crate::test_random::word();
+        write.write_all(format!("{{\"type\":\"unlock\",\"password\":\"{typed}\"}}\n").as_bytes()).await.unwrap();
 
         // The bridge's part: take the password and sign in with it.
         let used = vault.password().await;
-        assert_eq!(used.expose(), "correct horse");
+        assert_eq!(used.expose(), typed);
         vault.signed_in(4);
 
         let mut heard = String::new();
@@ -692,8 +693,8 @@ mod tests {
         heard.push_str(&lines.next_line().await.unwrap().unwrap());
         assert!(heard.contains("\"waiting_for_password\":true") && heard.contains("\"waiting_for_password\":false"), "{heard}");
         assert!(heard.contains("handed over"), "the hand-over is logged: {heard}");
-        assert!(!heard.contains("horse"), "the password came back: {heard}");
-        assert!(!format!("{:?}", daemon.state()).contains("horse"));
+        assert!(!heard.contains(&typed), "the password came back: {heard}");
+        assert!(!format!("{:?}", daemon.state()).contains(&typed));
 
         // With no console configured there is nothing to unlock.
         client.abort();

@@ -8,6 +8,7 @@ use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::crypto::{from_hex, hkdf, open, random, seal};
+use crate::labels;
 use crate::srp::SrpServer;
 use crate::store::Store;
 use crate::tlv::{self, error, Tlv};
@@ -89,7 +90,7 @@ pub fn pair_setup(
 /// Pair-setup M5/M6: verify and store the controller's long-term key, then
 /// return ours, both under a key derived from the SRP session.
 fn exchange_keys(store: &Store, srp_key: &[u8; 64], req: &Tlv) -> Result<Vec<u8>, u8> {
-    let session_key = hkdf(b"Pair-Setup-Encrypt-Salt", b"Pair-Setup-Encrypt-Info", srp_key);
+    let session_key = hkdf(labels::PAIR_SETUP_ENCRYPT_SALT, labels::PAIR_SETUP_ENCRYPT_INFO, srp_key);
     let plain = req
         .get(tlv::ENCRYPTED_DATA)
         .and_then(|data| open(&session_key, b"PS-Msg05", &[], data))
@@ -101,7 +102,7 @@ fn exchange_keys(store: &Store, srp_key: &[u8; 64], req: &Tlv) -> Result<Vec<u8>
     let controller_name = std::str::from_utf8(controller_id).map_err(|_| error::UNKNOWN)?;
 
     let mut signed =
-        hkdf(b"Pair-Setup-Controller-Sign-Salt", b"Pair-Setup-Controller-Sign-Info", srp_key).to_vec();
+        hkdf(labels::PAIR_SETUP_CONTROLLER_SIGN_SALT, labels::PAIR_SETUP_CONTROLLER_SIGN_INFO, srp_key).to_vec();
     signed.extend_from_slice(controller_id);
     signed.extend_from_slice(&controller_key);
     if !verify_signature(&controller_key, &signed, signature) {
@@ -120,7 +121,7 @@ fn exchange_keys(store: &Store, srp_key: &[u8; 64], req: &Tlv) -> Result<Vec<u8>
     let device_id = store.device_id();
     let public_key = signing_key.verifying_key().to_bytes();
     let mut signed =
-        hkdf(b"Pair-Setup-Accessory-Sign-Salt", b"Pair-Setup-Accessory-Sign-Info", srp_key).to_vec();
+        hkdf(labels::PAIR_SETUP_ACCESSORY_SIGN_SALT, labels::PAIR_SETUP_ACCESSORY_SIGN_INFO, srp_key).to_vec();
     signed.extend_from_slice(device_id.as_bytes());
     signed.extend_from_slice(&public_key);
     let inner = Tlv::new()
@@ -162,7 +163,7 @@ pub fn pair_verify(
             let secret = StaticSecret::from(random::<32>());
             let accessory_public = PublicKey::from(&secret).to_bytes();
             let shared = secret.diffie_hellman(&PublicKey::from(controller_public)).to_bytes();
-            let session_key = hkdf(b"Pair-Verify-Encrypt-Salt", b"Pair-Verify-Encrypt-Info", &shared);
+            let session_key = hkdf(labels::PAIR_VERIFY_ENCRYPT_SALT, labels::PAIR_VERIFY_ENCRYPT_INFO, &shared);
 
             let device_id = store.device_id();
             let mut signed = accessory_public.to_vec();

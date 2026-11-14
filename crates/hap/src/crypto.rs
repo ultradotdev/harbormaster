@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn seal_open_round_trip_and_tamper() {
-        let key = [9u8; 32];
+        let key = random::<32>();
         let sealed = seal(&key, b"PS-Msg05", b"aad", b"hello");
         assert_eq!(open(&key, b"PS-Msg05", b"aad", &sealed).unwrap(), b"hello");
         assert!(open(&key, b"PS-Msg06", b"aad", &sealed).is_none());

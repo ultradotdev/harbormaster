@@ -342,7 +342,11 @@ pub mod test_support {
     use super::*;
 
     pub fn setup_value(ip: &str, video_port: u16) -> Value {
-        let srtp = Srtp { suite: SRTP_AES_CM_128_HMAC_SHA1_80, key: vec![1; 16], salt: vec![2; 14] };
+        let srtp = Srtp {
+            suite: SRTP_AES_CM_128_HMAC_SHA1_80,
+            key: crate::crypto::random::<16>().to_vec(),
+            salt: crate::crypto::random::<14>().to_vec(),
+        };
         let address = Tlv::new()
             .with(0x01, &[if ip.contains(':') { 1 } else { 0 }])
             .with(0x02, ip.as_bytes())

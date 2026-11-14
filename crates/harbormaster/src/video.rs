@@ -917,7 +917,7 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     fn request(ip: &str, port: u16) -> SetupRequest {
-        let srtp = Srtp { suite: 0, key: vec![1; 16], salt: vec![2; 14] };
+        let srtp = Srtp { suite: 0, key: crate::test_random::bytes::<16>().to_vec(), salt: crate::test_random::bytes::<14>().to_vec() };
         SetupRequest {
             session_id: [9; 16],
             controller_ip: ip.parse().unwrap(),

@@ -298,11 +298,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hm-launchd-{}-plain", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(crate::secrets::PROTECT_PASSWORD_FILE), "correct horse\n").unwrap();
+        let kept = crate::test_random::word();
+        std::fs::write(dir.join(crate::secrets::PROTECT_PASSWORD_FILE), format!("{kept}\n")).unwrap();
         let mut here = spec(Scope::System);
         here.state_dir = dir.clone();
         let text = plist(&here);
-        assert!(!text.contains("horse"));
+        assert!(!text.contains(&kept));
         for word in ["password", "Password", "secret", "token", "protect-password"] {
             assert!(!text.contains(word), "{word} in {text}");
         }

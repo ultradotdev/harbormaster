@@ -179,49 +179,57 @@ mod tests {
         Secret::new(text.to_owned())
     }
 
+    /// A stand-in password, different on every call and every run.
+    fn made_up() -> String {
+        crate::test_random::word()
+    }
+
     #[test]
     fn a_secret_never_prints_itself() {
-        let password = secret("correct horse");
+        let typed = made_up();
+        let password = secret(&typed);
         assert_eq!(format!("{password:?}"), "[hidden]");
         assert_eq!(format!("{:?}", Some(Arc::new(password.clone()))), "Some([hidden])");
         // It does travel over the owner's socket, as a bare string.
-        assert_eq!(serde_json::to_string(&password).unwrap(), "\"correct horse\"");
+        assert_eq!(serde_json::to_string(&password).unwrap(), format!("\"{typed}\""));
     }
 
     #[tokio::test]
     async fn a_rejected_password_is_discarded_and_a_failed_one_is_kept() {
         let vault = Vault::new(None);
         assert!(vault.view().waiting);
+        let (wrong, right) = (made_up(), made_up());
 
-        let answer = vault.offer(secret("wrong"));
+        let answer = vault.offer(secret(&wrong));
         let used = vault.password().await;
         vault.rejected(&used, "the console rejected the username or password");
         assert_eq!(answer.await.unwrap(), Outcome::Rejected("the console rejected the username or password".into()));
         let view = vault.view();
         assert!(view.waiting && view.problem.as_deref().unwrap().contains("rejected"));
 
-        let answer = vault.offer(secret("right"));
+        let answer = vault.offer(secret(&right));
         let used = vault.password().await;
         vault.failed(&used, "could not reach the console");
         assert_eq!(answer.await.unwrap(), Outcome::Failed("could not reach the console".into()));
         assert!(!vault.view().waiting, "kept for the next try");
-        assert_eq!(vault.password().await.expose(), "right");
+        assert_eq!(vault.password().await.expose(), right);
 
         vault.signed_in(3);
         assert_eq!(vault.view(), View { waiting: false, problem: None });
         // Already signed in: the answer is immediate and the working password stays.
-        assert_eq!(vault.offer(secret("another")).await.unwrap(), Outcome::SignedIn { devices: 3 });
-        assert_eq!(vault.password().await.expose(), "right");
+        assert_eq!(vault.offer(secret(&made_up())).await.unwrap(), Outcome::SignedIn { devices: 3 });
+        assert_eq!(vault.password().await.expose(), right);
     }
 
     #[tokio::test]
     async fn a_newer_password_is_not_blamed_for_an_older_ones_failure() {
-        let vault = Vault::new(Some(secret("old")));
+        let (old, new) = (made_up(), made_up());
+        let vault = Vault::new(Some(secret(&old)));
         let used = vault.password().await;
-        let mut answer = vault.offer(secret("new"));
+        let mut answer = vault.offer(secret(&new));
         vault.rejected(&used, "rejected");
         assert!(answer.try_recv().is_err(), "the new password has not been tried yet");
-        assert_eq!(vault.password().await.expose(), "new");
+        assert_eq!(vault.password().await.expose(), new);
         assert_eq!(vault.offer(Secret::new(String::new())).await.unwrap(), Outcome::Rejected("the password was empty".into()));
     }
 
@@ -234,7 +242,8 @@ mod tests {
         });
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
-        let _answer = vault.offer(secret("here"));
-        assert_eq!(waiting.await.unwrap(), "here");
+        let typed = made_up();
+        let _answer = vault.offer(secret(&typed));
+        assert_eq!(waiting.await.unwrap(), typed);
     }
 }

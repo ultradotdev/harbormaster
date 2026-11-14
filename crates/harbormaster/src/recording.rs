@@ -871,7 +871,7 @@ mod tests {
             connection: 1,
             local_ip: "127.0.0.1".parse().unwrap(),
             peer_ip: "127.0.0.1".parse().unwrap(),
-            shared_secret: Some([7; 32]),
+            shared_secret: Some(crate::test_random::bytes()),
         };
 
         let (db, ids) = build();
@@ -889,11 +889,12 @@ mod tests {
         assert!(matches!(recorder.open(9), Err(Refusal::Unexpected)));
 
         // A hub sets up a data stream and is told where to connect.
-        let answer = db.write(2, ids.transport_setup, &transport_setup_value(&[5; 32]), &context).unwrap();
+        let hub_salt = crate::test_random::bytes::<32>();
+        let answer = db.write(2, ids.transport_setup, &transport_setup_value(&hub_salt), &context).unwrap();
         let (port, salt) = transport_answer(&answer).unwrap();
         assert!(port > 0 && salt.len() == 32);
         let no_session = WriteContext { shared_secret: None, ..context };
-        assert!(db.write(2, ids.transport_setup, &transport_setup_value(&[5; 32]), &no_session).is_err());
+        assert!(db.write(2, ids.transport_setup, &transport_setup_value(&hub_salt), &no_session).is_err());
 
         // Home's switches decide what may be seen. 400 stands in for a
         // stream's own on/off switch.
