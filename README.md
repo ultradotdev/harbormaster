@@ -129,9 +129,11 @@ presents the exact certificate you confirmed during setup.
 
 ## Trying it without a console
 
-`harbormaster mock-console` runs a pretend UniFi Protect console with an
-invented site, so setup, sign-in, the dashboard, events and live video can
-be tried on a spare Mac or virtual machine with no real console. See
+A build made from source with `--features mock-console` gains
+`harbormaster mock-console`, a pretend UniFi Protect console with an
+invented site. With it, setup, sign-in, the dashboard, events and live
+video can be tried on a spare Mac or virtual machine with no real console.
+Released builds do not contain it. See
 [docs/mock-console.md](docs/mock-console.md).
 
 ## Files

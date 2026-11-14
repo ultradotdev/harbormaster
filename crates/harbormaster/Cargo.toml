@@ -19,11 +19,30 @@ toml = "1.2.1"
 tracing = "0.1.44"
 zeroize = "1.9.1"
 tracing-subscriber = { version = "0.3.23", features = ["registry"] }
-# For the mock console (`harbormaster mock-console`).
-flate2 = "1.1.11"
-futures-util = "0.3.34"
+# Only for the mock console; see the `mock-console` feature below.
+flate2 = { version = "1.1.11", optional = true }
+futures-util = { version = "0.3.34", optional = true }
+rcgen = { version = "0.14.10", optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"], optional = true }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"], optional = true }
+
+[features]
+# `harbormaster mock-console`: a pretend UniFi Protect console for testing
+# a fresh install (docs/mock-console.md). It is of no use to someone
+# running the bridge, so it is off by default and released builds do not
+# contain it. Build with `--features mock-console` to get it.
+mock-console = [
+    "dep:flate2",
+    "dep:futures-util",
+    "dep:rcgen",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:tokio-tungstenite",
+]
+
+[dev-dependencies]
+# The tests' own stand-in console.
 rcgen = "0.14.10"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
-
